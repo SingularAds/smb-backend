@@ -18,7 +18,6 @@ States: ``conversing`` → ``pairing`` → ``complete``
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import logging
 import re
@@ -868,9 +867,7 @@ class OnboardingService:
         # Skipped when: (a) already in a terminal onboarding step, or
         #               (b) a business already exists for this owner (EC10).
         _terminal_steps = {
-            "pairing", "pairing_mode_choice", "pairing_qr_active",
-            "pairing_scam_warning", "calendar_setup", "call_forwarding",
-            "complete", "post_onboarding",
+            "pairing", "calendar_setup", "call_forwarding", "complete", "post_onboarding"
         }
         _current_step = (session or {}).get("currentStep", "")
         if not existing_biz and _current_step not in _terminal_steps:
@@ -893,25 +890,6 @@ class OnboardingService:
                         session, biz, phone, body, push_name, message_id
                     )
                     return
-
-            # ── New pairing sub-steps (device-choice → QR or code) ────────
-
-            # Step 1: waiting for user to choose QR vs. pairing code.
-            if step == "pairing_mode_choice":
-                await self._handle_pairing_mode_choice(session, phone, body)
-                return
-
-            # Step 2a: QR code was sent; waiting for scan confirmation.
-            if step == "pairing_qr_active":
-                await self._handle_pairing_qr_active(session, phone, body)
-                return
-
-            # Step 2b: scam-warning was sent; waiting for YES before sending code.
-            if step == "pairing_scam_warning":
-                await self._handle_pairing_scam_warning(session, phone, body)
-                return
-
-            # ─────────────────────────────────────────────────────────────────
 
             # Pairing step — code logic handles all pairing actions;
             # try fast substring checks first (covers natural phrasing),
@@ -2549,8 +2527,20 @@ class OnboardingService:
                 )
                 await self._send_pairing_code(refreshed, phone)
         else:
-            # Fresh pairing needed — let the user choose between QR and pairing code.
-            await self._start_pairing_mode_choice(refreshed, phone, biz_name)
+            # Fresh pairing needed — send phone-linking instructions first
+            pairing_msg = (
+                f"🎉 *{biz_name}* is now live!\n\n"
+                "Now let's connect your business WhatsApp so I can answer your customers.\n\n"
+                "📱 On your phone:\n"
+                "1️⃣ Open WhatsApp\n"
+                "2️⃣ Settings → Linked Devices\n"
+                "3️⃣ Link a Device\n"
+                "4️⃣ Choose *Link with phone number instead*\n\n"
+                "⏳ Sending you a pairing code in 3 seconds…"
+            )
+            await self._send(phone, pairing_msg)
+            await asyncio.sleep(3)
+            await self._send_pairing_code(refreshed, phone)
 
     async def _extract_business_data(self, history: list[dict]) -> dict:
         """Use Claude to extract structured business data from the conversation."""
@@ -2681,335 +2671,6 @@ class OnboardingService:
             "Copy the code above ☝🏼 and paste it on the screen you opened.\n"
             "⏱ 60 seconds\n\n"
             "Reply *done* when linked, *new code* for a fresh code, or *skip* to do it later.",
-        )
-
-    # ── QR / pairing-mode helpers ─────────────────────────────────────────
-
-    @staticmethod
-    def _qr_payload_to_png_bytes(qr_payload: str) -> bytes:
-        """Convert a raw WhatsApp QR payload string into a PNG image (bytes).
-
-        Uses the ``qrcode`` library (must be installed; listed in requirements.txt
-        as ``qrcode[pil]``).  The image is sized for comfortable mobile scanning:
-        10 px per module with a 4-module quiet border.
-
-        Args:
-            qr_payload: Raw QR payload string returned by the bridge's
-                        ``/api/qr-payload`` or ``/api/qr-current/:session_id``
-                        endpoints.
-
-        Returns:
-            PNG image as raw bytes, ready to send via ``WhatsmeowClient.send_image``.
-
-        Raises:
-            ImportError: If the ``qrcode`` or ``Pillow`` packages are not installed.
-            ValueError: If *qr_payload* is empty.
-        """
-        if not qr_payload:
-            raise ValueError("qr_payload must not be empty")
-
-        try:
-            import qrcode  # type: ignore[import]
-        except ImportError as exc:
-            raise ImportError(
-                "The 'qrcode[pil]' package is required for QR image generation. "
-                "Install it with: pip install 'qrcode[pil]'"
-            ) from exc
-
-        qr = qrcode.QRCode(
-            version=None,                                   # auto-detect size
-            error_correction=qrcode.constants.ERROR_CORRECT_L,
-            box_size=10,
-            border=4,
-        )
-        qr.add_data(qr_payload)
-        qr.make(fit=True)
-
-        img = qr.make_image(fill_color="black", back_color="white")
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
-
-    async def _send_qr_image(self, session: dict, phone: str) -> bool:
-        """Fetch the current QR payload from the bridge, convert to PNG, and
-        send it to *phone* as a WhatsApp image message.
-
-        Returns ``True`` on success, ``False`` when no QR payload could be
-        obtained (e.g. bridge offline or session already paired).
-        """
-        pairing_sid = session.get("pairingSessionId", f"biz-{phone}")
-
-        try:
-            # Use the current (non-blocking) endpoint first.  If none is
-            # available yet, fall back to the blocking start endpoint.
-            result = await self.wa.get_qr_current(pairing_sid)
-            if result is None:
-                result = await self.wa.get_qr_payload(pairing_sid, timeout_seconds=15)
-        except PairingStateConflict:
-            logger.info("[QR] Session %s is already paired; skipping QR send", pairing_sid)
-            return False
-        except Exception as exc:
-            logger.error("[QR] Failed to get QR payload for session %s: %s", pairing_sid, exc)
-            return False
-
-        qr_payload = (result or {}).get("qr_payload", "")
-        if not qr_payload:
-            logger.error("[QR] Bridge returned empty qr_payload for session %s", pairing_sid)
-            return False
-
-        try:
-            png_bytes = self._qr_payload_to_png_bytes(qr_payload)
-        except Exception as exc:
-            logger.error("[QR] Failed to convert QR payload to PNG: %s", exc)
-            return False
-
-        try:
-            device_id = session.get("pairingSessionId")  # use the business session
-            await self.wa.send_image(
-                phone=phone,
-                image_bytes=png_bytes,
-                caption="📲 Scan this QR code in WhatsApp → Settings → Linked Devices → Link a Device",
-                mime_type="image/png",
-                device_id=self.wa.default_device_id,   # send via the onboarding device
-            )
-            logger.info("[QR] QR image sent to %s (session=%s)", phone, pairing_sid)
-            return True
-        except Exception as exc:
-            logger.error("[QR] Failed to send QR image to %s: %s", phone, exc)
-            return False
-
-    async def _start_pairing_mode_choice(
-        self, session: dict, phone: str, biz_name: str
-    ) -> None:
-        """Ask the owner whether they want to link via QR code (another device)
-        or via pairing code (same phone), then transition to the appropriate sub-step.
-        """
-        db.upsert_onboarding_session(phone, {"currentStep": "pairing_mode_choice"})
-        await self._send(
-            phone,
-            f"🎉 *{biz_name}* is now live!\n\n"
-            "📱 *How would you like to connect your business WhatsApp?*\n\n"
-            "1️⃣ *Scan QR code* — if you have a tablet, computer, or another phone nearby\n"
-            "2️⃣ *Pairing code* — if you only have this phone with you\n\n"
-            "Reply *1* or *QR* for option 1, or *2* or *code* for option 2.",
-        )
-
-    async def _handle_pairing_mode_choice(
-        self, session: dict, phone: str, body: str
-    ) -> None:
-        """Handle the owner's reply to the QR-vs-pairing-code choice message."""
-        normalized = body.strip().lower()
-
-        # Keywords for each option — handle common language variations.
-        _qr_words = {
-            "1", "qr", "scan", "qr code", "scan qr", "other device", "tablet",
-            "computer", "laptop", "another device", "another phone",
-            "escaner", "qr code scan", "scaner", "scannear",
-        }
-        _code_words = {
-            "2", "code", "pairing code", "same phone", "this phone", "phone",
-            "código", "codigo", "pair", "sms", "only phone",
-        }
-
-        if any(normalized == w or normalized.startswith(w) for w in _qr_words):
-            # User wants QR code.
-            db.upsert_onboarding_session(phone, {"currentStep": "pairing_qr_active"})
-            ok = await self._send_qr_image(session, phone)
-            if ok:
-                await asyncio.sleep(1)
-                await self._send(
-                    phone,
-                    "⏱ QR codes refresh every ~20 seconds.\n\n"
-                    "Reply *done* once linked, *refresh* for a new QR code, or "
-                    "*code* to switch to a pairing code instead.",
-                )
-            else:
-                # Bridge unavailable — gracefully fall back to pairing code.
-                await self._send(
-                    phone,
-                    "⚠️ I couldn't load the QR code right now. "
-                    "Switching to the pairing-code method instead.",
-                )
-                await self._start_scam_warning(session, phone)
-            return
-
-        if any(normalized == w or normalized.startswith(w) for w in _code_words):
-            # User wants pairing code.
-            await self._start_scam_warning(session, phone)
-            return
-
-        # Unclear — gently re-prompt.
-        await self._send(
-            phone,
-            "Please reply *1* or *QR* to scan a QR code, or *2* or *code* to use a pairing code.",
-        )
-
-    async def _handle_pairing_qr_active(
-        self, session: dict, phone: str, body: str
-    ) -> None:
-        """Handle user messages while a QR code is active (waiting for scan)."""
-        normalized = body.strip().lower()
-        pairing_sid = session.get("pairingSessionId", f"biz-{phone}")
-
-        _done_words = {
-            "done", "linked", "connected", "ready", "pronto", "feito",
-            "hecho", "listo", "conectado", "scanned", "worked",
-        }
-        _refresh_words = {
-            "refresh", "new qr", "new code", "expired", "refresh qr",
-            "send again", "again", "resend", "not working", "can't scan",
-            "cannot scan",
-        }
-        _switch_to_code_words = {
-            "code", "pairing code", "phone number", "same phone", "link code",
-            "use code", "switch to code", "código", "codigo",
-        }
-
-        if any(w in normalized for w in _done_words):
-            # Check bridge status to confirm the scan actually happened.
-            try:
-                status_data = await self.wa.get_session_status(pairing_sid)
-                if status_data.get("paired") or status_data.get("status") == "connected":
-                    await self._handle_pairing(session, phone, "done")
-                    return
-            except Exception as exc:
-                logger.warning("[QR] Could not verify session status for %s: %s", pairing_sid, exc)
-
-            await self._send(
-                phone,
-                "🤔 I don't see the WhatsApp link yet. "
-                "Please make sure you scanned the QR code fully, then reply *done* again.\n\n"
-                "Reply *refresh* for a new QR code or *code* to use a pairing code instead.",
-            )
-            return
-
-        if any(w in normalized for w in _refresh_words):
-            # Send a fresh QR code by polling the bridge's current-payload endpoint.
-            try:
-                result = await self.wa.get_qr_current(pairing_sid)
-                if result is None:
-                    # QR session may have timed out entirely; restart it.
-                    result = await self.wa.get_qr_payload(pairing_sid, timeout_seconds=15)
-            except PairingStateConflict:
-                await self._handle_pairing(session, phone, "done")
-                return
-            except Exception as exc:
-                logger.error("[QR] Refresh failed for %s: %s", pairing_sid, exc)
-                await self._send(
-                    phone,
-                    "⚠️ I couldn't refresh the QR code right now — please try again in a moment.",
-                )
-                return
-
-            qr_payload = (result or {}).get("qr_payload", "")
-            if not qr_payload:
-                await self._send(
-                    phone,
-                    "⚠️ The QR code is not ready yet — please wait a moment and reply *refresh* again.",
-                )
-                return
-
-            try:
-                png_bytes = self._qr_payload_to_png_bytes(qr_payload)
-                await self.wa.send_image(
-                    phone=phone,
-                    image_bytes=png_bytes,
-                    caption="📲 Scan this QR code in WhatsApp → Settings → Linked Devices → Link a Device",
-                    mime_type="image/png",
-                    device_id=self.wa.default_device_id,
-                )
-                await asyncio.sleep(1)
-                await self._send(
-                    phone,
-                    "Fresh QR code sent! ☝🏼\n\n"
-                    "Reply *done* once linked, *refresh* for another new code, or "
-                    "*code* to switch to a pairing code.",
-                )
-            except Exception as exc:
-                logger.error("[QR] Failed to send refreshed QR image to %s: %s", phone, exc)
-                await self._send(
-                    phone,
-                    "⚠️ Couldn't send the refreshed QR — please reply *code* to use a pairing code instead.",
-                )
-            return
-
-        if any(w in normalized for w in _switch_to_code_words):
-            # Owner wants to switch to the pairing-code flow.
-            await self._start_scam_warning(session, phone)
-            return
-
-        # Anything else — remind them of their options.
-        await self._send(
-            phone,
-            "Reply *done* once you've scanned the QR code, *refresh* for a new one "
-            "(they expire in ~20 s), or *code* to use a pairing code instead.",
-        )
-
-    async def _start_scam_warning(self, session: dict, phone: str) -> None:
-        """Send the regulatory scam-warning required before generating a
-        pairing code, then transition to ``pairing_scam_warning`` step.
-        """
-        db.upsert_onboarding_session(phone, {"currentStep": "pairing_scam_warning"})
-        await self._send(
-            phone,
-            "⚠️ *Before we continue — please read this:*\n\n"
-            'WhatsApp may show a screen saying:\n\n'
-            '*"This may be a scam"*\n\n'
-            "This appears automatically whenever WhatsApp links a device using a "
-            "pairing code instead of a QR scan.\n\n"
-            "✅ This is expected\n"
-            "✅ Your account remains fully under your control\n"
-            "✅ You can unlink anytime from WhatsApp settings\n\n"
-            "Reply *YES* to continue.",
-        )
-
-    async def _handle_pairing_scam_warning(
-        self, session: dict, phone: str, body: str
-    ) -> None:
-        """Handle the owner's reply to the scam-warning message.
-
-        Only generates and sends the pairing code after an explicit YES.
-        """
-        normalized = body.strip().lower()
-
-        _yes_words = {"yes", "sim", "sí", "si", "ok", "okay", "sure", "proceed",
-                      "continue", "yep", "yeah", "y", "oui", "ja"}
-
-        if any(w in normalized for w in _yes_words):
-            # User confirmed — generate and send the pairing code.
-            # Transition back to the standard "pairing" step so the existing
-            # _handle_pairing / _send_pairing_code machinery takes over.
-            db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
-            await self._send_pairing_code(session, phone)
-            return
-
-        _qr_words = {"qr", "scan", "qr code", "other device", "use qr", "switch to qr"}
-        if any(w in normalized for w in _qr_words):
-            # Owner wants to switch back to the QR flow.
-            db.upsert_onboarding_session(phone, {"currentStep": "pairing_qr_active"})
-            ok = await self._send_qr_image(session, phone)
-            if ok:
-                await asyncio.sleep(1)
-                await self._send(
-                    phone,
-                    "⏱ QR codes refresh every ~20 seconds.\n\n"
-                    "Reply *done* once linked, *refresh* for a new QR code, or "
-                    "*code* to switch back to a pairing code.",
-                )
-            else:
-                # QR unavailable — re-send the warning so they can confirm YES.
-                db.upsert_onboarding_session(phone, {"currentStep": "pairing_scam_warning"})
-                await self._send(
-                    phone,
-                    "⚠️ I couldn't load the QR code right now.\n\n"
-                    "Reply *YES* to get a pairing code instead.",
-                )
-            return
-
-        # Not a clear YES — gently remind them.
-        await self._send(
-            phone,
-            "Please reply *YES* to generate your pairing code, or *QR* to go back to the QR scan option.",
         )
 
     async def _send_pairing_code(self, session: dict, phone: str) -> None:
@@ -3465,10 +3126,19 @@ class OnboardingService:
                         "Reply *done* once messages start flowing through.",
                     )
             else:
-                # Needs fresh pairing — let the owner choose QR vs. pairing code.
-                await self._start_pairing_mode_choice(
-                    refreshed, phone, biz_name
+                # Needs fresh pairing
+                pairing_msg = (
+                    f"Sure! Let's connect your WhatsApp for *{biz_name}*. 📱\n\n"
+                    "On your phone:\n"
+                    "1️⃣ Open WhatsApp\n"
+                    "2️⃣ Settings → Linked Devices\n"
+                    "3️⃣ Link a Device\n"
+                    "4️⃣ Choose *Link with phone number instead*\n\n"
+                    "⏳ Sending you a pairing code in 3 seconds…"
                 )
+                await self._send(phone, pairing_msg)
+                await asyncio.sleep(3)
+                await self._send_pairing_code(refreshed, phone)
             return
 
         # ── disconnect / unlink WhatsApp ───────────────────────────────

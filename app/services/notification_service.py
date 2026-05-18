@@ -213,6 +213,7 @@ class NotificationService:
         customer_name: str,
         business_name: str,
         language: str = "en",
+        business_phone: str = "",
     ) -> bool:
         messages = {
             "pt": (
@@ -226,7 +227,7 @@ class NotificationService:
                 f"Thank you — {business_name}"
             ),
         }
-        body = messages.get(language, messages["en"])
+        body = messages.get(language, messages["en"]) + self._wa_footer(business_phone)
         return self._send(customer_phone, body)
 
     def notify_owner_reschedule(

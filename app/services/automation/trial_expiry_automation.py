@@ -73,6 +73,7 @@ def _is_stopped(business: dict) -> bool:
         return True
     return False
 
+
 def _build_reminder_message(business: dict, days_after_expiry: int) -> str:
     """Build a WhatsApp/SMS reminder message for the owner."""
     biz_name = business.get("name") or "your business"

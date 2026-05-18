@@ -43,7 +43,6 @@ stripe==11.2.0
 phonenumbers==8.13.51
 pytz==2024.2
 langdetect==1.0.9
-qrcode[pil]>=7.4      # QR code image generation for WhatsApp pairing flow
 
 # ── Testing ──
 pytest==8.3.4

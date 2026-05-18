@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     APIFY_GOOGLE_PLACES_ACTOR_ID: str = "compass~crawler-google-places"  # Maps fallback actor
     GOOGLE_CREDENTIALS_FILE: str = "./credentials.json"  # service account for owner calendar
     GOOGLE_CALENDAR_ID: str = "primary"                  # owner calendar ID or email
+    GOOGLE_SERVICE_ACCOUNT_CALENDAR_ID: str = "primary"  # calendar ID for service account
     GOOGLE_CALENDAR_TIMEZONE: str = "Europe/Lisbon"      # timezone for calendar events
     BUSINESS_TIMEZONE: str = "Europe/Lisbon"             # local timezone for booking display & reminders
     

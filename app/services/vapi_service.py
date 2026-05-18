@@ -25,18 +25,199 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytz
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 from app import firestore as fs
 from app.config import settings
-from app.integrations.google_calendar import google_calendar
-from app.integrations.calendar_sync import sync_create as _cal_create, sync_update as _cal_update, sync_delete as _cal_delete
 from app.services.notification_service import notifications
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-# ── Tool result helpers ──────────────────────────────────────────────────────
+# ── Direct Google Calendar API Helpers ───────────────────────────────────────
+
+def _get_calendar_service():
+    """Build Google Calendar service using service account credentials."""
+    credentials = service_account.Credentials.from_service_account_file(
+        settings.GOOGLE_CREDENTIALS_FILE,
+        scopes=['https://www.googleapis.com/auth/calendar'],
+    )
+    return build('calendar', 'v3', credentials=credentials)
+
+
+def _cal_create_both(booking_data: dict, business: dict) -> tuple[str | None, str | None]:
+    """Create calendar event using Service Account credentials.
+
+    Returns (None, service_account_event_id).
+    """
+    booking_id = booking_data.get("id", "?")
+    biz_id = business.get("id", "?")
+    service_event_id = None
+
+    # Parse start datetime
+    try:
+        start_dt_raw = booking_data.get("datetime")
+        if isinstance(start_dt_raw, str):
+            start_dt = datetime.fromisoformat(start_dt_raw.replace("Z", "+00:00"))
+        else:
+            start_dt = start_dt_raw
+    except Exception as exc:
+        logger.error("[Calendar] Failed to parse datetime for booking %s: %s", booking_id, exc)
+        return None, None
+
+    # Build event details
+    customer_name = booking_data.get("customerName", "")
+    customer_phone = booking_data.get("customerPhone") or booking_data.get("callerPhone", "")
+    service_name = booking_data.get("serviceName", "Appointment")
+    duration_minutes = int(booking_data.get("serviceDuration") or 60)
+    notes = booking_data.get("notes", "")
+    
+    end_dt = start_dt + timedelta(minutes=duration_minutes)
+    
+    business_name = business.get("name", "Business")
+    event = {
+        'summary': f"[{business_name}] {service_name} - {customer_name}" if customer_name else f"[{business_name}] {service_name}",
+        'description': f"Business: {business_name}\nBusinessID: {biz_id}\nBookingID: {booking_id}\nCustomer: {customer_name}\nPhone: {customer_phone}\nNotes: {notes}",
+        'start': {
+            'dateTime': start_dt.isoformat(),
+            'timeZone': business.get("timezone") or settings.GOOGLE_CALENDAR_TIMEZONE or "UTC",
+        },
+        'end': {
+            'dateTime': end_dt.isoformat(),
+            'timeZone': business.get("timezone") or settings.GOOGLE_CALENDAR_TIMEZONE or "UTC",
+        },
+        'extendedProperties': {
+            'private': {
+                'businessId': biz_id,
+                'bookingId': booking_id,
+            }
+        },
+    }
+
+    service_calendar_id = settings.GOOGLE_CALENDAR_ID or "primary"
+    print(f"[Calendar] CREATE booking={booking_id} biz={biz_id} calendar={service_calendar_id} credentials={settings.GOOGLE_CREDENTIALS_FILE}")
+    
+    try:
+        service = _get_calendar_service()
+        created_event = service.events().insert(
+            calendarId=service_calendar_id,
+            body=event
+        ).execute()
+        service_event_id = created_event.get('id')
+        
+        if service_event_id:
+            print(f"[Calendar] CREATE SUCCESS booking={booking_id} event={service_event_id}")
+        else:
+            print(f"[Calendar] CREATE FAILED (no event ID) booking={booking_id}")
+    except Exception as exc:
+        print(f"[Calendar] CREATE EXCEPTION booking={booking_id}: {exc}")
+        logger.error("[Calendar] CREATE EXCEPTION booking=%s: %s", booking_id, exc, exc_info=True)
+
+    return None, service_event_id
+
+
+def _cal_update_both(
+    booking_id: str,
+    oauth_event_id: str | None,
+    service_event_id: str | None,
+    business: dict,
+    start_dt: datetime,
+    duration_minutes: int = 60,
+    customer_name: str = "",
+    service_name: str = "",
+    notes: str = "",
+) -> bool:
+    """Update calendar event using Service Account credentials.
+
+    Returns True if the update succeeded.
+    """
+    # Use whichever event ID is available (service_event_id preferred, oauth_event_id as fallback)
+    event_id = service_event_id or oauth_event_id
+    if not event_id:
+        print(f"[Calendar] UPDATE skipped booking={booking_id} — no event ID stored")
+        return False
+
+    end_dt = start_dt + timedelta(minutes=duration_minutes)
+    business_name = business.get("name", "Business")
+    event = {
+        'summary': f"[{business_name}] {service_name} - {customer_name}" if customer_name else f"[{business_name}] {service_name}",
+        'description': f"Business: {business_name}\nBusinessID: {business.get('id', '?')}\nBookingID: {booking_id}\nCustomer: {customer_name}\nNotes: {notes}",
+        'start': {
+            'dateTime': start_dt.isoformat(),
+            'timeZone': business.get("timezone") or settings.GOOGLE_CALENDAR_TIMEZONE or "UTC",
+        },
+        'end': {
+            'dateTime': end_dt.isoformat(),
+            'timeZone': business.get("timezone") or settings.GOOGLE_CALENDAR_TIMEZONE or "UTC",
+        },
+        'extendedProperties': {
+            'private': {
+                'businessId': business.get('id', '?'),
+                'bookingId': booking_id,
+            }
+        },
+    }
+
+    service_calendar_id = settings.GOOGLE_CALENDAR_ID or "primary"
+    print(f"[Calendar] UPDATE booking={booking_id} event={event_id} calendar={service_calendar_id}")
+    
+    try:
+        service = _get_calendar_service()
+        updated_event = service.events().update(
+            calendarId=service_calendar_id,
+            eventId=event_id,
+            body=event
+        ).execute()
+        
+        if updated_event:
+            print(f"[Calendar] UPDATE SUCCESS booking={booking_id} event={event_id}")
+            return True
+        else:
+            print(f"[Calendar] UPDATE FAILED booking={booking_id} event={event_id}")
+            return False
+    except Exception as exc:
+        print(f"[Calendar] UPDATE EXCEPTION booking={booking_id}: {exc}")
+        logger.error("[Calendar] UPDATE EXCEPTION booking=%s: %s", booking_id, exc, exc_info=True)
+        return False
+
+
+def _cal_delete_both(
+    booking_id: str,
+    oauth_event_id: str | None,
+    service_event_id: str | None,
+    business: dict,
+) -> bool:
+    """Delete calendar event using Service Account credentials.
+
+    Returns True if the deletion succeeded.
+    """
+    # Use whichever event ID is available (service_event_id preferred, oauth_event_id as fallback)
+    event_id = service_event_id or oauth_event_id
+    if not event_id:
+        print(f"[Calendar] DELETE skipped booking={booking_id} — no event ID stored")
+        return False
+
+    service_calendar_id = settings.GOOGLE_CALENDAR_ID or "primary"
+    print(f"[Calendar] DELETE booking={booking_id} event={event_id} calendar={service_calendar_id}")
+    
+    try:
+        service = _get_calendar_service()
+        service.events().delete(
+            calendarId=service_calendar_id,
+            eventId=event_id
+        ).execute()
+        
+        print(f"[Calendar] DELETE SUCCESS booking={booking_id} event={event_id}")
+        return True
+    except Exception as exc:
+        print(f"[Calendar] DELETE EXCEPTION booking={booking_id}: {exc}")
+        logger.error("[Calendar] DELETE EXCEPTION booking=%s: %s", booking_id, exc, exc_info=True)
+        return False
+
+
+
 
 def _ok(msg: str) -> str:
     return msg
@@ -251,13 +432,33 @@ def tool_create_booking(args: dict[str, Any], call_info: dict) -> str:
 
     date_str = booking_dt.date().isoformat()
     day_bookings = _list_day_bookings(business["id"], date_str)
+    
+    # Also check Google Calendar for conflicts
+    calendar_events = _get_google_calendar_events_for_day(date_str, business["id"])
+    calendar_conflicts = sum(
+        1 for event in calendar_events
+        if _calendar_event_overlaps_slot(booking_dt_local, duration, event)
+    )
+    
+    # Count existing bookings at this time
     booked_headcount = sum(
         _get_party_size(b)
         for b in day_bookings
         if _slot_overlaps_booking(booking_dt, duration, b)
     )
-    if booked_headcount + party_size > capacity_per_hour:
-        remaining = max(0, capacity_per_hour - booked_headcount)
+    
+    # For capacity=1, any calendar conflict blocks the slot entirely
+    if capacity_per_hour == 1 and calendar_conflicts > 0:
+        return _err(
+            f"Sorry, that time slot is already booked. "
+            f"Please choose a different time."
+        )
+    
+    # Add calendar conflicts to total headcount
+    total_headcount = booked_headcount + calendar_conflicts
+    
+    if total_headcount + party_size > capacity_per_hour:
+        remaining = max(0, capacity_per_hour - total_headcount)
         return _err(
             f"Sorry, that time slot only has capacity for {remaining} more "
             f"{'person' if remaining == 1 else 'people'}. "
@@ -305,11 +506,9 @@ def tool_create_booking(args: dict[str, Any], call_info: dict) -> str:
         )
         existing_id = existing_booking.get("id", booking_id)
         formatted_dt = booking_dt_local.strftime("%B %d, %Y at %I:%M %p")
-        return (
-            f"Booking confirmed! ID: {existing_id}\n"
-            f"Service: {service_name}\n"
-            f"Date/Time: {formatted_dt}\n"
-            f"Name: {customer_name}"
+        return _err(
+            f"You already have a booking for {service_name} on {formatted_dt}. "
+            f"Your booking ID is {existing_id}. Would you like to reschedule or cancel this booking instead?"
         )
 
     # ── Atomic capacity check + create (DB FIRST — prevents orphan calendar events) ──
@@ -330,8 +529,20 @@ def tool_create_booking(args: dict[str, Any], call_info: dict) -> str:
             f"(maximum {slots_per_hour} booking(s) per hour).{next_hint}"
         )
     print(f"[BOOKING CREATED] {booking_id} for business={business['id']} customer={customer_phone} at {booking_dt_utc.isoformat()} (local {booking_dt_local.isoformat()})")
-    # Sync to Google Calendar AFTER DB save — prevents orphan calendar events
-    calendar_event_id = _cal_create(booking_data, business)
+    # Sync to Google Calendar (BOTH OAuth + Service Account) AFTER DB save — prevents orphan calendar events
+    oauth_event_id, service_event_id = _cal_create_both(booking_data, business)
+    
+    # Store both event IDs in the booking for future updates/deletes
+    if oauth_event_id or service_event_id:
+        try:
+            updates = {}
+            if oauth_event_id:
+                updates["calendarEventId"] = oauth_event_id
+            if service_event_id:
+                updates["calendarEventIdBackup"] = service_event_id
+            fs.update_booking(booking_id, updates, business["id"])
+        except Exception as exc:
+            logger.warning("[CalendarDual] Could not store event IDs in booking %s: %s", booking_id, exc)
 
     # Fire-and-forget WhatsApp confirmation to customer.
     # Skip when source is "whatsapp" — the customer_ai_service already sends
@@ -358,6 +569,66 @@ def tool_create_booking(args: dict[str, Any], call_info: dict) -> str:
 
     formatted_dt = booking_dt_local.strftime("%B %d, %Y at %I:%M %p")
 
+    # ── SMS Notifications ────────────────────────────────────────────────────
+    # Send SMS confirmation to customer
+    try:
+        business_name = business.get("name", "our business")
+        business_phone = business.get("phoneNumber", "") or business.get("ownerPhone", "")
+        logger.info(
+            "[TWILIO-SMS] CREATE-BOOKING: Attempting to send confirmation SMS to customer=%s, "
+            "booking_id=%s, business=%s, service=%s, datetime=%s, language=%s",
+            customer_phone, booking_id, business_name, service_name, formatted_dt, language
+        )
+        notifications.confirm_booking_to_customer(
+            customer_phone=customer_phone,
+            customer_name=customer_name or "there",
+            business_name=business_name,
+            service_name=service_name,
+            booking_datetime=formatted_dt,
+            language=language,
+            business_phone=business_phone,
+        )
+        logger.info(
+            "[TWILIO-SMS] CREATE-BOOKING SUCCESS: Customer confirmation sent to %s for booking %s",
+            customer_phone, booking_id
+        )
+        print(f"[SMS] Booking confirmation sent to {customer_phone}")
+    except Exception as _sms_err:
+        logger.error(
+            "[TWILIO-SMS] CREATE-BOOKING FAILED: Customer confirmation to %s failed for booking %s. Error: %s",
+            customer_phone, booking_id, _sms_err, exc_info=True
+        )
+
+    # Send SMS notification to owner
+    try:
+        owner_phone = business.get("ownerPhone", "")
+        if owner_phone:
+            logger.info(
+                "[TWILIO-SMS] CREATE-BOOKING: Attempting to send notification to owner=%s, "
+                "booking_id=%s, customer=%s (%s), service=%s, new_customer=%s",
+                owner_phone, booking_id, customer_name, customer_phone, service_name, is_new
+            )
+            notifications.notify_owner_new_booking(
+                owner_phone=owner_phone,
+                customer_name=customer_name or "Customer",
+                customer_phone=customer_phone,
+                service_name=service_name,
+                booking_datetime=formatted_dt,
+                is_new_customer=is_new,
+            )
+            logger.info(
+                "[TWILIO-SMS] CREATE-BOOKING SUCCESS: Owner notification sent to %s for booking %s",
+                owner_phone, booking_id
+            )
+            print(f"[SMS] Booking notification sent to owner {owner_phone}")
+        else:
+            logger.warning("[TWILIO-SMS] CREATE-BOOKING: No owner phone configured for business %s", business.get("id"))
+    except Exception as _sms_owner_err:
+        logger.error(
+            "[TWILIO-SMS] CREATE-BOOKING FAILED: Owner notification to %s failed for booking %s. Error: %s",
+            owner_phone, booking_id, _sms_owner_err, exc_info=True
+        )
+
     # Owner WhatsApp notification — always sent regardless of source so the
     # owner knows when a customer books via voice (VAPI) or any other channel.
     try:
@@ -376,7 +647,7 @@ def tool_create_booking(args: dict[str, Any], call_info: dict) -> str:
     except Exception as _notify_err:
         logger.warning("[Booking] Owner notification skipped: %s", _notify_err)
 
-    cal_note = " Calendar event created." if calendar_event_id else ""
+    cal_note = " Calendar event created." if (oauth_event_id or service_event_id) else ""
     spoken_id = _speak_booking_id(booking_id)
     return _ok(
         f"Booking confirmed for {customer_name} on {formatted_dt} for {service_name}. "
@@ -579,6 +850,31 @@ def reschedule_booking_payload(args: dict[str, Any], call_info: dict) -> dict[st
     except ValueError:
         return {"error": f"Invalid datetime format: {raw_new_dt}"}
 
+    # ── Resolve business timezone and make new_dt timezone-aware ──────────
+    biz_tz_name = business.get("timezone") or "UTC"
+    if biz_tz_name == "UTC":
+        owner_phone = business.get("ownerPhone", "")
+        if owner_phone:
+            try:
+                from app.services.onboarding_service import _infer_timezone_from_phone
+                inferred = _infer_timezone_from_phone(owner_phone)
+                if inferred and inferred != "UTC":
+                    biz_tz_name = inferred
+            except Exception:
+                pass
+    try:
+        biz_tz = pytz.timezone(biz_tz_name)
+    except Exception:
+        biz_tz = pytz.UTC
+        biz_tz_name = "UTC"
+
+    if new_dt.tzinfo is None:
+        new_dt = biz_tz.localize(new_dt)
+        logger.info("[TZ] reschedule naive → localized to %s: %s", biz_tz_name, new_dt.isoformat())
+    new_dt_utc = new_dt.astimezone(pytz.UTC)
+    new_dt_local = new_dt.astimezone(biz_tz)
+    # ────────────────────────────────────────────────────────────────────────
+
     # Determine new party size (use updated value or fall back to existing booking)
     new_party_size = booking.get("partySize") or 1
     if args.get("partySize") is not None:
@@ -590,18 +886,38 @@ def reschedule_booking_payload(args: dict[str, Any], call_info: dict) -> dict[st
     except (TypeError, ValueError):
         capacity_per_hour = 1
 
+    duration = _to_int(booking.get("serviceDuration") or args.get("durationMinutes", 60), 60)
+    date_str = new_dt_utc.date().isoformat()
+    day_bookings = _list_day_bookings(business["id"], date_str)
+    
+    # Check Google Calendar for conflicts
+    calendar_events = _get_google_calendar_events_for_day(date_str, business["id"])
+    calendar_conflicts = sum(
+        1 for event in calendar_events
+        if _calendar_event_overlaps_slot(new_dt_local, duration, event)
+    )
+    
+    # For capacity=1, any calendar conflict blocks the slot (unless it's the current booking's event)
+    if capacity_per_hour == 1 and calendar_conflicts > 0:
+        return {
+            "error": (
+                f"Sorry, that time slot is already booked. "
+                f"Please choose a different time."
+            )
+        }
+    
     if capacity_per_hour > 1:
-        duration = _to_int(booking.get("serviceDuration") or args.get("durationMinutes", 60), 60)
-        date_str = new_dt.date().isoformat()
-        day_bookings = _list_day_bookings(business["id"], date_str)
         # Count headcount at the target slot, EXCLUDING this booking (it's moving)
         other_headcount = sum(
             _get_party_size(b)
             for b in day_bookings
-            if b.get("id") != booking_id and _slot_overlaps_booking(new_dt, duration, b)
+            if b.get("id") != booking_id and _slot_overlaps_booking(new_dt_utc, duration, b)
         )
-        if other_headcount + new_party_size > capacity_per_hour:
-            remaining = max(0, capacity_per_hour - other_headcount)
+        
+        total_headcount = other_headcount + calendar_conflicts
+        
+        if total_headcount + new_party_size > capacity_per_hour:
+            remaining = max(0, capacity_per_hour - total_headcount)
             return {
                 "error": (
                     f"Sorry, that time slot only has capacity for {remaining} more "
@@ -612,7 +928,7 @@ def reschedule_booking_payload(args: dict[str, Any], call_info: dict) -> dict[st
             }
 
     updates: dict[str, Any] = {
-        "datetime": new_dt.isoformat(),
+        "datetime": new_dt_utc.isoformat(),
         "updatedAt": datetime.utcnow().isoformat(),
         "status": "confirmed",
     }
@@ -636,33 +952,104 @@ def reschedule_booking_payload(args: dict[str, Any], call_info: dict) -> dict[st
     if not updated:
         return {"error": f"Failed to reschedule booking {booking_id}"}
 
-    # Sync Google Calendar — update the existing event with the new time
-    calendar_event_id = booking.get("calendarEventId")
-    if calendar_event_id:
+    # Sync Google Calendar — update the existing event with the new time (both OAuth + backup)
+    oauth_event_id = booking.get("calendarEventId")
+    service_event_id = booking.get("calendarEventIdBackup")
+    if oauth_event_id or service_event_id:
         duration = _to_int(
             updates.get("serviceDuration") or booking.get("serviceDuration") or 60, 60
         )
-        _cal_update(
+        _cal_update_both(
             booking_id=booking_id,
-            event_id=calendar_event_id,
+            oauth_event_id=oauth_event_id,
+            service_event_id=service_event_id,
             business=business,
-            start_dt=new_dt,
+            start_dt=new_dt_utc,
             duration_minutes=duration,
             customer_name=updates.get("customerName") or booking.get("customerName", ""),
             service_name=updates.get("serviceName") or booking.get("serviceName", ""),
             notes=updates.get("notes") or booking.get("notes", ""),
         )
 
+    # Prepare formatted datetime for notifications
+    try:
+        new_dt_fmt = new_dt_local.strftime("%B %d, %Y at %I:%M %p")
+    except Exception:
+        new_dt_fmt = str(new_dt_local)
+
+    customer_name_str = updates.get("customerName") or booking.get("customerName", "Unknown")
+    customer_phone_str = booking.get("customerPhone") or booking.get("callerPhone", "")
+    service_name_str = updates.get("serviceName") or booking.get("serviceName", "Appointment")
+    old_dt = _parse_slot_datetime(booking.get("datetime"))
+    old_dt_fmt = old_dt.strftime("%B %d, %Y at %I:%M %p") if old_dt else "previous time"
+
+    # SMS notifications for reschedule
+    try:
+        customer_language = booking.get("customerLanguage", "en")
+        logger.info(
+            "[TWILIO-SMS] RESCHEDULE: Attempting to send confirmation to customer=%s, "
+            "booking_id=%s, service=%s, old_time=%s, new_time=%s, language=%s",
+            customer_phone_str, booking_id, service_name_str, old_dt_fmt, new_dt_fmt, customer_language
+        )
+        notifications.notify_customer_reschedule(
+            customer_phone=customer_phone_str,
+            customer_name=customer_name_str,
+            business_name=business.get("name", "our business"),
+            service_name=service_name_str,
+            new_datetime=new_dt_fmt,
+            language=customer_language,
+            business_phone=business.get("phoneNumber", "") or business.get("ownerPhone", ""),
+        )
+        logger.info(
+            "[TWILIO-SMS] RESCHEDULE SUCCESS: Customer confirmation sent to %s for booking %s",
+            customer_phone_str, booking_id
+        )
+        print(f"[SMS] Reschedule confirmation sent to {customer_phone_str}")
+    except Exception as _sms_err:
+        logger.error(
+            "[TWILIO-SMS] RESCHEDULE FAILED: Customer confirmation to %s failed for booking %s. Error: %s",
+            customer_phone_str, booking_id, _sms_err, exc_info=True
+        )
+
+    try:
+        owner_phone = business.get("ownerPhone", "")
+        if owner_phone:
+            logger.info(
+                "[TWILIO-SMS] RESCHEDULE: Attempting to send notification to owner=%s, "
+                "booking_id=%s, customer=%s (%s), old_time=%s, new_time=%s",
+                owner_phone, booking_id, customer_name_str, customer_phone_str, old_dt_fmt, new_dt_fmt
+            )
+            notifications.notify_owner_reschedule(
+                owner_phone=owner_phone,
+                customer_name=customer_name_str,
+                customer_phone=customer_phone_str,
+                service_name=service_name_str,
+                old_datetime=old_dt_fmt,
+                new_datetime=new_dt_fmt,
+            )
+            logger.info(
+                "[TWILIO-SMS] RESCHEDULE SUCCESS: Owner notification sent to %s for booking %s",
+                owner_phone, booking_id
+            )
+            print(f"[SMS] Reschedule notification sent to owner {owner_phone}")
+        else:
+            logger.warning("[TWILIO-SMS] RESCHEDULE: No owner phone configured for business %s", business.get("id"))
+    except Exception as _sms_owner_err:
+        logger.error(
+            "[TWILIO-SMS] RESCHEDULE FAILED: Owner notification to %s failed for booking %s. Error: %s",
+            owner_phone, booking_id, _sms_owner_err, exc_info=True
+        )
+
+    # Customer WhatsApp reschedule notification
+    try:
+        from app.services.automation.booking_automation import send_reschedule_notice
+        asyncio.get_event_loop().create_task(send_reschedule_notice(updated, business, old_dt_fmt, new_dt_fmt))
+    except Exception as _wa_reschedule_err:
+        logger.warning("[WhatsApp] Customer reschedule notification skipped: %s", _wa_reschedule_err)
+
     # Owner WhatsApp notification
     try:
         from app.services.automation.whatsapp_notifier import send_to_owner
-        customer_name_str = updates.get("customerName") or booking.get("customerName", "Unknown")
-        customer_phone_str = booking.get("customerPhone") or booking.get("callerPhone", "")
-        service_name_str = updates.get("serviceName") or booking.get("serviceName", "Appointment")
-        try:
-            new_dt_fmt = new_dt.strftime("%B %d, %Y at %I:%M %p")
-        except Exception:
-            new_dt_fmt = str(new_dt)
         asyncio.get_event_loop().create_task(send_to_owner(
             business,
             f"🔄 *Booking rescheduled*\n"
@@ -717,19 +1104,85 @@ def cancel_booking_payload(args: dict[str, Any], call_info: dict) -> dict[str, A
     if not updated:
         return {"error": f"Failed to cancel booking {booking_id}"}
 
-    # Delete the Google Calendar event if one exists (with retry + sync status)
-    calendar_event_id = booking.get("calendarEventId")
-    if calendar_event_id:
-        _cal_delete(booking_id=booking_id, event_id=calendar_event_id, business=business)
+    # Delete the Google Calendar events if they exist (both OAuth + backup)
+    oauth_event_id = booking.get("calendarEventId")
+    service_event_id = booking.get("calendarEventIdBackup")
+    if oauth_event_id or service_event_id:
+        _cal_delete_both(booking_id=booking_id, oauth_event_id=oauth_event_id, service_event_id=service_event_id, business=business)
+
+    # Prepare formatted datetime for notifications
+    customer_name_str = booking.get("customerName", "Unknown")
+    customer_phone_str = booking.get("customerPhone") or booking.get("callerPhone", "")
+    service_name_str = booking.get("serviceName", "Appointment")
+    original_dt = _parse_slot_datetime(booking.get("datetime"))
+    formatted_cancel_dt = original_dt.strftime("%B %d, %Y at %I:%M %p") if original_dt else "scheduled time"
+
+    # SMS notifications for cancellation
+    try:
+        customer_language = booking.get("customerLanguage", "en")
+        logger.info(
+            "[TWILIO-SMS] CANCEL: Attempting to send confirmation to customer=%s, "
+            "booking_id=%s, service=%s, datetime=%s, language=%s",
+            customer_phone_str, booking_id, service_name_str, formatted_cancel_dt, customer_language
+        )
+        notifications.notify_customer_cancellation(
+            customer_phone=customer_phone_str,
+            customer_name=customer_name_str,
+            business_name=business.get("name", "our business"),
+            service_name=service_name_str,
+            booking_datetime=formatted_cancel_dt,
+            language=customer_language,
+            business_phone=business.get("phoneNumber", "") or business.get("ownerPhone", ""),
+        )
+        logger.info(
+            "[TWILIO-SMS] CANCEL SUCCESS: Customer confirmation sent to %s for booking %s",
+            customer_phone_str, booking_id
+        )
+        print(f"[SMS] Cancellation confirmation sent to {customer_phone_str}")
+    except Exception as _sms_err:
+        logger.error(
+            "[TWILIO-SMS] CANCEL FAILED: Customer confirmation to %s failed for booking %s. Error: %s",
+            customer_phone_str, booking_id, _sms_err, exc_info=True
+        )
+
+    try:
+        owner_phone = business.get("ownerPhone", "")
+        if owner_phone:
+            logger.info(
+                "[TWILIO-SMS] CANCEL: Attempting to send notification to owner=%s, "
+                "booking_id=%s, customer=%s (%s), service=%s, datetime=%s",
+                owner_phone, booking_id, customer_name_str, customer_phone_str, service_name_str, formatted_cancel_dt
+            )
+            notifications.notify_owner_cancellation(
+                owner_phone=owner_phone,
+                customer_name=customer_name_str,
+                customer_phone=customer_phone_str,
+                service_name=service_name_str,
+                booking_datetime=formatted_cancel_dt,
+            )
+            logger.info(
+                "[TWILIO-SMS] CANCEL SUCCESS: Owner notification sent to %s for booking %s",
+                owner_phone, booking_id
+            )
+            print(f"[SMS] Cancellation notification sent to owner {owner_phone}")
+        else:
+            logger.warning("[TWILIO-SMS] CANCEL: No owner phone configured for business %s", business.get("id"))
+    except Exception as _sms_owner_err:
+        logger.error(
+            "[TWILIO-SMS] CANCEL FAILED: Owner notification to %s failed for booking %s. Error: %s",
+            owner_phone, booking_id, _sms_owner_err, exc_info=True
+        )
+
+    # Customer WhatsApp cancellation notification
+    try:
+        from app.services.automation.booking_automation import send_cancellation_notice
+        asyncio.get_event_loop().create_task(send_cancellation_notice(updated, business))
+    except Exception as _wa_cancel_err:
+        logger.warning("[WhatsApp] Customer cancellation notification skipped: %s", _wa_cancel_err)
 
     # Owner WhatsApp notification
     try:
         from app.services.automation.whatsapp_notifier import send_to_owner
-        customer_name_str = booking.get("customerName", "Unknown")
-        customer_phone_str = booking.get("customerPhone") or booking.get("callerPhone", "")
-        service_name_str = booking.get("serviceName", "Appointment")
-        original_dt = _parse_slot_datetime(booking.get("datetime"))
-        formatted_cancel_dt = original_dt.strftime("%B %d, %Y at %I:%M %p") if original_dt else "scheduled time"
         asyncio.get_event_loop().create_task(send_to_owner(
             business,
             f"❌ *Booking cancelled*\n"
@@ -796,17 +1249,19 @@ def update_booking_payload(args: dict[str, Any], call_info: dict) -> dict[str, A
     if not updated:
         return {"error": f"Failed to update booking {booking_id}"}
 
-    # Sync Google Calendar when service name, notes, or other fields change
-    calendar_event_id = booking.get("calendarEventId")
-    if calendar_event_id:
+    # Sync Google Calendar when service name, notes, or other fields change (both OAuth + backup)
+    oauth_event_id = booking.get("calendarEventId")
+    service_event_id = booking.get("calendarEventIdBackup")
+    if oauth_event_id or service_event_id:
         existing_dt_raw = booking.get("datetime", "")
         try:
             existing_dt = datetime.fromisoformat(
                 str(existing_dt_raw).replace("Z", "+00:00")
             )
-            _cal_update(
+            _cal_update_both(
                 booking_id=booking_id,
-                event_id=calendar_event_id,
+                oauth_event_id=oauth_event_id,
+                service_event_id=service_event_id,
                 business=business,
                 start_dt=existing_dt,
                 duration_minutes=_to_int(
@@ -888,6 +1343,35 @@ def create_complaint_payload(args: dict[str, Any], call_info: dict) -> dict[str,
 
     created = fs.create_business_complaint(complaint_data)
 
+    # SMS notifications for complaint
+    try:
+        owner_phone = business.get("ownerPhone", "")
+        if owner_phone:
+            notifications.notify_owner_complaint(
+                owner_phone=owner_phone,
+                customer_name=customer_name,
+                customer_phone=customer_phone,
+                complaint_text=complaint_text,
+                category=complaint_type,
+            )
+            print(f"[SMS] Complaint notification sent to owner {owner_phone}")
+    except Exception as _sms_err:
+        logger.warning("[SMS] Owner complaint notification failed: %s", _sms_err)
+
+    try:
+        if customer_phone:
+            customer_language = args.get("language", "en")
+            notifications.acknowledge_complaint_to_customer(
+                customer_phone=customer_phone,
+                customer_name=customer_name,
+                business_name=business.get("name", "our business"),
+                language=customer_language,
+                business_phone=business.get("phoneNumber", "") or business.get("ownerPhone", ""),
+            )
+            print(f"[SMS] Complaint acknowledgement sent to {customer_phone}")
+    except Exception as _sms_customer_err:
+        logger.warning("[SMS] Customer complaint acknowledgement failed: %s", _sms_customer_err)
+
     return {
         "complaintId": created.get("id"),
         "businessId": business_id,
@@ -956,6 +1440,90 @@ def tool_log_complaint(args: dict[str, Any], call_info: dict) -> str:
 
 
 # ── Tool: getAvailableSlots ──────────────────────────────────────────────────
+
+def _get_google_calendar_events_for_day(date: str, business_id: str) -> list[dict]:
+    """Fetch all Google Calendar events for a specific date and business.
+    
+    Returns list of events with 'start', 'end', and 'businessId' fields.
+    """
+    try:
+        day_start = datetime.strptime(date, "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        
+        service = _get_calendar_service()
+        calendar_id = settings.GOOGLE_CALENDAR_ID or "primary"
+        
+        events_result = service.events().list(
+            calendarId=calendar_id,
+            timeMin=day_start.isoformat() + "Z",
+            timeMax=day_end.isoformat() + "Z",
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        
+        events = events_result.get('items', [])
+        
+        # Filter events for this specific business and parse times
+        business_events = []
+        for event in events:
+            # Check if event belongs to this business
+            extended_props = event.get('extendedProperties', {}).get('private', {})
+            event_business_id = extended_props.get('businessId', '')
+            
+            # Also check description for backward compatibility
+            if not event_business_id:
+                description = event.get('description', '')
+                if f'BusinessID: {business_id}' in description:
+                    event_business_id = business_id
+            
+            # Only include events for this business
+            if event_business_id == business_id:
+                start = event.get('start', {})
+                end = event.get('end', {})
+                
+                start_dt_str = start.get('dateTime') or start.get('date')
+                end_dt_str = end.get('dateTime') or end.get('date')
+                
+                if start_dt_str and end_dt_str:
+                    business_events.append({
+                        'start': start_dt_str,
+                        'end': end_dt_str,
+                        'businessId': event_business_id,
+                        'summary': event.get('summary', ''),
+                    })
+        
+        print(f"[Calendar] Fetched {len(business_events)} events for business={business_id} on {date}")
+        return business_events
+        
+    except Exception as exc:
+        logger.warning("[Calendar] Failed to fetch events for %s: %s", date, exc)
+        return []
+
+
+def _calendar_event_overlaps_slot(slot_start: datetime, duration_minutes: int, event: dict) -> bool:
+    """Check if a Google Calendar event overlaps with a slot time range."""
+    try:
+        biz_tz = ZoneInfo(settings.BUSINESS_TIMEZONE)
+        
+        # Parse event start/end times
+        event_start = _parse_slot_datetime(event.get('start'))
+        event_end = _parse_slot_datetime(event.get('end'))
+        
+        if not event_start or not event_end:
+            return False
+        
+        # Normalize slot_start to be naive
+        if slot_start.tzinfo is not None:
+            slot_start = slot_start.astimezone(biz_tz).replace(tzinfo=None)
+        
+        slot_end = slot_start + timedelta(minutes=duration_minutes)
+        
+        # Check overlap
+        return slot_start < event_end and slot_end > event_start
+        
+    except Exception:
+        return False
+
 
 def _parse_slot_datetime(value: Any) -> datetime | None:
     """Parse a datetime value and return it as a naive local-time datetime
@@ -1114,10 +1682,6 @@ def get_available_slots_payload(args: dict[str, Any], call_info: dict) -> dict[s
         }
 
     # ── Step 3: Generate candidate slots from business hours ─────────────────
-    # We intentionally do NOT use Google Calendar free/busy here because all
-    # businesses share a single calendar — its events would block slots for
-    # every business.  Instead we check only THIS business's Firestore bookings
-    # (done below in the conflict filter), which is the correct per-business check.
     candidate_slots = _default_slots(date, business.get("hours"))
     slot_source = "default-hours"
 
@@ -1129,7 +1693,9 @@ def get_available_slots_payload(args: dict[str, Any], call_info: dict) -> dict[s
     except (TypeError, ValueError):
         capacity_per_hour = 1
 
+    # Fetch both Firestore bookings AND Google Calendar events for this business
     day_bookings = _list_day_bookings(business["id"], date)
+    calendar_events = _get_google_calendar_events_for_day(date, business["id"])
     earliest_slot_dt = _resolve_earliest_slot_datetime(args, date)
     filtered_slots: list[str] = []
     slot_remaining: dict[str, int] = {}  # remaining headcount per available slot
@@ -1140,15 +1706,32 @@ def get_available_slots_payload(args: dict[str, Any], call_info: dict) -> dict[s
             continue
         if earliest_slot_dt and slot_start < earliest_slot_dt:
             continue
-        # Sum partySize of existing non-cancelled bookings that overlap this slot
+        
+        # Sum partySize of existing non-cancelled bookings that overlap this slot (Firestore)
         booked_headcount = sum(
             _get_party_size(booking)
             for booking in day_bookings
             if _slot_overlaps_booking(slot_start, duration, booking)
         )
-        remaining = capacity_per_hour - booked_headcount
+        
+        # Check Google Calendar events - if any event overlaps, treat it as blocking
+        # For capacity=1, any overlapping event blocks the slot entirely
+        # For capacity>1, treat each calendar event as 1 person (conservative approach)
+        calendar_conflicts = sum(
+            1 for event in calendar_events
+            if _calendar_event_overlaps_slot(slot_start, duration, event)
+        )
+        
+        # If capacity is 1 and there's ANY calendar conflict, block the slot
+        if capacity_per_hour == 1 and calendar_conflicts > 0:
+            continue
+        
+        # For higher capacity, add calendar conflicts to the headcount
+        total_headcount = booked_headcount + calendar_conflicts
+        remaining = capacity_per_hour - total_headcount
+        
         # Slot is available only if the requested party can fit in remaining capacity
-        if booked_headcount + requested_party <= capacity_per_hour:
+        if total_headcount + requested_party <= capacity_per_hour:
             iso = slot_start.isoformat()
             filtered_slots.append(iso)
             slot_remaining[iso] = remaining

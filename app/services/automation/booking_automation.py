@@ -241,6 +241,29 @@ async def send_cancellation_notice(booking: dict, business: dict) -> None:
     await send_to_customer(business, customer_phone, msg)
 
 
+# ── Step 2a-II: Reschedule notice ────────────────────────────────────────────
+
+async def send_reschedule_notice(booking: dict, business: dict, old_datetime: str, new_datetime: str) -> None:
+    """Notify the customer that their booking has been rescheduled."""
+    customer_phone = booking.get("customerPhone", "")
+    if not customer_phone:
+        return
+
+    customer_name = booking.get("customerName") or "there"
+    service = booking.get("serviceName") or booking.get("service") or "your appointment"
+    biz_name = business.get("name") or "us"
+
+    msg = (
+        f"🔄 *Booking rescheduled!*\n\n"
+        f"Hi {customer_name}, your {service} at *{biz_name}* has been moved.\n\n"
+        f"❌ Old time: {old_datetime}\n"
+        f"✅ New time: {new_datetime}\n\n"
+        f"See you soon! 😊"
+    )
+    logger.info("[AUTOMATION:RESCHEDULE] booking=%s customer=%s", booking.get('id'), customer_phone)
+    await send_to_customer(business, customer_phone, msg)
+
+
 # ── Step 2b: Visit confirmation sweep (scheduled every 30 min) ───────────────
 
 _VISIT_CONFIRMATION_DELAY_MINUTES = 120  # 2 hours after booking time
