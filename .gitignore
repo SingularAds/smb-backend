@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+.env_production
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment Variables
+.env
+.env.local
+.env.production
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Test Coverage
+.coverage
+.pytest_cache/
+htmlcov/
+.tox/
+
+# Alembic
+alembic/versions/*.pyc
+
+# Secrets
+serviceAccount.json
+credentials.json
+*.pem
+*.key
+secrets/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Firebase
+.firebase/
+firebase-debug.log
+firestore-debug.log
+
+# Docker
+.dockerignore
+
+# Misc
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+firebase-secret.json
+
+#nodemodules
+node_modules/
+*.md
+tests/

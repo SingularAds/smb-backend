@@ -1,0 +1,723 @@
+
+============================================================
+[2026-04-17T10:13:52.605320Z] VAPI REQUEST BODY:
+{
+  "message": {
+    "timestamp": 1776420831245,
+    "type": "status-update",
+    "status": "in-progress",
+    "artifact": {
+      "messages": [
+        {
+          "role": "system",
+          "message": "[System Info]\nToday's date is Apr 17, 2026 UTC, time is 10:13 AM UTC. Always use this as the current date reference.\nNever use any other date unless the caller explicitly states one.\nWhen calling checkAvailableSlots, always derive the date from today's\ndate (Apr 17, 2026 UTC) unless the caller specifies otherwise.\nThe businessId for all tool calls is: {{businessId}}\nNever tell the caller you don't have access to the current time or date.\nAlways refer to the system info for the current datetime.\n\n[Identity]\nYou are Riley, the appointment scheduling voice assistant for {{businessName}}.\na multi-specialty health clinic. Your role is to efficiently schedule, confirm,\nreschedule, or cancel appointments, and handle complaints for all callers,\nensuring every task is completed accurately using the required system tools.\n\n[Style]\n- Maintain a friendly, warm, and professional tone.\n- Be patient and provide supportive guidance, especially for elderly or confused callers.\n- Speak with confidence a...",
+          "time": 1776420831109,
+          "secondsFromStart": 0
+        }
+      ],
+      "messagesOpenAIFormatted": [
+        {
+          "role": "system",
+          "content": "[System Info]\nToday's date is Apr 17, 2026 UTC, time is 10:13 AM UTC. Always use this as the current date reference.\nNever use any other date unless the caller explicitly states one.\nWhen calling checkAvailableSlots, always derive the date from today's\ndate (Apr 17, 2026 UTC) unless the caller specifies otherwise.\nThe businessId for all tool calls is: {{businessId}}\nNever tell the caller you don't have access to the current time or date.\nAlways refer to the system info for the current datetime.\n\n[Identity]\nYou are Riley, the appointment scheduling voice assistant for {{businessName}}.\na multi-specialty health clinic. Your role is to efficiently schedule, confirm,\nreschedule, or cancel appointments, and handle complaints for all callers,\nensuring every task is completed accurately using the required system tools.\n\n[Style]\n- Maintain a friendly, warm, and professional tone.\n- Be patient and provide supportive guidance, especially for elderly or confused callers.\n- Speak with confidence a..."
+        }
+      ],
+      "variables": {
+        "now": "Apr 17, 2026, 10:13 AM UTC",
+        "currentDateTime": "Friday, April 17, 2026 at 10:13 AM UTC",
+        "date": "Apr 17, 2026 UTC",
+        "time": "10:13 AM UTC",
+        "year": "2026",
+        "month": "April",
+        "day": "17",
+        "customer": {
+          "number": "+919234567890",
+          "sipUri": "sip:+919234567890@44.229.228.186:5060"
+        },
+        "phoneNumber": {
+          "id": "7e782fee-3bc4-4ac2-a9ea-25a35029d193",
+          "orgId": "cbafe0ac-2e0f-4ee4-aa3f-a1c1d126c2c0",
+          "assistantId": "6ea20463-f52e-4ad5-8454-97ace9b2ed78",
+          "number": "+19514590514",
+          "createdAt": "2026-04-16T11:15:37.083Z",
+          "updatedAt": "2026-04-17T09:20:49.036Z",
+          "provider": "vapi",
+          "server": {
+            "url": "https://d48c-115-245-201-22.ngrok-free.app/vapi/webhook",
+            "timeoutSeconds": 20
+          },
+          "status": "active",
+          "providerResourceId": "226d3b77-1d5f-4dd4-86ee-30f032d1152b"
+        },
+        "transport": {
+          "conversationType": "voice",
+          "provider": "vapi.sip",
+          "callSid": "cfd4cd30-25a2-4cca-a101-a6b0de801985",
+          "sbcCallSid": "837713862-3985409630-184090472@msc1.382COM.COM"
+        },
+        "call": {
+          "id": "019d9aee-beef-788f-aee7-102fb4efb6f0",
+          "type": "inboundPhoneCall",
+          "status": "ringing",
+          "createdAt": "2026-04-17T10:13:50.959Z",
+          "phoneCallProvider": "vapi",
+          "transport": {
+            "conversationType": "voice",
+            "provider": "vapi.sip",
+            "callSid": "cfd4cd30-25a2-4cca-a101-a6b0de801985",
+            "sbcCallSid": "837713862-3985409630-184090472@msc1.382COM.COM"
+          }
+        },
+        "cid": "837713862-3985409630-184090472@msc1.382COM.COM",
+        "account-sid": "c033b672-5b99-42ae-9ce2-b231e9a522fb",
+        "forwarded-for": "64.125.111.10",
+        "application-sid": "79d078c8-76b2-452a-99e0-ddd5abbf6269",
+        "voip-carrier-sid": "a5569621-84ac-49cc-a8b8-11c7fb96b905",
+        "originating-carrier": "382com"
+      },
+      "variableValues": {
+        "now": "Apr 17, 2026, 10:13 AM UTC",
+        "currentDateTime": "Friday, April 17, 2026 at 10:13 AM UTC",
+        "date": "Apr 17, 2026 UTC",
+        "time": "10:13 AM UTC",
+        "year": "2026",
+        "month": "April",
+        "day": "17",
+        "customer": {
+          "number": "+919234567890",
+          "sipUri": "sip:+919234567890@44.229.228.186:5060"
+        },
+        "phoneNumber": {
+          "id": "7e782fee-3bc4-4ac2-a9ea-25a35029d193",
+          "orgId": "cbafe0ac-2e0f-4ee4-aa3f-a1c1d126c2c0",
+          "assistantId": "6ea20463-f52e-4ad5-8454-97ace9b2ed78",
+          "number": "+19514590514",
+          "createdAt": "2026-04-16T11:15:37.083Z",
+          "updatedAt": "2026-04-17T09:20:49.036Z",
+          "provider": "vapi",
+          "server": {
+            "url": "https://d48c-115-245-201-22.ngrok-free.app/vapi/webhook",
+            "timeoutSeconds": 20
+          },
+          "status": "active",
+          "providerResourceId": "226d3b77-1d5f-4dd4-86ee-30f032d1152b"
+        },
+        "transport": {
+          "conversationType": "voice",
+          "provider": "vapi.sip",
+          "callSid": "cfd4cd30-25a2-4cca-a101-a6b0de801985",
+          "sbcCallSid": "837713862-3985409630-184090472@msc1.382COM.COM"
+        },
+        "call": {
+          "id": "019d9aee-beef-788f-aee7-102fb4efb6f0",
+          "type": "inboundPhoneCall",
+          "status": "ringing",
+          "createdAt": "2026-04-17T10:13:50.959Z",
+          "phoneCallProvider": "vapi",
+          "transport": {
+            "conversationType": "voice",
+            "provider": "vapi.sip",
+            "callSid": "cfd4cd30-25a2-4cca-a101-a6b0de801985",
+            "sbcCallSid": "837713862-3985409630-184090472@msc1.382COM.COM"
+          }
+        },
+        "cid": "837713862-3985409630-184090472@msc1.382COM.COM",
+        "account-sid": "c033b672-5b99-42ae-9ce2-b231e9a522fb",
+        "forwarded-for": "64.125.111.10",
+        "application-sid": "79d078c8-76b2-452a-99e0-ddd5abbf6269",
+        "voip-carrier-sid": "a5569621-84ac-49cc-a8b8-11c7fb96b905",
+        "originating-carrier": "382com"
+      }
+    },
+    "call": {
+      "id": "019d9aee-beef-788f-aee7-102fb4efb6f0",
+      "orgId": "cbafe0ac-2e0f-4ee4-aa3f-a1c1d126c2c0",
+      "createdAt": "2026-04-17T10:13:50.959Z",
+      "updatedAt": "2026-04-17T10:13:50.959Z",
+      "type": "inboundPhoneCall",
+      "cost": 0,
+      "monitor": {
+        "listenUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production2.vapi.ai/019d9aee-beef-788f-aee7-102fb4efb6f0/listen",
+        "controlUrl": "https://phone-call-websocket.aws-us-west-2-backend-production2.vapi.ai/019d9aee-beef-788f-aee7-102fb4efb6f0/control"
+      },
+      "transport": {
+        "conversationType": "voice",
+        "provider": "vapi.sip",
+        "callSid": "cfd4cd30-25a2-4cca-a101-a6b0de801985",
+        "sbcCallSid": "837713862-3985409630-184090472@msc1.382COM.COM"
+      },
+      "phoneCallProvider": "vapi",
+      "phoneCallProviderId": "cfd4cd30-25a2-4cca-a101-a6b0de801985",
+      "phoneCallTransport": "sip",
+      "phoneCallProviderDetails": {
+        "sip": {
+          "raw": "INVITE sip:9514590514@172.30.27.240:5060 SIP/2.0\r\nVia: SIP/2.0/UDP 44.229.228.186;rport=5060;branch=z9hG4bK0ZKcU3D4FNtaj;received=172.31.57.86\r\nMax-Forwards: 70\r\nFrom: <sip:+919234567890@44.229.228.186:5060>;tag=rc9B6yrcr8ZHm\r\nTo: <sip:9514590514@192.168.250.45>\r\nCall-ID: f8da2241-b4e8-123f-668a-0ec7040a32ad\r\nCSeq: 113656623 INVITE\r\nContact: <sip:172.31.57.86:5060>\r\nAccept: application/sdp\r\nAllow: PUBLISH, MESSAGE, UPDATE, PRACK, SUBSCRIBE, REFER, INFO, NOTIFY, REGISTER, OPTIONS, BYE, INVITE, ACK, CANCEL\r\nSupported: 100rel, timer\r\nMin-SE: 600\r\nPrivacy: none\r\nContent-Type: application/sdp\r\nContent-Length: 304\r\nX-Account-Sid: c033b672-5b99-42ae-9ce2-b231e9a522fb\r\nX-CID: 837713862-3985409630-184090472@msc1.382COM.COM\r\nX-Forwarded-For: 64.125.111.10\r\nX-Originating-Carrier: 382com\r\nX-Voip-Carrier-Sid: a5569621-84ac-49cc-a8b8-11c7fb96b905\r\nX-Application-Sid: 79d078c8-76b2-452a-99e0-ddd5abbf6269\r\nP-Asserted-Identity: <sip:+919234567890@207.223.78.171:5060>\r\n\r\nv=0\r\no=msc1 591307 517928 IN IP4 172.30.31.14\r\ns=sip call\r\nc=IN IP4 172.30.31.14\r\nt=0 0\r\nm=audio 54134 RTP/AVP 0 8 18 101\r\na=maxptime:20\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:18 G729/8000\r\na=fmtp:18 annexb=no\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-15\r\na=sendrecv\r\na=rtcp:54135\r\n",
+          "uri": "sip:9514590514@172.30.27.240:5060",
+          "body": "v=0\r\no=msc1 591307 517928 IN IP4 172.30.31.14\r\ns=sip call\r\nc=IN IP4 172.30.31.14\r\nt=0 0\r\nm=audio 54134 RTP/AVP 0 8 18 101\r\na=maxptime:20\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:18 G729/8000\r\na=fmtp:18 annexb=no\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-15\r\na=sendrecv\r\na=rtcp:54135\r\n",
+          "method": "INVITE",
+          "headers": {
+            "to": "<sip:+19514590514@192.168.250.45>",
+            "via": "SIP/2.0/UDP 44.229.228.186;rport=5060;branch=z9hG4bK0ZKcU3D4FNtaj;received=172.31.57.86",
+            "cseq": "113656623 INVITE",
+            "from": "<sip:+919234567890@44.229.228.186:5060>;tag=rc9B6yrcr8ZHm",
+            "X-CID": "837713862-3985409630-184090472@msc1.382COM.COM",
+            "allow": "PUBLISH, MESSAGE, UPDATE, PRACK, SUBSCRIBE, REFER, INFO, NOTIFY, REGISTER, OPTIONS, BYE, INVITE, ACK, CANCEL",
+            "accept": "application/sdp",
+            "min-se": "600",
+            "call-id": "f8da2241-b4e8-123f-668a-0ec7040a32ad",
+            "contact": "<sip:172.31.57.86:5060>",
+            "privacy": "none",
+            "supported": "100rel, timer",
+            "content-type": "application/sdp",
+            "max-forwards": "70",
+            "X-Account-Sid": "c033b672-5b99-42ae-9ce2-b231e9a522fb",
+            "content-length": "304",
+            "X-Forwarded-For": "64.125.111.10",
+            "X-Application-Sid": "79d078c8-76b2-452a-99e0-ddd5abbf6269",
+            "X-Voip-Carrier-Sid": "a5569621-84ac-49cc-a8b8-11c7fb96b905",
+            "p-asserted-identity": "<sip:+919234567890@207.223.78.171:5060>",
+            "X-Originating-Carrier": "382com"
+          },
+          "payload": [
+            {
+              "type": "application/sdp",
+              "content": "v=0\r\no=msc1 591307 517928 IN IP4 172.30.31.14\r\ns=sip call\r\nc=IN IP4 172.30.31.14\r\nt=0 0\r\nm=audio 54134 RTP/AVP 0 8 18 101\r\na=maxptime:20\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:18 G729/8000\r\na=fmtp:18 annexb=no\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-15\r\na=sendrecv\r\na=rtcp:54135\r\n"
+            }
+          ],
+          "version": "2.0"
+        },
+        "sbcCallId": "837713862-3985409630-184090472@msc1.382COM.COM"
+      },
+      "status": "ringing",
+      "assistantId": "6ea20463-f52e-4ad5-8454-97ace9b2ed78",
+      "assistantOverrides": {
+        "variableValues": {
+          "cid": "837713862-3985409630-184090472@msc1.382COM.COM",
+          "account-sid": "c033b672-5b99-42ae-9ce2-b231e9a522fb",
+          "forwarded-for": "64.125.111.10",
+          "application-sid": "79d078c8-76b2-452a-99e0-ddd5abbf6269",
+          "voip-carrier-sid": "a5569621-84ac-49cc-a8b8-11c7fb96b905",
+          "originating-carrier": "382com"
+        }
+      },
+      "phoneNumberId": "7e782fee-3bc4-4ac2-a9ea-25a35029d193",
+      "customer": {
+        "number": "+919234567890",
+        "sipUri": "sip:+919234567890@44.229.228.186:5060"
+      }
+    },
+    "phoneNumber": {
+      "id": "7e782fee-3bc4-4ac2-a9ea-25a35029d193",
+      "orgId": "cbafe0ac-2e0f-4ee4-aa3f-a1c1d126c2c0",
+      "assistantId": "6ea20463-f52e-4ad5-8454-97ace9b2ed78",
+      "number": "+19514590514",
+      "createdAt": "2026-04-16T11:15:37.083Z",
+      "updatedAt": "2026-04-17T09:20:49.036Z",
+      "provider": "vapi",
+      "server": {
+        "url": "https://d48c-115-245-201-22.ngrok-free.app/vapi/webhook",
+        "timeoutSeconds": 20
+      },
+      "status": "active",
+      "providerResourceId": "226d3b77-1d5f-4dd4-86ee-30f032d1152b"
+    },
+    "customer": {
+      "number": "+919234567890",
+      "sipUri": "sip:+919234567890@44.229.228.186:5060"
+    },
+    "assistant": {
+      "id": "6ea20463-f52e-4ad5-8454-97ace9b2ed78",
+      "orgId": "cbafe0ac-2e0f-4ee4-aa3f-a1c1d126c2c0",
+      "name": "DO NOT DELETE",
+      "voice": {
+        "voiceId": "Elliot",
+        "provider": "vapi"
+      },
+      "createdAt": "2026-03-25T07:31:40.673Z",
+      "updatedAt": "2026-04-17T09:51:37.371Z",
+      "model": {
+        "model": "gpt-4.1",
+        "toolIds": [
+          "f9775983-ce13-4b47-a90a-0ccd5d740544",
+          "77025ab6-a5ce-4949-a384-f54ef4ce40a3",
+          "92aa8c7a-fc05-41da-abe2-33bb33f82065",
+          "7521e446-c9ef-47e1-9eb7-62f20253e8e7",
+          "22d802dd-2ef8-4b61-8a0b-9b24f38878e0",
+          "c7b8cd93-0b27-4c80-9da1-41b046b63a11"
+        ],
+        "messages": [
+          {
+            "role": "system",
+            "content": "[System Info]\nToday's date is Apr 17, 2026 UTC, time is 10:13 AM UTC. Always use this as the current date reference.\nNever use any other date unless the caller explicitly states one.\nWhen calling checkAvailableSlots, always derive the date from today's\ndate (Apr 17, 2026 UTC) unless the caller specifies otherwise.\nThe businessId for all tool calls is: {{businessId}}\nNever tell the caller you don't have access to the current time or date.\nAlways refer to the system info for the current datetime.\n\n[Identity]\nYou are Riley, the appointment scheduling voice assistant for {{businessName}}.\na multi-specialty health clinic. Your role is to efficiently schedule, confirm,\nreschedule, or cancel appointments, and handle complaints for all callers,\nensuring every task is completed accurately using the required system tools.\n\n[Style]\n- Maintain a friendly, warm, and professional tone.\n- Be patient and provide supportive guidance, especially for elderly or confused callers.\n- Speak with confidence and clear organization.\n- Use concise language with natural contractions.\n- Pace responses carefully, particularly when giving dates and times.\n- Include natural conversational touches, such as \"let's see\u2026\" or brief hesitations.\n- Avoid sounding robotic by using pauses, fillers, and human-like speech patterns.\n\n[Response Guidelines]\n- Ask only one question at a time and wait for the user's response before proceeding.\n- Clearly confirm and spell out names, dates, and times as needed for clarity.\n- Offer only two to three available time slots at a time.\n- Never confirm or state a booking is complete until after calling the booking tool.\n- For spelling clarification, state names or numbers phonetically if needed.\n- Always repeat the complete appointment summary and ask for explicit confirmation before booking.\n- Do not use phrases like \"please hold,\" \"one moment,\" or \"let me check\" before\n  executing booking tools; do not narrate or delay tool usage.\n- After the booking tool call, say only: \"Your booking is confirmed.\" Then offer further assistance.\n- Provide arrival instructions or pertinent information for new patients or relevant\n  appointment types when appropriate.\n- When reading booking IDs aloud, always spell them out character by character.\n  Example: \"BK7A91F2\" \u2192 \"B K 7 A 9 1 F 2\"\n- Never tell the caller you don't have access to the current time or date.\n\n[Task & Goals]\n\n1. Begin every call by saying: \"Thank you for calling {{businessName}}..\n   This is Riley, your scheduling assistant. How may I help you today?\"\n\n2. Determine the purpose of the call: scheduling, rescheduling, canceling,\n   complaint, or inquiry.\n\n--- SCHEDULING FLOW ---\n\n3. If scheduling, follow this step-by-step information collection,\n   never combining multiple questions:\n   - Full name (spell out if unclear)\n   - Phone number (verify if not clear or missing)\n   - Preferred date (if no date mentioned, use today's date for checkAvailableSlots)\n   - Any special requests\n\n4. Once you have the preferred date, immediately call checkAvailableSlots with:\n   - datetime: YYYY-MM-DD if only date given, YYYY-MM-DDTHH:mm:ss if time also given\n   - If no date mentioned at all, use today's date as YYYY-MM-DD\n   - and with the {{businessId}}\n\n5. From the slots array returned, offer only 2 to 3 options in natural readable format.\n   Example: \"I have 9 AM, 10 AM, or 11 AM available on that day. Which works best for you?\"\n\n6. Once a slot is selected, collect any remaining missing details:\n   - Party size (default to 1 if not mentioned)\n   - Provider preference if mentioned\n\n7. Restate the complete booking summary:\n   \"Just to confirm, you'd like to book a [appointment type] on [date] at [time]\n   for [partySize] person(s). Is that correct?\"\n\n8. Wait for the caller's explicit \"yes\" before proceeding.\n\n9. When you receive confirmation, immediately call createBooking with:\n   - customerName: caller's full name\n   - datetime: chosen slot exactly as returned in slots array (YYYY-MM-DDTHH:mm:ss)\n   - partySize: number of attendees\n   - callerPhone: caller's phone number\n   - specialRequest: caller's special request if any\n    - and with the {{businessId}}\n   Do not say anything before the tool call completes. No stalling or narrating.\n\n10. After createBooking succeeds, read out the booking ID character by character:\n    \"Your booking is confirmed. Your booking ID is [spell out ID].\n    Is there anything else I can help you with today?\"\n\n--- RESCHEDULING FLOW ---\n\n11. If the caller wants to reschedule:\n    a. Ask for their phone number if not already known.\n    b. Ask if they have a specific date in mind for checking their booking\n       (optional \u2014 if not, use today's date).\n    c. Call checkBooking with:\n       - phone: caller's phone number\n       - date: specific date if mentioned, otherwise today's date in YYYY-MM-DD\n       - and with the {{businessId}}\n    d. If status is \"error\" or booking is null, say:\n       \"I wasn't able to find any booking under that number.\n        Would you like to schedule a new appointment?\"\n    e. If one confirmed booking is found, read it out fully:\n       \"I found your booking. Booking ID [spell out ID], for [serviceName]\n        on [date] at [time] for [partySize] person(s).\n        Special requests: [specialRequests].\"\n    f. If multiple bookings are found, read only the confirmed ones:\n       \"I found [n] bookings under your number.\n        Booking one: ID [spell out ID], [serviceName] on [date] at [time].\n        Booking two: ID [spell out ID], [serviceName] on [date] at [time].\n        Which booking would you like to reschedule?\"\n    g. Once the booking is identified, ask for the new preferred date.\n    h. Call checkAvailableSlots for the new date and offer 2 to 3 slots.\n    i. Once a slot is selected, ask if they want to update any other details:\n       \"Would you like to update your name, phone number, party size,\n        or add any special notes for the new booking?\"\n    j. Collect any changes one question at a time. Keep unchanged fields\n       from the original booking.\n    k. Confirm the full reschedule summary:\n       \"Just to confirm, you'd like to move booking [spell out ID]\n        to [new date] at [new time] for [partySize] person(s).\n        [Any updated details]. Is that correct?\"\n    l. On explicit yes, immediately call rescheduleBooking with:\n       - bookingId: the booking ID from checkBooking response (keep exactly as received)\n       - rescheduleDateTime: new selected slot in YYYY-MM-DDTHH:mm:ss\n       - phone: caller's phone number\n       - customerName: updated or original name\n       - partySize: updated or original party size\n       - notes: any new notes or special requests\n        - and with the {{businessId}}\n    m. After success say:\n       \"Your booking [spell out ID] has been successfully rescheduled\n        to [new date] at [new time]. Is there anything else I can help you with?\"\n\n--- CANCELLATION FLOW ---\n\n12. If the caller wants to cancel:\n    a. Ask for their phone number if not already known.\n    b. Ask if they have a specific date in mind (optional).\n    c. Call checkBooking with:\n       - phone: caller's phone number\n       - date: specific date if mentioned, otherwise today's date in YYYY-MM-DD\n   - and with the {{businessId}}\n    d. If status is \"error\" or booking is null, say:\n       \"I wasn't able to find any booking under that number.\n        Is there anything else I can help you with?\"\n    e. If only one confirmed booking is found, read it out:\n       \"I found one booking under your number. Booking ID [spell out ID],\n        for [serviceName] on [date] at [time]. Would you like to cancel this?\"\n    f. If multiple bookings found, read only confirmed ones one by one:\n       \"I found [n] bookings under your number.\n        Booking one: ID [spell out ID], [serviceName] on [date] at [time].\n        Booking two: ID [spell out ID], [serviceName] on [date] at [time].\n        Which one would you like to cancel?\"\n    g. Wait for caller to confirm which booking or say yes to cancel.\n    h. On explicit confirmation, immediately call cancelBooking with:\n       - bookingId: the selected booking ID exactly as received\n       - phone: caller's phone number\n       - and with the {{businessId}}\n    i. After success say:\n       \"Your booking [spell out ID] has been successfully cancelled.\n        Is there anything else I can help you with today?\"\n    j. If the response status is \"error\", say:\n       \"I'm sorry, I wasn't able to cancel that booking.\n        Please hold while I connect you to our staff for assistance.\"\n\n--- COMPLAINT FLOW ---\n\n13. If the caller wants to raise a complaint:\n    a. Empathize first: \"I'm sorry to hear that. I'll do my best to help \n       you resolve this right away.\"\n    b. Ask: \"Is your complaint related to a specific appointment, \n       or is it about something else?\"\n\n    IF APPOINTMENT-RELATED (complaintType = \"appointment\"):\n    c. Ask: \"Do you have your booking ID handy?\"\n       - If yes: note the booking ID, skip to step (f).\n       - If no: ask for their phone number and optionally a date,\n         then call checkBooking with:\n         - phone: caller's phone number\n         - date: if mentioned, otherwise today's date in YYYY-MM-DD\n            - and with the {{businessId}}\n\n    d. If checkBooking returns no booking or status is \"error\", say:\n       \"I wasn't able to find a booking under that number.\n        Could you double-check the details or would you like to \n        raise a general complaint instead?\"\n       Then move to general complaint flow (step m).\n\n    e. If booking(s) found, read them out:\n       - One booking: \"I found your booking. ID [spell out ID], \n         [serviceName] on [date] at [time].\"\n       - Multiple: read confirmed ones and ask which one the complaint is about.\n\n    f. Ask the caller to describe their issue:\n       \"Could you please tell me what happened or what the issue is?\"\n       Listen carefully and note the full complaint description.\n\n    g. TROUBLESHOOT based on what the caller says:\n       - If the issue is about appointment not being booked or missing:\n         \"I can see your booking details. Would you like me to \n          reschedule or create a new appointment to resolve this?\"\n         \u2192 If yes: follow the RESCHEDULING or SCHEDULING flow.\n         \u2192 After resolving, set complaint status as \"resolved\".\n\n       - If the issue is about wrong information (name, time, party size etc.):\n         \"I can update those details right away. What would you like to change?\"\n         \u2192 Collect the changes and call rescheduleBooking with updated fields.\n         \u2192 After resolving, set complaint status as \"resolved\".\n\n       - If the issue cannot be resolved by rescheduling or updating\n         (e.g. waited too long, staff behavior, billing):\n         \"I understand. I'll make sure this is noted and passed on \n          to our team for review.\"\n         \u2192 Set complaint status as \"open\".\n\n    h. After troubleshooting, always call createComplaint with:\n       - msgType: \"complaint\"\n       - and with the {{businessId}}\n       - complaintType: \"appointment\"\n       - bookingId: booking ID if available, else null\n       - complaint: full complaint description as stated by the caller\n       - customerName: caller's full name\n       - customerPhone: caller's phone number\n       - status: \"resolved\" if issue was fixed during the call, else \"open\"\n       - source: \"vapi\"\n\n    i. After createComplaint succeeds:\n       - If status was \"resolved\": \n         \"Your complaint has been recorded and marked as resolved. \n          I'm glad we could sort that out for you. Is there anything \n          else I can help you with?\"\n       - If status was \"open\":\n         \"Your complaint has been recorded and our team will follow \n          up with you shortly. Is there anything else I can help you with?\"\n\n    IF NOT APPOINTMENT-RELATED (complaintType = \"others\"):\n    j. Ask for their name and phone number if not already known.\n    k. Ask them to describe the issue fully:\n       \"Could you please describe what happened?\"\n    l. Try to troubleshoot if possible. If resolvable during the call,\n       set status as \"resolved\", otherwise \"open\".\n    m. Call createComplaint with:\n       - msgType: \"complaint\"\n        - and with the {{businessId}}\n       - complaintType: \"others\"\n       - bookingId: null\n       - complaint: full complaint description\n       - customerName: caller's full name\n       - customerPhone: caller's phone number\n       - status: \"resolved\" or \"open\" based on outcome\n       - source: \"vapi\"\n    n. After success, respond same as step (i) based on status.\n\n--- GENERAL ---\n\n14. Handle urgent requests by assessing the situation; escalate if appropriate.\n15. For questions about insurance or policy, provide brief general responses;\n    refer complex cases to clinic staff.\n16. Always guide new patients or specialized appointments regarding required\n    preparations or documents.\n17. Close every resolved or completed call with:\n    \"Thank you for calling Wellness Partners. Have a wonderful day!\" and end the call.\n\n[Error Handling / Fallback]\n- If the caller's response is unclear or missing, politely request clarification or repetition.\n- If required information is missing, keep gathering necessary details step by step\n  before proceeding to any tool call.\n- If any tool returns status \"error\", apologize and either retry or escalate to staff.\n- If the booking tool fails, apologize and offer alternative time slots or retry booking.\n- If the caller expresses uncertainty about their schedule, offer to wait quietly\n  or suggest calling back when ready.\n- If technical issues or system errors arise, apologize, reassure the caller,\n  and make further attempts or escalate as appropriate.\n- For inquiries outside the assistant's scope, refer politely to clinic staff\n  or the appropriate entity.\n- For emergencies, advise immediate care and offer to transfer or provide\n  emergency contact options.\n- For call escalations or transfers, do not output any verbal response;\n  trigger the appropriate transfer tool silently.\n- Always end each call with gratitude and courtesy,\n  thanking the caller for choosing Wellness Partners.\n- Never skip or assume bookingId \u2014 always take it exactly from the checkBooking\n  tool response. Never invent or modify a booking ID.\n- Never invent or assume a complaint resolution. Only mark status as \"resolved\"\n  if a concrete action was taken during the call (rescheduling, info update etc.)."
+          }
+        ],
+        "provider": "openai",
+        "temperature": 0.5,
+        "tools": [
+          {
+            "id": "f9775983-ce13-4b47-a90a-0ccd5d740544",
+            "createdAt": "2026-04-15T09:32:00.163Z",
+            "updatedAt": "2026-04-16T11:38:50.276Z",
+            "type": "apiRequest",
+            "function": {
+              "name": "api_request_tool",
+              "description": "Complaint will be stored here"
+            },
+            "messages": [
+              {
+                "type": "request-start",
+                "blocking": false
+              }
+            ],
+            "orgId": "cbafe0ac-2e0f-4ee4-aa3f-a1c1d126c2c0",
+            "async": false,
+            "name": "createComplaint",
+            "url": "https://88fd-2401-4900-1c2b-cb7d-c2e-345c-ed68-e56d.ngrok-free.app/vapi/webhook",
+            "method": "POST",
+            "body": {
+              "type": "object",
+              "required": [
+                "complaintType"
+              ],
+              "properties": {
+                "source": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                },
+                "status": {
+                  "type": "string",
+                  "default": "open",
+                  "description": ""
+                },
+                "bookingId": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                },
+                "complaint": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                },
+                "businessId": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                },
+                "customerName": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                },
+                "complaintType": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                },
+                "customerPhone": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                }
+              }
+            },
+            "variableExtractionPlan": {
+              "schema": {
+                "type": "object",
+                "required": [],
+                "properties": {}
+              }
+            },
+            "parameters": [
+              {
+                "key": "msgType",
+                "value": "comnplaint"
+              }
+            ]
+          },
+          {
+            "id": "77025ab6-a5ce-4949-a384-f54ef4ce40a3",
+            "createdAt": "2026-04-15T07:19:18.447Z",
+            "updatedAt": "2026-04-16T11:38:45.013Z",
+            "type": "apiRequest",
+            "function": {
+              "name": "api_request_tool",
+              "description": "Will be triggered if the caller want to cacel the booking"
+            },
+            "messages": [
+              {
+                "type": "request-start",
+                "blocking": false
+              }
+            ],
+            "orgId": "cbafe0ac-2e0f-4ee4-aa3f-a1c1d126c2c0",
+            "name": "cancelBooking",
+            "url": "https://88fd-2401-4900-1c2b-cb7d-c2e-345c-ed68-e56d.ngrok-free.app/vapi/webhook",
+            "method": "POST",
+            "body": {
+              "type": "object",
+              "required": [
+                "bookingId"
+              ],
+              "properties": {
+                "phone": {
+                  "type": "string",
+                  "default": "",
+                  "description": "caller's phone"
+                },
+                "bookingId": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                },
+                "businessId": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                }
+              }
+            },
+            "variableExtractionPlan": {
+              "schema": {
+                "type": "object",
+                "required": [],
+                "properties": {}
+              }
+            },
+            "parameters": [
+              {
+                "key": "msgType",
+                "value": "cancel"
+              }
+            ]
+          },
+          {
+            "id": "92aa8c7a-fc05-41da-abe2-33bb33f82065",
+            "createdAt": "2026-04-15T07:08:51.447Z",
+            "updatedAt": "2026-04-16T11:38:39.618Z",
+            "type": "apiRequest",
+            "function": {
+              "name": "api_request_tool",
+              "description": "Patch existing booking by bookingId"
+            },
+            "messages": [
+              {
+                "type": "request-start",
+                "blocking": false
+              }
+            ],
+            "orgId": "cbafe0ac-2e0f-4ee4-aa3f-a1c1d126c2c0",
+            "name": "rescheduleBooking",
+            "url": "https://88fd-2401-4900-1c2b-cb7d-c2e-345c-ed68-e56d.ngrok-free.app/vapi/webhook",
+            "method": "POST",
+            "body": {
+              "type": "object",
+              "required": [
+                "bookingId",
+                "rescheduleDateTime"
+              ],
+              "properties": {
+                "notes": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                },
+                "phone": {
+                  "type": "string",
+                  "default": "",
+                  "description": "Phone number of the caller"
+                },
+                "bookingId": {
+                  "type": "string",
+                  "default": "",
+                  "description": "Booking id of the found booking"
+                },
+                "partySize": {
+                  "type": "string",
+                  "default": "1",
+                  "description": ""
+                },
+                "businessId": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                },
+                "customerName": {
+                  "type": "string",
+                  "default": "",
+                  "description": "Customer Name"
+                },
+                "rescheduleDateTime": {
+                  "type": "string",
+                  "default": "",
+                  "description": "Reschedule Date Time"
+                }
+              }
+            },
+            "variableExtractionPlan": {
+              "schema": {
+                "type": "object",
+                "required": [],
+                "properties": {}
+              }
+            },
+            "parameters": [
+              {
+                "key": "msgType",
+                "value": "reschedule"
+              }
+            ]
+          },
+          {
+            "id": "7521e446-c9ef-47e1-9eb7-62f20253e8e7",
+            "createdAt": "2026-04-15T07:05:06.821Z",
+            "updatedAt": "2026-04-16T11:38:33.981Z",
+            "type": "apiRequest",
+            "function": {
+              "name": "api_request_tool",
+              "description": "Find booking by phone + optional date"
+            },
+            "messages": [
+              {
+                "type": "request-start",
+                "blocking": false
+              }
+            ],
+            "orgId": "cbafe0ac-2e0f-4ee4-aa3f-a1c1d126c2c0",
+            "async": false,
+            "name": "checkBooking",
+            "url": "https://88fd-2401-4900-1c2b-cb7d-c2e-345c-ed68-e56d.ngrok-free.app/vapi/webhook",
+            "method": "POST",
+            "body": {
+              "type": "object",
+              "required": [
+                "phone"
+              ],
+              "properties": {
+                "date": {
+                  "type": "string",
+                  "default": "",
+                  "description": "Optional date to narrow search in YYYY-MM-DD format"
+                },
+                "phone": {
+                  "type": "string",
+                  "default": "",
+                  "description": "Caller's phone number to look up booking"
+                },
+                "businessId": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                }
+              }
+            },
+            "variableExtractionPlan": {
+              "schema": {
+                "type": "object",
+                "required": [],
+                "properties": {}
+              }
+            },
+            "parameters": [
+              {
+                "key": "msgType",
+                "value": "checkbooking"
+              }
+            ]
+          },
+          {
+            "id": "22d802dd-2ef8-4b61-8a0b-9b24f38878e0",
+            "createdAt": "2026-04-15T06:18:11.285Z",
+            "updatedAt": "2026-04-16T11:38:27.840Z",
+            "type": "apiRequest",
+            "function": {
+              "name": "api_request_tool",
+              "description": "This tool will be triggered when a customer is specifying a booking time to check for available slots or you need to check the available slots"
+            },
+            "messages": [
+              {
+                "type": "request-start",
+                "blocking": false
+              }
+            ],
+            "orgId": "cbafe0ac-2e0f-4ee4-aa3f-a1c1d126c2c0",
+            "name": "checkAvailableSlots",
+            "url": "https://88fd-2401-4900-1c2b-cb7d-c2e-345c-ed68-e56d.ngrok-free.app/vapi/webhook",
+            "method": "POST",
+            "body": {
+              "type": "object",
+              "required": [
+                "msgType",
+                "datetime",
+                "businessId",
+                "duration"
+              ],
+              "properties": {
+                "msgType": {
+                  "type": "string",
+                  "default": "slot",
+                  "description": "it's value will be slot in all cases"
+                },
+                "datetime": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                },
+                "duration": {
+                  "type": "number",
+                  "default": "30",
+                  "description": ""
+                },
+                "businessId": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                }
+              }
+            },
+            "variableExtractionPlan": {
+              "schema": {
+                "type": "object",
+                "required": [],
+                "properties": {}
+              }
+            }
+          },
+          {
+            "id": "c7b8cd93-0b27-4c80-9da1-41b046b63a11",
+            "createdAt": "2026-04-14T11:16:24.464Z",
+            "updatedAt": "2026-04-16T11:38:21.124Z",
+            "type": "apiRequest",
+            "function": {
+              "name": "api_request_tool"
+            },
+            "messages": [
+              {
+                "type": "request-start",
+                "blocking": false
+              }
+            ],
+            "orgId": "cbafe0ac-2e0f-4ee4-aa3f-a1c1d126c2c0",
+            "async": false,
+            "name": "createBooking",
+            "url": "https://88fd-2401-4900-1c2b-cb7d-c2e-345c-ed68-e56d.ngrok-free.app/vapi/webhook",
+            "method": "POST",
+            "body": {
+              "type": "object",
+              "required": [],
+              "properties": {
+                "msgType": {
+                  "type": "string",
+                  "default": "createBooking",
+                  "description": "It will always be createBooking"
+                },
+                "datetime": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                },
+                "partySize": {
+                  "type": "number",
+                  "default": "",
+                  "description": ""
+                },
+                "businessId": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                },
+                "callerPhone": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                },
+                "customerName": {
+                  "type": "string",
+                  "default": "",
+                  "description": ""
+                },
+                "specialRequest": {
+                  "type": "string",
+                  "default": "",
+                  "description": "caller's special request"
+                }
+              }
+            },
+            "variableExtractionPlan": {
+              "schema": {
+                "type": "object",
+                "required": [],
+                "properties": {}
+              }
+            }
+          }
+        ]
+      },
+      "firstMessage": "Thank you for calling Wellness Partners. This is Riley, your scheduling assistant. How may I help you today?",
+      "voicemailMessage": "Hello, this is Riley from Wellness Partners. I'm calling about your appointment. Please call us back at your earliest convenience so we can confirm your scheduling details.",
+      "endCallMessage": "Thank you for scheduling with Wellness Partners. Your appointment is confirmed, and we look forward to seeing you soon. Have a wonderful day!",
+      "transcriber": {
+        "model": "nova-3",
+        "language": "multi",
+        "provider": "deepgram",
+        "endpointing": 150,
+        "fallbackPlan": {
+          "transcribers": [
+            {
+              "model": "flux-general-en",
+              "language": "en",
+              "provider": "deepgram"
+            }
+          ]
+        }
+      },
+      "clientMessages": [
+        "conversation-update",
+        "function-call",
+        "hang",
+        "model-output",
+        "speech-update",
+        "status-update",
+        "transfer-update",
+        "transcript",
+        "tool-calls",
+        "user-interrupted",
+        "voice-input",
+        "workflow.node.started",
+        "assistant.started"
+      ],
+      "serverMessages": [
+        "conversation-update",
+        "end-of-call-report",
+        "function-call",
+        "hang",
+        "speech-update",
+        "status-update",
+        "tool-calls",
+        "transfer-destination-request",
+        "handoff-destination-request",
+        "user-interrupted",
+        "assistant.started"
+      ],
+      "endCallPhrases": [
+        "goodbye",
+        "talk to you soon"
+      ],
+      "hipaaEnabled": false,
+      "backgroundDenoisingEnabled": false,
+      "startSpeakingPlan": {
+        "waitSeconds": 0.4,
+        "smartEndpointingEnabled": "livekit"
+      },
+      "variableValues": {
+        "cid": "837713862-3985409630-184090472@msc1.382COM.COM",
+        "account-sid": "c033b672-5b99-42ae-9ce2-b231e9a522fb",
+        "forwarded-for": "64.125.111.10",
+        "application-sid": "79d078c8-76b2-452a-99e0-ddd5abbf6269",
+        "voip-carrier-sid": "a5569621-84ac-49cc-a8b8-11c7fb96b905",
+        "originating-carrier": "382com"
+      }
+    }
+  }
+}
+============================================================

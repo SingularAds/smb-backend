@@ -1,0 +1,39 @@
+version: '3.8'
+
+# Recepte backend — FastAPI + Firestore (no database container needed).
+# Firestore is managed by Google Cloud; only the API service runs here.
+#
+# Usage:
+#   docker compose up -d          # start the API
+#   docker compose logs -f api    # tail logs
+#   docker compose down           # stop
+
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Mount service account files — never bake credentials into the image
+      - ./serviceAccount.json:/app/serviceAccount.json:ro
+      - ./credentials.json:/app/credentials.json:ro
+      # Persist generated audio files across restarts
+      - media_data:/app/media
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+volumes:
+  media_data:
+
+    volumes:
+      - ./app:/app/app
+
+volumes:
+  postgres_data:
