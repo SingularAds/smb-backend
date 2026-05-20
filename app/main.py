@@ -52,6 +52,7 @@ if _allow_insecure_transport and _environment != "production":
     warnings.filterwarnings("ignore", message="Unverified HTTPS request")
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -63,6 +64,23 @@ from app.services.automation.scheduler import start_scheduler, stop_scheduler
 
 # Import routers
 from app.api.v1 import businesses, billing, bookings, calendar, customers, health, recepte, reminders, vapi, voice, webhooks, whatsapp
+
+# ── Configure logging to console ──────────────────────────────────────────────
+_log_level = getattr(logging, (settings.LOG_LEVEL or "INFO").upper(), logging.INFO)
+_logging_handler = logging.StreamHandler()
+_logging_handler.setLevel(_log_level)
+_logging_formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+_logging_handler.setFormatter(_logging_formatter)
+
+# Apply to root logger so all modules see the handler
+_root_logger = logging.getLogger()
+_root_logger.setLevel(_log_level)
+_root_logger.addHandler(_logging_handler)
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager

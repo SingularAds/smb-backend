@@ -64,13 +64,16 @@ class Settings(BaseSettings):
     APIFY_GOOGLE_PLACES_ACTOR_ID: str = "compass~crawler-google-places"  # Maps fallback actor
     GOOGLE_CREDENTIALS_FILE: str = "./credentials.json"  # service account for owner calendar
     GOOGLE_CALENDAR_ID: str = "primary"                  # owner calendar ID or email
-    GOOGLE_SERVICE_ACCOUNT_CALENDAR_ID: str = "primary"  # calendar ID for service account
     GOOGLE_CALENDAR_TIMEZONE: str = "Europe/Lisbon"      # timezone for calendar events
     BUSINESS_TIMEZONE: str = "Europe/Lisbon"             # local timezone for booking display & reminders
     
     # Stripe
     STRIPE_SECRET_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
+
+    # Telegram (Daniel escalation alerts)
+    TELEGRAM_BOT_TOKEN: str = ""       # Bot token from @BotFather
+    TELEGRAM_DANIEL_CHAT_ID: str = ""  # Daniel's personal chat/group ID
     
     # SMTP (Email)
     SMTP_HOST: str = "sandbox.smtp.mailtrap.io"

@@ -123,6 +123,7 @@ class WhatsmeowClient:
                     json={"phone": jid, "message": message},
                     headers={"X-Device-Id": device},
                 )
+                print("message is this: ", message)
                 logger.debug("WhatsApp bridge response status: %s", resp.status_code)
                 logger.debug("WhatsApp bridge response text: %s", (resp.text or '')[:200])
                 resp.raise_for_status()
@@ -344,3 +345,121 @@ class WhatsmeowClient:
             resp = await client.get("/api/health")
             resp.raise_for_status()
             return resp.json()
+
+    # ── QR-code pairing flow ──────────────────────────────────────────────
+
+    async def get_qr_payload(
+        self,
+        session_id: str,
+        timeout_seconds: int = 15,
+    ) -> dict:
+        """Start (or reuse) a QR session and block until the first QR payload
+        is available.
+
+        The returned ``qr_payload`` is the raw string that must be converted
+        into a QR image (PNG) and sent to the user for scanning.
+
+        Returns ``{"qr_payload": "...", "sessionId": "..."}`` on success.
+        Raises ``PairingStateConflict`` when the session is already paired.
+        """
+        # Add extra headroom beyond the bridge-side timeout so the HTTP
+        # client does not time out before the bridge responds.
+        http_timeout = float(timeout_seconds) + 10.0
+        async with self._client(timeout=http_timeout) as client:
+            resp = await client.post(
+                "/api/qr-payload",
+                json={"sessionId": session_id, "timeoutSeconds": timeout_seconds},
+            )
+            if resp.status_code == 409:
+                data = resp.json()
+                raise PairingStateConflict(
+                    session_id=data.get("sessionId", session_id),
+                    status=data.get("status", "disconnected"),
+                    phone=data.get("phone", ""),
+                    action=data.get("action", "reconnect"),
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            logger.info("QR payload received for session %s", session_id)
+            return data
+
+    async def get_qr_current(self, session_id: str) -> dict | None:
+        """Fetch the latest QR payload for an active QR session without blocking.
+
+        Used to refresh a QR code after the previous one expires (~20 s).
+        Returns the response dict when a payload is available, or ``None``
+        when the bridge returns 404 (no active QR flow for this session).
+        """
+        async with self._client(timeout=10.0) as client:
+            resp = await client.get(f"/api/qr-current/{session_id}")
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return resp.json()
+
+    # ── Image sending ─────────────────────────────────────────────────────
+
+    async def send_image(
+        self,
+        phone: str,
+        image_bytes: bytes,
+        caption: str = "",
+        mime_type: str = "image/png",
+        device_id: str | None = None,
+    ) -> dict:
+        """Send an image (PNG or JPEG) as a WhatsApp image message via the bridge.
+
+        The bridge endpoint ``POST /send/message`` with ``type=image`` accepts
+        a JSON body with Base64-encoded image data.
+
+        Args:
+            phone: Recipient phone number or full WhatsApp JID.
+            image_bytes: Raw image bytes (PNG or JPEG).
+            caption: Optional caption text displayed below the image.
+            mime_type: MIME type of the image; defaults to ``"image/png"``.
+            device_id: Bridge session ID; falls back to the default device.
+        """
+        device = device_id or self.default_device_id
+        jid = _phone_to_jid(phone)
+        image_b64 = base64.b64encode(image_bytes).decode()
+
+        try:
+            logger.debug(
+                "→ WhatsApp IMAGE to %s (device=%s, %d bytes, caption=%r)",
+                jid, device, len(image_bytes), caption[:40] if caption else "",
+            )
+        except Exception:
+            logger.exception("→ WhatsApp IMAGE (logging failed)")
+
+        async with self._client(timeout=60.0) as client:
+            try:
+                resp = await client.post(
+                    "/send/message",
+                    json={
+                        "phone": jid,
+                        "type": "image",
+                        "image": {
+                            "data": image_b64,
+                            "mimetype": mime_type,
+                            "caption": caption,
+                        },
+                    },
+                    headers={"X-Device-Id": device},
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                _register_sent_id(result.get("message_id", ""))
+                logger.debug("Image sent to %s via device %s", phone, device)
+                return result
+            except httpx.ConnectError as exc:
+                logger.error(
+                    "WhatsApp bridge unreachable for image to %s (device=%s): %s",
+                    phone, device, exc,
+                )
+                raise
+            except httpx.HTTPStatusError as exc:
+                logger.error(
+                    "WhatsApp bridge returned %s for image to %s (device=%s): %s",
+                    exc.response.status_code, phone, device, exc.response.text[:200],
+                )
+                raise

@@ -122,6 +122,13 @@ def create_checkout_session(
     stripe_customer_id: str | None = business.get("stripeCustomerId")
 
     try:
+        logger.debug(
+            "[STRIPE] Creating checkout session for business=%s plan=%s period=%s has_customer=%s",
+            business_id,
+            plan_key,
+            billing_period,
+            bool(stripe_customer_id),
+        )
         session_kwargs: dict = {
             "mode": "subscription",
             "line_items": [{
@@ -156,14 +163,13 @@ def create_checkout_session(
                     "plan":       plan_key,
                 },
             },
-            "tax_id_collection": {"enabled": True},
-            "automatic_tax":     {"enabled": True},
+            # "tax_id_collection": {"enabled": True},
+            # "automatic_tax":     {"enabled": True},
         }
 
         if stripe_customer_id:
             session_kwargs["customer"] = stripe_customer_id
-        else:
-            session_kwargs["customer_creation"] = "always"
+        
 
         checkout_session = stripe.checkout.Session.create(**session_kwargs)
         logger.info(
@@ -314,6 +320,8 @@ def _on_checkout_completed(session: dict, db) -> str:
 
 def _on_subscription_updated(sub: dict, db) -> str:
     """customer.subscription.created / updated — sync status."""
+    import datetime as _dt
+
     business = _resolve_business(sub, db)
     if not business:
         return "business_not_found"
@@ -338,6 +346,17 @@ def _on_subscription_updated(sub: dict, db) -> str:
     }
     if stripe_status == "active":
         updates["plan"] = plan
+
+    # Persist the billing cycle end date so the AI can answer renewal questions
+    period_end_ts = sub.get("current_period_end")
+    if period_end_ts:
+        try:
+            renewal_dt = _dt.datetime.fromtimestamp(
+                int(period_end_ts), tz=_dt.timezone.utc
+            )
+            updates["subscriptionRenewalDate"] = renewal_dt.isoformat()
+        except (TypeError, ValueError, OSError):
+            pass
 
     db.update_business_doc(business_id, updates)
     logger.info(

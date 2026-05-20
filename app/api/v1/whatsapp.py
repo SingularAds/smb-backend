@@ -229,26 +229,19 @@ async def _process_webhook(payload: dict) -> None:
         device_id = payload.get("device_id", "")
         data = payload.get("payload", {})
 
-        # ── VERBOSE ENTRY LOG — always at INFO for production traceability.
-        #    Shows key fields so you can trace exactly which handler ran and why.
-        #    NOTE: individual guards below print DROPPED/ACCEPTED to make the
-        #    fate of each message visible in stdout alongside these log lines.
         logger.info(
-            "[WEBHOOK] event=%r device=%r | from=%r chat=%r msg_id=%r "
-            "is_from_me=%s is_group=%s type=%r body=%r",
+            "[PROCESS] event=%r device=%r from=%r chat=%r msg_id=%r body=%r",
             event,
             device_id,
             data.get("from", ""),
             data.get("chat_id", ""),
             data.get("message_id", ""),
-            data.get("is_from_me"),
-            data.get("is_group"),
-            data.get("message_type", ""),
-            (data.get("body") or "")[:60],
+            (data.get("body") or "")[:100],
         )
 
         # ── Call events ────────────────────────────────────────────────────────
         if event == "call_offer":
+            logger.info("[CALL_OFFER] call_id=%r caller=%r", data.get("call_id"), data.get("caller_phone"))
             logger.info(
                 "[CALL] call_offer received — session=%r call_id=%r caller_phone=%r caller_jid=%r",
                 device_id,
@@ -264,22 +257,23 @@ async def _process_webhook(payload: dict) -> None:
             return
 
         if event == "call_missed":
+            logger.info("[CALL_MISSED] call_id=%r caller=%r", data.get("call_id"), data.get("caller_phone"))
             await _handle_missed_call(payload)
             return
 
         # Only process incoming text messages
         if event != "message":
-            logger.info("[WEBHOOK] skipped — event=%r is not 'message'", event)
+            logger.info("[SKIP] event=%r is not 'message'", event)
             _log_event("skipped", detail=f"event={event!r} (not 'message')")
             return
 
         if data.get("is_from_me"):
-            logger.info("[WEBHOOK] skipped — is_from_me=True (outbound echo from bridge)")
+            logger.info("[SKIP] is_from_me=True (outbound echo)")
             _log_event("skipped", detail="is_from_me=True")
             return
 
         if data.get("is_group"):
-            logger.info("[WEBHOOK] skipped — is_group=True, chat=%r", data.get("chat_id"))
+            logger.info("[SKIP] is_group=True (group message)")
             _log_event("skipped", detail="is_group=True")
             return
 
@@ -291,7 +285,7 @@ async def _process_webhook(payload: dict) -> None:
         is_location = message_type == "location" and bool(body)
 
         if not body and not is_audio:
-            logger.info("[WEBHOOK] skipped — empty body (image/reaction/sticker?) chat=%r", data.get('chat_id', '?'))
+            logger.info("[SKIP] empty body (type=%r) chat=%r", message_type, data.get('chat_id', '?'))
             _log_event("skipped", detail="empty body")
             return
 
@@ -300,9 +294,9 @@ async def _process_webhook(payload: dict) -> None:
         message_id = data.get("message_id", "")
         sender = data.get("from", "")
 
-# Skip newsletter / broadcast messages
+        # Skip newsletter / broadcast messages
         if "@newsletter" in sender:
-            logger.info("[WEBHOOK] skipped — newsletter/broadcast message from %s", sender)
+            logger.info("[SKIP] newsletter/broadcast from %s", sender)
             _log_event(
                 "skipped",
                 phone=phone,
@@ -312,7 +306,7 @@ async def _process_webhook(payload: dict) -> None:
             return
 
         if not phone:
-            logger.warning("[WEBHOOK] skipped — missing chat_id in payload")
+            logger.warning("[SKIP] missing chat_id in payload")
             _log_event("skipped", detail="missing chat_id")
             return
 
@@ -571,16 +565,21 @@ async def _process_webhook(payload: dict) -> None:
 
         # Onboarding device only handles text and location shares — silently skip other audio/media
         if is_audio:
-            logger.debug("[ONBOARDING] Skipping audio message from %s (onboarding is text-only)", phone)
+            logger.debug("[SKIP] audio message on onboarding device (text-only)")
             _log_event("skipped", phone=phone, message_id=message_id, detail="audio on onboarding device")
             return
 
+        logger.info("[ONBOARDING-PROCESS] phone=%s push_name=%r msg_id=%r body=%r", phone, push_name, message_id, body[:100])
+
         try:
             await _onboarding.handle_message(phone, body, push_name, message_id, message_type=message_type)
+            logger.info("[ONBOARDING-RESPONSE] Sent reply for phone=%s msg_id=%r", phone, message_id)
         except TypeError:
             # Backward compatibility for monkeypatched/test doubles that still
             # implement the older 4-argument signature.
             await _onboarding.handle_message(phone, body, push_name, message_id)
+            logger.info("[ONBOARDING-RESPONSE] Sent reply (legacy) for phone=%s msg_id=%r", phone, message_id)
+        
         _log_event("processed", phone=phone, message_id=message_id, detail=f"body={body[:80]!r}")
 
     except Exception as exc:
@@ -602,37 +601,36 @@ async def whatsmeow_webhook(
     Returns 200 immediately; actual processing runs as a background task
     so the bridge doesn't time out waiting for Claude / Firestore calls.
     """
+    print("\n" + "🔔"*40)
+    print(f"� [WEBHOOK ENDPOINT HIT] — {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("🔔"*40 + "\n")
+    
     # ── secret validation ─────────────────────────────────────────────
     expected = settings.WEBHOOK_SECRET or settings.X_WEBHOOK_SECRET
-    logger.debug("Validating webhook secret configured=%s", bool(expected))
     if expected and x_webhook_secret != expected:
         logger.warning("Webhook secret mismatch (got %s)", x_webhook_secret)
         return Response(status_code=401, content="Unauthorized")
 
     payload: dict = await request.json()
 
-    # ── SYNCHRONOUS entry log — runs BEFORE the 200 OK so it always appears
-    #    in the server log adjacent to the access-log line.  Gives full
-    #    visibility into every incoming webhook without enabling DEBUG mode.
+    # ── REQUEST LOG ─────────────────────────────────────────────────────
     _data = payload.get("payload", {})
-    print("Incoming webhook payload:", _data)
     logger.info(
-        "[WEBHOOK-IN] event=%r device=%r | from=%r chat=%r msg_id=%r "
-        "is_from_me=%s is_group=%s type=%r ts=%s body=%r",
+        "[REQUEST] event=%r device=%r from=%r chat=%r body=%r msg_id=%r",
         payload.get("event"),
         payload.get("device_id"),
         _data.get("from", ""),
         _data.get("chat_id", ""),
+        (_data.get("body") or "")[:100],
         _data.get("message_id", ""),
-        _data.get("is_from_me"),
-        _data.get("is_group"),
-        _data.get("message_type", ""),
-        _data.get("timestamp"),
-        (_data.get("body") or "")[:80],
     )
 
     background_tasks.add_task(_process_webhook, payload)
-    return {"status": "ok"}
+    
+    # ── RESPONSE LOG ────────────────────────────────────────────────────
+    response = {"status": "ok"}
+    logger.info("[RESPONSE] Webhook accepted | status=%r", response.get("status"))
+    return response
 
 
 @router.get("/whatsmeow-webhook/health")
