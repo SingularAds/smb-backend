@@ -288,7 +288,10 @@ class WhatsmeowClient:
 
         Returns ``{"code": "XXXX-XXXX", "sessionId": "..."}``
         """
-        async with self._client() as client:
+        # Use a 90 s HTTP timeout: the bridge needs ~10-20 s for the WS handshake
+        # + PairPhone round-trip, and the Python side retries twice with a 3 s sleep.
+        # The default 30 s is too tight on slow production connections.
+        async with self._client(timeout=90.0) as client:
             resp = await client.post(
                 "/api/pair-code",
                 json={

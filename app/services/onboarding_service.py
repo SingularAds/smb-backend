@@ -1738,6 +1738,15 @@ class OnboardingService:
         await self._send(phone, clean_reply)
 
         if confirmed:
+            # IMMEDIATELY lock the step so any concurrent incoming message cannot
+            # re-trigger finalization while _finalize_business is in flight.
+            # This sync write completes before the next `await`, so any message
+            # that arrives between now and the end of _finalize_business will see
+            # step="pairing" and be routed to the pairing handler instead of
+            # re-entering _handle_conversation or _handle_website_confirm.
+            db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
+            session["currentStep"] = "pairing"
+
             # Merge any website-extracted baseline with conversation-derived data.
             # This preserves website-scraped fields (services, hours, etc.) and fills
             # any missing fields the AI collected during the conversation.
@@ -2610,9 +2619,13 @@ class OnboardingService:
                 })
                 await self._send(phone, clean_reply)
                 if confirmed:
+                    # Lock step before finalization to prevent re-entry
+                    db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
                     await self._finalize_business(session, phone, history, pre_extracted=extracted)
                 return
 
+            # Lock step before finalization to prevent re-entry from concurrent messages
+            db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
             await self._finalize_from_website(session, phone, extracted)
             return
 
@@ -2714,6 +2727,20 @@ class OnboardingService:
         If ``pre_extracted`` is provided (e.g. from website scanning), it is used
         directly and the normal Claude extraction step is skipped.
         """
+        # Guard against duplicate calls caused by race conditions on slow production
+        # connections. If step is already past the pairing entry-point, a concurrent
+        # coroutine has already completed (or is completing) finalization — abort.
+        _guard_step = (db.get_onboarding_session(phone) or {}).get("currentStep", "")
+        _post_finalize_steps = {
+            "pairing_mode_choice", "pairing_qr_active", "pairing_scam_warning",
+            "calendar_setup", "call_forwarding", "complete", "post_onboarding",
+        }
+        if _guard_step in _post_finalize_steps:
+            logger.warning(
+                "[FINALIZE] Race guard: skipping duplicate run for %s (step=%r)",
+                phone, _guard_step,
+            )
+            return
 
         if pre_extracted:
             business_json = pre_extracted
@@ -3096,7 +3123,9 @@ class OnboardingService:
             # available yet, fall back to the blocking start endpoint.
             result = await self.wa.get_qr_current(pairing_sid)
             if result is None:
-                result = await self.wa.get_qr_payload(pairing_sid, timeout_seconds=15)
+                # No active QR session yet — start one with a generous timeout so
+                # the bridge has enough time to connect to WhatsApp on production.
+                result = await self.wa.get_qr_payload(pairing_sid, timeout_seconds=45)
         except PairingStateConflict:
             logger.info("[QR] Session %s is already paired; skipping QR send", pairing_sid)
             return False
@@ -3176,13 +3205,15 @@ class OnboardingService:
                     "*code* to switch to a pairing code instead.",
                 )
             else:
-                # Bridge unavailable — gracefully fall back to pairing code.
+                # QR unavailable (bridge starting up / slow connection).
+                # Reset step so the user can choose again rather than auto-switching.
+                db.upsert_onboarding_session(phone, {"currentStep": "pairing_mode_choice"})
                 await self._send(
                     phone,
-                    "⚠️ I couldn't load the QR code right now. "
-                    "Switching to the pairing-code method instead.",
+                    "⚠️ The QR code isn't ready yet — the bridge may still be starting up.\n\n"
+                    "Reply *1* or *QR* to try again in a moment, "
+                    "or *2* or *code* to use a pairing code instead.",
                 )
-                await self._start_scam_warning(session, phone)
             return
 
         if any(normalized == w or normalized.startswith(w) for w in _code_words):
@@ -3240,8 +3271,9 @@ class OnboardingService:
             try:
                 result = await self.wa.get_qr_current(pairing_sid)
                 if result is None:
-                    # QR session may have timed out entirely; restart it.
-                    result = await self.wa.get_qr_payload(pairing_sid, timeout_seconds=15)
+                    # QR session may have timed out entirely; restart it with a
+                    # generous timeout to survive slow production connections.
+                    result = await self.wa.get_qr_payload(pairing_sid, timeout_seconds=45)
             except PairingStateConflict:
                 await self._handle_pairing(session, phone, "done")
                 return
