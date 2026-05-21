@@ -3138,28 +3138,53 @@ class OnboardingService:
 
         Returns ``True`` on success, ``False`` when no QR payload could be
         obtained (e.g. bridge offline or session already paired).
+
+        Retries up to 3 times with increasing back-off so transient bridge
+        start-up delays on production (Cloud Run cold start) don't immediately
+        surface an error to the user.
         """
         pairing_sid = session.get("pairingSessionId", f"biz-{phone}")
 
-        try:
-            # Use the current (non-blocking) endpoint first.  If none is
-            # available yet, fall back to the blocking start endpoint.
-            result = await self.wa.get_qr_current(pairing_sid)
-            if result is None:
-                # No active QR session yet — start one with a generous timeout so
-                # the bridge has enough time to connect to WhatsApp on production.
-                result = await self.wa.get_qr_payload(pairing_sid, timeout_seconds=45)
-        except PairingStateConflict:
-            logger.info("[QR] Session %s is already paired; skipping QR send", pairing_sid)
-            return False
-        except Exception as exc:
-            logger.error("[QR] Failed to get QR payload for session %s: %s", pairing_sid, exc)
+        result = None
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                # Use the current (non-blocking) endpoint first.  If none is
+                # available yet, fall back to the blocking start endpoint.
+                result = await self.wa.get_qr_current(pairing_sid)
+                if result is None:
+                    # No active QR session yet — start one with a generous timeout so
+                    # the bridge has enough time to connect to WhatsApp on production.
+                    result = await self.wa.get_qr_payload(pairing_sid, timeout_seconds=45)
+                if result and result.get("qr_payload"):
+                    break  # got a valid payload — stop retrying
+                result = None
+                if attempt < 3:
+                    logger.warning(
+                        "[QR] Attempt %d/3: bridge returned empty payload for session %s — retrying in %ds",
+                        attempt, pairing_sid, attempt * 3,
+                    )
+                    await asyncio.sleep(attempt * 3)
+            except PairingStateConflict:
+                logger.info("[QR] Session %s is already paired; skipping QR send", pairing_sid)
+                return False
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "[QR] Attempt %d/3 failed for session %s: %s — retrying in %ds",
+                    attempt, pairing_sid, exc, attempt * 3,
+                )
+                if attempt < 3:
+                    await asyncio.sleep(attempt * 3)
+
+        if not result or not result.get("qr_payload"):
+            logger.error(
+                "[QR] All 3 attempts failed to get QR payload for session %s. last_error=%s",
+                pairing_sid, last_exc,
+            )
             return False
 
-        qr_payload = (result or {}).get("qr_payload", "")
-        if not qr_payload:
-            logger.error("[QR] Bridge returned empty qr_payload for session %s", pairing_sid)
-            return False
+        qr_payload = result["qr_payload"]
 
         try:
             png_bytes = self._qr_payload_to_png_bytes(qr_payload)
@@ -3168,7 +3193,6 @@ class OnboardingService:
             return False
 
         try:
-            device_id = session.get("pairingSessionId")  # use the business session
             await self.wa.send_image(
                 phone=phone,
                 image_bytes=png_bytes,
@@ -3228,12 +3252,16 @@ class OnboardingService:
                     "*code* to switch to a pairing code instead.",
                 )
             else:
-                # QR unavailable (bridge starting up / slow connection).
-                # Reset step so the user can choose again rather than auto-switching.
+                # QR unavailable after all retries — reset step and offer a clear
+                # actionable alternative rather than a vague "bridge starting up" message.
                 db.upsert_onboarding_session(phone, {"currentStep": "pairing_mode_choice"})
                 await self._send(
                     phone,
-                    "⚠️ The QR code isn't ready yet — the bridge may still be starting up.",
+                    "⚠️ *Couldn't generate the QR code right now.*\n\n"
+                    "You can:\n"
+                    "• Reply *QR* to try again\n"
+                    "• Reply *2* or *code* to link via pairing code instead 📱\n\n"
+                    "_The pairing code works great if you only have this phone with you._",
                 )
             return
 
