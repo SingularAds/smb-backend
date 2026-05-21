@@ -3188,11 +3188,18 @@ class OnboardingService:
 
         try:
             png_bytes = self._qr_payload_to_png_bytes(qr_payload)
+            print(f"[QR] PNG generated: {len(png_bytes)} bytes for session={pairing_sid}")
+        except ImportError as exc:
+            print(f"[QR] MISSING PACKAGE: qrcode/Pillow not installed — {exc}")
+            logger.error("[QR] qrcode/Pillow package missing. Add 'qrcode[pil]' to requirements.txt. Error: %s", exc)
+            return False
         except Exception as exc:
+            print(f"[QR] PNG conversion failed for session={pairing_sid}: {exc}")
             logger.error("[QR] Failed to convert QR payload to PNG: %s", exc)
             return False
 
         try:
+            print(f"[QR] Sending image to phone={phone} device={self.wa.default_device_id}")
             await self.wa.send_image(
                 phone=phone,
                 image_bytes=png_bytes,
@@ -3200,9 +3207,11 @@ class OnboardingService:
                 mime_type="image/png",
                 device_id=self.wa.default_device_id,   # send via the onboarding device
             )
+            print(f"[QR] Image sent successfully to {phone}")
             logger.info("[QR] QR image sent to %s (session=%s)", phone, pairing_sid)
             return True
         except Exception as exc:
+            print(f"[QR] send_image FAILED to {phone}: {exc}")
             logger.error("[QR] Failed to send QR image to %s: %s", phone, exc)
             return False
 

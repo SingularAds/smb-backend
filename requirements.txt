@@ -39,6 +39,9 @@ google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.1
 stripe==11.2.0
 
+# ── QR Code Generation ──
+qrcode[pil]>=7.4.2
+
 # ── Utilities ──
 phonenumbers==8.13.51
 pytz==2024.2

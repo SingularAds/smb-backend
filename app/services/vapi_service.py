@@ -48,12 +48,16 @@ def _get_calendar_service():
 
 
 def _cal_create_both(booking_data: dict, business: dict) -> tuple[str | None, str | None]:
-    """Create calendar event using Service Account credentials.
+    """Create calendar event for a booking.
 
-    Returns (None, service_account_event_id).
+    Tries owner OAuth credentials first (written to the owner's personal calendar),
+    then falls back to the service account (written to the global service calendar).
+
+    Returns ``(oauth_event_id, service_event_id)``.
     """
     booking_id = booking_data.get("id", "?")
     biz_id = business.get("id", "?")
+    oauth_event_id = None
     service_event_id = None
 
     # Parse start datetime
@@ -67,38 +71,57 @@ def _cal_create_both(booking_data: dict, business: dict) -> tuple[str | None, st
         logger.error("[Calendar] Failed to parse datetime for booking %s: %s", booking_id, exc)
         return None, None
 
-    # Build event details
+    # Build common event fields
     customer_name = booking_data.get("customerName", "")
     customer_phone = booking_data.get("customerPhone") or booking_data.get("callerPhone", "")
     service_name = booking_data.get("serviceName", "Appointment")
     duration_minutes = int(booking_data.get("serviceDuration") or 60)
     notes = booking_data.get("notes", "")
-    
+
     end_dt = start_dt + timedelta(minutes=duration_minutes)
-    
     business_name = business.get("name", "Business")
+    tz_str = business.get("timezone") or settings.GOOGLE_CALENDAR_TIMEZONE or "UTC"
+
     event = {
         'summary': f"[{business_name}] {service_name} - {customer_name}" if customer_name else f"[{business_name}] {service_name}",
         'description': f"Business: {business_name}\nBusinessID: {biz_id}\nBookingID: {booking_id}\nCustomer: {customer_name}\nPhone: {customer_phone}\nNotes: {notes}",
-        'start': {
-            'dateTime': start_dt.isoformat(),
-            'timeZone': business.get("timezone") or settings.GOOGLE_CALENDAR_TIMEZONE or "UTC",
-        },
-        'end': {
-            'dateTime': end_dt.isoformat(),
-            'timeZone': business.get("timezone") or settings.GOOGLE_CALENDAR_TIMEZONE or "UTC",
-        },
+        'start': {'dateTime': start_dt.isoformat(), 'timeZone': tz_str},
+        'end': {'dateTime': end_dt.isoformat(), 'timeZone': tz_str},
         'extendedProperties': {
-            'private': {
-                'businessId': biz_id,
-                'bookingId': booking_id,
-            }
+            'private': {'businessId': biz_id, 'bookingId': booking_id}
         },
     }
 
+    # ── Path 1: Owner OAuth (preferred) ──────────────────────────────────────
+    refresh_token = business.get("calendarRefreshToken", "")
+    owner_calendar_id = business.get("ownerCalendarId") or "primary"
+    if refresh_token and business.get("calendarConnected"):
+        print(f"[Calendar] CREATE (OAuth) booking={booking_id} biz={biz_id} calendar={owner_calendar_id}")
+        try:
+            from app.integrations.google_calendar import GoogleCalendarClient
+            cal = GoogleCalendarClient()
+            oauth_event_id = cal.create_event(
+                customer_name=customer_name,
+                customer_phone=customer_phone,
+                service_name=service_name,
+                start_dt=start_dt,
+                duration_minutes=duration_minutes,
+                notes=notes,
+                timezone=tz_str,
+                calendar_id=owner_calendar_id,
+                refresh_token=refresh_token,
+            )
+            if oauth_event_id:
+                print(f"[Calendar] CREATE (OAuth) SUCCESS booking={booking_id} event={oauth_event_id}")
+            else:
+                print(f"[Calendar] CREATE (OAuth) FAILED (no event ID) booking={booking_id}")
+        except Exception as exc:
+            print(f"[Calendar] CREATE (OAuth) EXCEPTION booking={booking_id}: {exc}")
+            logger.error("[Calendar] CREATE (OAuth) EXCEPTION booking=%s: %s", booking_id, exc, exc_info=True)
+
+    # ── Path 2: Service Account (fallback / backup) ──────────────────────────
     service_calendar_id = settings.GOOGLE_CALENDAR_ID or "primary"
-    print(f"[Calendar] CREATE booking={booking_id} biz={biz_id} calendar={service_calendar_id} credentials={settings.GOOGLE_CREDENTIALS_FILE}")
-    
+    print(f"[Calendar] CREATE (ServiceAccount) booking={booking_id} biz={biz_id} calendar={service_calendar_id}")
     try:
         service = _get_calendar_service()
         created_event = service.events().insert(
@@ -106,16 +129,15 @@ def _cal_create_both(booking_data: dict, business: dict) -> tuple[str | None, st
             body=event
         ).execute()
         service_event_id = created_event.get('id')
-        
         if service_event_id:
-            print(f"[Calendar] CREATE SUCCESS booking={booking_id} event={service_event_id}")
+            print(f"[Calendar] CREATE (ServiceAccount) SUCCESS booking={booking_id} event={service_event_id}")
         else:
-            print(f"[Calendar] CREATE FAILED (no event ID) booking={booking_id}")
+            print(f"[Calendar] CREATE (ServiceAccount) FAILED (no event ID) booking={booking_id}")
     except Exception as exc:
-        print(f"[Calendar] CREATE EXCEPTION booking={booking_id}: {exc}")
-        logger.error("[Calendar] CREATE EXCEPTION booking=%s: %s", booking_id, exc, exc_info=True)
+        print(f"[Calendar] CREATE (ServiceAccount) EXCEPTION booking={booking_id}: {exc}")
+        logger.error("[Calendar] CREATE (ServiceAccount) EXCEPTION booking=%s: %s", booking_id, exc, exc_info=True)
 
-    return None, service_event_id
+    return oauth_event_id, service_event_id
 
 
 def _cal_update_both(
@@ -129,58 +151,75 @@ def _cal_update_both(
     service_name: str = "",
     notes: str = "",
 ) -> bool:
-    """Update calendar event using Service Account credentials.
+    """Update calendar event(s) when a booking is rescheduled.
 
-    Returns True if the update succeeded.
+    Uses owner OAuth credentials to update the owner's calendar event (when
+    oauth_event_id is set), and service account for the backup event.
+
+    Returns True if at least one update succeeded.
     """
-    # Use whichever event ID is available (service_event_id preferred, oauth_event_id as fallback)
-    event_id = service_event_id or oauth_event_id
-    if not event_id:
-        print(f"[Calendar] UPDATE skipped booking={booking_id} — no event ID stored")
-        return False
-
+    success = False
     end_dt = start_dt + timedelta(minutes=duration_minutes)
     business_name = business.get("name", "Business")
-    event = {
+    tz_str = business.get("timezone") or settings.GOOGLE_CALENDAR_TIMEZONE or "UTC"
+
+    event_body = {
         'summary': f"[{business_name}] {service_name} - {customer_name}" if customer_name else f"[{business_name}] {service_name}",
         'description': f"Business: {business_name}\nBusinessID: {business.get('id', '?')}\nBookingID: {booking_id}\nCustomer: {customer_name}\nNotes: {notes}",
-        'start': {
-            'dateTime': start_dt.isoformat(),
-            'timeZone': business.get("timezone") or settings.GOOGLE_CALENDAR_TIMEZONE or "UTC",
-        },
-        'end': {
-            'dateTime': end_dt.isoformat(),
-            'timeZone': business.get("timezone") or settings.GOOGLE_CALENDAR_TIMEZONE or "UTC",
-        },
+        'start': {'dateTime': start_dt.isoformat(), 'timeZone': tz_str},
+        'end': {'dateTime': end_dt.isoformat(), 'timeZone': tz_str},
         'extendedProperties': {
-            'private': {
-                'businessId': business.get('id', '?'),
-                'bookingId': booking_id,
-            }
+            'private': {'businessId': business.get('id', '?'), 'bookingId': booking_id}
         },
     }
 
-    service_calendar_id = settings.GOOGLE_CALENDAR_ID or "primary"
-    print(f"[Calendar] UPDATE booking={booking_id} event={event_id} calendar={service_calendar_id}")
-    
-    try:
-        service = _get_calendar_service()
-        updated_event = service.events().update(
-            calendarId=service_calendar_id,
-            eventId=event_id,
-            body=event
-        ).execute()
-        
-        if updated_event:
-            print(f"[Calendar] UPDATE SUCCESS booking={booking_id} event={event_id}")
-            return True
-        else:
-            print(f"[Calendar] UPDATE FAILED booking={booking_id} event={event_id}")
-            return False
-    except Exception as exc:
-        print(f"[Calendar] UPDATE EXCEPTION booking={booking_id}: {exc}")
-        logger.error("[Calendar] UPDATE EXCEPTION booking=%s: %s", booking_id, exc, exc_info=True)
-        return False
+    # ── Path 1: Update owner's calendar via OAuth ─────────────────────────────
+    if oauth_event_id:
+        refresh_token = business.get("calendarRefreshToken", "")
+        owner_calendar_id = business.get("ownerCalendarId") or "primary"
+        print(f"[Calendar] UPDATE (OAuth) booking={booking_id} event={oauth_event_id} calendar={owner_calendar_id}")
+        try:
+            from app.integrations.google_calendar import GoogleCalendarClient
+            cal = GoogleCalendarClient()
+            svc = cal._get_service(refresh_token=refresh_token if refresh_token else None)
+            if svc:
+                updated = svc.events().update(
+                    calendarId=owner_calendar_id,
+                    eventId=oauth_event_id,
+                    body=event_body,
+                ).execute()
+                if updated:
+                    print(f"[Calendar] UPDATE (OAuth) SUCCESS booking={booking_id} event={oauth_event_id}")
+                    success = True
+                else:
+                    print(f"[Calendar] UPDATE (OAuth) FAILED booking={booking_id}")
+        except Exception as exc:
+            print(f"[Calendar] UPDATE (OAuth) EXCEPTION booking={booking_id}: {exc}")
+            logger.error("[Calendar] UPDATE (OAuth) EXCEPTION booking=%s: %s", booking_id, exc, exc_info=True)
+
+    # ── Path 2: Update service account backup event ───────────────────────────
+    if service_event_id:
+        service_calendar_id = settings.GOOGLE_CALENDAR_ID or "primary"
+        print(f"[Calendar] UPDATE (ServiceAccount) booking={booking_id} event={service_event_id} calendar={service_calendar_id}")
+        try:
+            service = _get_calendar_service()
+            updated = service.events().update(
+                calendarId=service_calendar_id,
+                eventId=service_event_id,
+                body=event_body,
+            ).execute()
+            if updated:
+                print(f"[Calendar] UPDATE (ServiceAccount) SUCCESS booking={booking_id} event={service_event_id}")
+                success = True
+            else:
+                print(f"[Calendar] UPDATE (ServiceAccount) FAILED booking={booking_id}")
+        except Exception as exc:
+            print(f"[Calendar] UPDATE (ServiceAccount) EXCEPTION booking={booking_id}: {exc}")
+            logger.error("[Calendar] UPDATE (ServiceAccount) EXCEPTION booking=%s: %s", booking_id, exc, exc_info=True)
+
+    if not oauth_event_id and not service_event_id:
+        print(f"[Calendar] UPDATE skipped booking={booking_id} — no event ID stored")
+    return success
 
 
 def _cal_delete_both(
@@ -189,32 +228,48 @@ def _cal_delete_both(
     service_event_id: str | None,
     business: dict,
 ) -> bool:
-    """Delete calendar event using Service Account credentials.
+    """Delete calendar event(s) when a booking is cancelled.
 
-    Returns True if the deletion succeeded.
+    Uses owner OAuth credentials to delete the owner's calendar event (when
+    oauth_event_id is set), and service account for the backup event.
+
+    Returns True if at least one deletion succeeded.
     """
-    # Use whichever event ID is available (service_event_id preferred, oauth_event_id as fallback)
-    event_id = service_event_id or oauth_event_id
-    if not event_id:
-        print(f"[Calendar] DELETE skipped booking={booking_id} — no event ID stored")
-        return False
+    success = False
 
-    service_calendar_id = settings.GOOGLE_CALENDAR_ID or "primary"
-    print(f"[Calendar] DELETE booking={booking_id} event={event_id} calendar={service_calendar_id}")
-    
-    try:
-        service = _get_calendar_service()
-        service.events().delete(
-            calendarId=service_calendar_id,
-            eventId=event_id
-        ).execute()
-        
-        print(f"[Calendar] DELETE SUCCESS booking={booking_id} event={event_id}")
-        return True
-    except Exception as exc:
-        print(f"[Calendar] DELETE EXCEPTION booking={booking_id}: {exc}")
-        logger.error("[Calendar] DELETE EXCEPTION booking=%s: %s", booking_id, exc, exc_info=True)
-        return False
+    # ── Path 1: Delete from owner's calendar via OAuth ────────────────────────
+    if oauth_event_id:
+        refresh_token = business.get("calendarRefreshToken", "")
+        owner_calendar_id = business.get("ownerCalendarId") or "primary"
+        print(f"[Calendar] DELETE (OAuth) booking={booking_id} event={oauth_event_id} calendar={owner_calendar_id}")
+        try:
+            from app.integrations.google_calendar import GoogleCalendarClient
+            cal = GoogleCalendarClient()
+            svc = cal._get_service(refresh_token=refresh_token if refresh_token else None)
+            if svc:
+                svc.events().delete(calendarId=owner_calendar_id, eventId=oauth_event_id).execute()
+                print(f"[Calendar] DELETE (OAuth) SUCCESS booking={booking_id} event={oauth_event_id}")
+                success = True
+        except Exception as exc:
+            print(f"[Calendar] DELETE (OAuth) EXCEPTION booking={booking_id}: {exc}")
+            logger.error("[Calendar] DELETE (OAuth) EXCEPTION booking=%s: %s", booking_id, exc, exc_info=True)
+
+    # ── Path 2: Delete service account backup event ───────────────────────────
+    if service_event_id:
+        service_calendar_id = settings.GOOGLE_CALENDAR_ID or "primary"
+        print(f"[Calendar] DELETE (ServiceAccount) booking={booking_id} event={service_event_id} calendar={service_calendar_id}")
+        try:
+            service = _get_calendar_service()
+            service.events().delete(calendarId=service_calendar_id, eventId=service_event_id).execute()
+            print(f"[Calendar] DELETE (ServiceAccount) SUCCESS booking={booking_id} event={service_event_id}")
+            success = True
+        except Exception as exc:
+            print(f"[Calendar] DELETE (ServiceAccount) EXCEPTION booking={booking_id}: {exc}")
+            logger.error("[Calendar] DELETE (ServiceAccount) EXCEPTION booking=%s: %s", booking_id, exc, exc_info=True)
+
+    if not oauth_event_id and not service_event_id:
+        print(f"[Calendar] DELETE skipped booking={booking_id} — no event ID stored")
+    return success
 
 
 
