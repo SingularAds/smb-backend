@@ -1202,18 +1202,6 @@ class OnboardingService:
             # try fast substring checks first (covers natural phrasing),
             # then fall back to the intent classifier for ambiguous cases.
             if step == "pairing":
-                # Refresh from DB — _finalize_business runs concurrently and may have
-                # just written businessId / pairingSessionId after our initial read.
-                _refreshed = db.get_onboarding_session(phone) or session
-                if not _refreshed.get("businessId"):
-                    # Finalization still in progress; ask the user to wait rather than
-                    # letting the AI classify "Ok" / "done" as a WhatsApp connection.
-                    await self._send(
-                        phone,
-                        "⏳ Just a moment — I'm still finishing your setup! I'll be right with you.",
-                    )
-                    return
-                session = _refreshed
                 normalized = body.strip().lower()
                 _done = {"done", "pronto", "feito", "hecho", "ready", "listo", "linked", "conectado"}
                 _skip = {"skip", "pular", "saltar", "later", "depois"}
@@ -2940,21 +2928,6 @@ class OnboardingService:
                 )
                 await self._send_pairing_code(refreshed, phone)
         else:
-            # Fresh pairing needed — let the user choose between QR and pairing code.
-            # Re-read the step from DB: a concurrent "done" message that raced ahead
-            # may have already moved us past pairing (e.g. to calendar_setup).
-            # If so, skip starting the mode-choice flow to avoid overwriting that state.
-            _end_step = (db.get_onboarding_session(phone) or {}).get("currentStep", "")
-            _already_advanced = {
-                "pairing_mode_choice", "pairing_qr_active", "pairing_scam_warning",
-                "calendar_setup", "call_forwarding", "complete", "post_onboarding",
-            }
-            if _end_step in _already_advanced:
-                logger.warning(
-                    "[FINALIZE] End-guard: step already at %r — skipping pairing mode choice for %s",
-                    _end_step, phone,
-                )
-                return
             await self._start_pairing_mode_choice(refreshed, phone, biz_name)
 
     async def _extract_business_data(self, history: list[dict]) -> dict:
@@ -3003,15 +2976,6 @@ class OnboardingService:
         if normalized in done_words:
             business_id = session.get("businessId")
             pairing_sid = session.get("pairingSessionId")
-
-            # Guard: businessId must be present before we can confirm connection.
-            # If missing, _finalize_business hasn't completed yet — tell the user to wait.
-            if not business_id:
-                await self._send(
-                    phone,
-                    "⏳ I'm still setting up your account — please try again in a moment!",
-                )
-                return
 
             if business_id and pairing_sid:
                 try:
@@ -3269,9 +3233,7 @@ class OnboardingService:
                 db.upsert_onboarding_session(phone, {"currentStep": "pairing_mode_choice"})
                 await self._send(
                     phone,
-                    "⏳ The QR code is still loading — this can take a few seconds.\n\n"
-                    "Reply *1* or *QR* to try again, "
-                    "or *2* or *code* to use a pairing code instead.",
+                    "⚠️ The QR code isn't ready yet — the bridge may still be starting up.",
                 )
             return
 
@@ -3769,13 +3731,10 @@ class OnboardingService:
                 system=(
                     "The user is pairing their WhatsApp device to a business platform.\n"
                     "Classify their message into exactly one category:\n"
-                    "  done        – they explicitly confirm they have linked/connected/paired/scanned successfully\n"
-                    "                (e.g. 'done', 'linked', 'connected', 'I did it', 'paired', 'it worked')\n"
+                    "  done        – they have linked/connected successfully and are confirming it\n"
                     "  resend      – they want the pairing code sent again (resend, send again, new code, didn't get it, etc.)\n"
                     "  skip        – they want to skip pairing for now\n"
-                    "  change_info – anything else, including casual acknowledgments\n"
-                    "IMPORTANT: Short words alone such as 'ok', 'okay', 'thanks', 'got it', 'sure', 'alright',\n"
-                    "'good', 'fine', 'yes', 'yep' are NOT 'done' — classify these as 'change_info'.\n"
+                    "  change_info – they want to change their business details (unrelated to pairing)\n"
                     "Reply with ONLY the category name, nothing else."
                 ),
                 messages=[{"role": "user", "content": message}],
