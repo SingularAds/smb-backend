@@ -29,12 +29,21 @@ async def save_recepte_lead(request: Request) -> dict:
         "phone":        "+918427791370",
         "businessName": "Restaurant Name",
         "city":         "City, Region",
+        "address":      "Full street address (optional, enriches onboarding card)",
         "country":      "IN",
         "type":         "restaurant",
         "url":          "https://...",
+        "placeId":      "ChIJ... (Google Places ID — optional)",
+        "hours":        "Mon-Sat 9:00-21:00 (optional, skips hours question in onboarding)",
+        "services":     [{"name": "...", "price": "...", "duration": "..."} ...],
         "source":       "recepte.co",
         "integration":  "whatsapp"
     }
+
+    The ``hours``, ``services``, ``address``, and ``placeId`` fields are optional
+    enrichment data from Google Places. When present they are stored on the lead doc
+    and surfaced in the WhatsApp onboarding confirmation card so the owner can confirm
+    (or correct) them without going through a long Q&A conversation.
     """
     try:
         lead = await request.json()

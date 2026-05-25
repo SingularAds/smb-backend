@@ -1080,3 +1080,73 @@ def delete_recepte_lead(phone: str) -> None:
     phone_clean = _clean_phone(phone)
     _db().collection("recepte_leads").document(phone_clean).delete()
     logger.info("[FIRESTORE] Deleted recepte lead for phone %s", phone_clean)
+
+
+def get_website_lead_by_phone(phone: str) -> dict | None:
+    """Fetch a lead for a brand-new user, checking website_leads first then recepte_leads.
+
+    Priority order (per product requirements):
+      1. ``website_leads`` — populated by the recepte.co production website form.
+         Tries both ``+91XXXXXXXXXX`` and ``91XXXXXXXXXX`` phone formats.
+      2. ``recepte_leads`` — populated by our own ``/api/v1/recepte/lead`` endpoint.
+
+    Used by the cold-start onboarding path (any user who messages WhatsApp for
+    the first time) to detect pre-existing registration data automatically,
+    without requiring the "I want to activate recepte for X" activation message.
+    """
+    if "@" in phone:
+        phone = phone.split("@")[0]
+    phone_clean = _clean_phone(phone)   # digits only, e.g. "917015057282"
+    phone_plus  = f"+{phone_clean}"     # e.g. "+917015057282"
+
+    print(f"[LEAD-LOOKUP] Checking website_leads for phone={phone_clean}")
+    logger.info("[LEAD-LOOKUP] Checking website_leads for phone=%s", phone_clean)
+
+    # ── 1. website_leads (recepte.co production site) ─────────────────────
+    for phone_fmt in (phone_plus, phone_clean):
+        docs = (
+            _db()
+            .collection("website_leads")
+            .where(filter=FieldFilter("phone", "==", phone_fmt))
+            .stream()
+        )
+        matches = []
+        for wl_doc in docs:
+            matches.append(wl_doc.to_dict())
+
+        if matches:
+            matches.sort(key=lambda x: x.get("createdAt", ""), reverse=True)
+            raw = matches[0]
+            raw["_collection"] = "website_leads"
+            result = _normalize_lead_data(raw, "website_leads")
+            print(
+                f"[LEAD-LOOKUP] Found in website_leads for {phone_clean} "
+                f"(stored as {phone_fmt!r}): businessName={result.get('businessName')!r}"
+            )
+            logger.info(
+                "[LEAD-LOOKUP] Found in website_leads for %s (fmt=%s): businessName=%r",
+                phone_clean, phone_fmt, result.get("businessName"),
+            )
+            return result
+
+    # ── 2. recepte_leads (our own ingestion endpoint) ─────────────────────
+    print(f"[LEAD-LOOKUP] Not in website_leads, checking recepte_leads for phone={phone_clean}")
+    logger.info("[LEAD-LOOKUP] Not in website_leads, checking recepte_leads for %s", phone_clean)
+
+    doc = _db().collection("recepte_leads").document(phone_clean).get()
+    if doc.exists:
+        data = doc.to_dict()
+        data["_collection"] = "recepte_leads"
+        print(
+            f"[LEAD-LOOKUP] Found in recepte_leads for {phone_clean}: "
+            f"businessName={data.get('businessName')!r}"
+        )
+        logger.info(
+            "[LEAD-LOOKUP] Found in recepte_leads for %s: businessName=%r",
+            phone_clean, data.get("businessName"),
+        )
+        return data
+
+    print(f"[LEAD-LOOKUP] No lead found for phone={phone_clean}")
+    logger.info("[LEAD-LOOKUP] No lead found for %s", phone_clean)
+    return None

@@ -184,63 +184,83 @@ equivalent based on the owner's language). Do not repeat your name after that un
 - "Recepte AI" is the product/company name — you never use it to refer to yourself.
 - Daniel is the human backup agent — only mention him when you are explicitly handing off.
 
-YOUR JOB:
+YOUR JOB (MINIMAL-QUESTION FLOW):
 1. Welcome the owner warmly with a short greeting (1-2 sentences max)
-2. FIRST TURN FLOW: after greeting, first ask whether they have a business website, Google Maps link, or Instagram profile they can share
-3. If they have a website, Google Maps link, or Instagram profile, the system processes it automatically — you do NOT need to react to URLs
-4. If they do NOT have a website/link/Instagram, ask for the business name next (only then), so the system can search Google Places automatically
-5. When you have enough info, present a summary for confirmation
-6. Never make the owner feel rushed — be patient and thorough
+2. FIRST TURN: immediately ask for their business website, Google Maps link, or Instagram \
+profile so the system can auto-fill their details
+3. The system processes the URL silently and shows a minimal confirmation card \
+(business name, type, address) — you do NOT need to react to URLs
+4. After the owner confirms the card, ask ONE referral question, then output [CONFIRMED]
+5. If no link available → ask for the business name so the system can search Google Places
+6. Keep the whole onboarding to the fewest possible messages — ideally 3–4 turns total
 
 WEBSITE / MAPS / INSTAGRAM LINKS:
-- The system processes all URLs, Google Maps links, and Instagram profile links in the background — you do NOT need to react to them
+- The system processes all URLs, Google Maps links, and Instagram profile links in the \
+background — you do NOT need to react to them
 - Never say "let me scan your website", "looking at it now", or react to any URL the owner shares
-- If extra context tells you a URL, Maps link, or Instagram link was already tried (success or failure), NEVER ask for another link
-- FIRST assistant message rule: when the owner starts with a greeting/small talk ("hi", "hello", "hey", etc.), ask this question directly:
-    "Do you have a business website, Google Maps link, or Instagram profile? If yes, share it here and I can pull your details automatically."
-    You may add a short fallback in the same message: "If not, then will move on the next step."
+- If extra context tells you a URL, Maps link, or Instagram link was already tried \
+(success or failure), NEVER ask for another link
+- FIRST assistant message rule: when the owner starts with a greeting/small talk \
+("hi", "hello", "hey", etc.), ask this question directly:
+    "Do you have a business website, Google Maps link, or Instagram profile? \
+If yes, share it here and I can pull your details automatically."
+    You may add a short fallback in the same message: "If not, just send your business name."
 - Ask this website/maps/instagram question only once unless the owner brings it up again.
-- If they say they don't have a website/link: reply "No worries! Please share your business name and I'll try to find it automatically on Google." — then wait for the name
+- If they say they don't have a website/link: reply \
+"No worries! Please share your business name and I'll try to find it automatically on Google." \
+— then wait for the name
 
 GOOGLE PLACES SEARCH:
 - When the owner shares a business name, the system automatically searches for it on Google
 - If a match is found, the system shows it to the owner for confirmation — you do NOT need to do anything
-- If no match is found, the system tells you — then ask for their city/address and continue collecting info naturally
+- If no match is found, the system tells you — then ask for their city/address only, \
+then move to the referral question
 - Never suggest the owner search Google themselves
-- After a business is confirmed from Google Places (owner replies yes), do NOT ask for business name/type/address again unless the owner explicitly says they are wrong
+- After a business is confirmed from Google Places (owner replies yes), do NOT ask for \
+business name/type/address again unless the owner explicitly says they are wrong
 
-INFORMATION YOU MUST COLLECT (ask naturally, not as a checklist):
+REQUIRED FIELDS — only 3 are mandatory:
 - Business name
 - Business type (salon, restaurant, clinic, gym, store, spa, barbershop, etc.)
-- Brief description of the business
-- Services offered (with prices and durations if known)
-- Operating hours
 - Business address (city at minimum)
-- Staff members (if applicable)
+
+INFORMATION YOU CAN COLLECT IF NOT ALREADY EXTRACTED \
+(do NOT ask for these — accept them only if the owner volunteers or they were auto-scraped):
+- Services offered (with prices and durations) — great if available, not required
+- Operating hours — NOT required; availability is managed via Google Calendar freebusy
+- Brief description of the business
 - Business phone number (if different from WhatsApp)
-- Languages spoken at the business
 - Any specialties or unique selling points
-- Maximum concurrent bookings per hour (e.g. 'how many clients can you serve at the same time in a given hour?')
-- Referral program (REQUIRED — you MUST ask this before showing the final summary): Ask the owner if they'd like to offer a referral discount to help grow their customer base. Give a one-sentence explanation: "A customer who refers a friend gets a discount on their next visit, and the referred friend gets a discount on their first visit." Then ask: *"Would you like to enable this? (yes/no — the default discounts are 25% for the referrer and 10% for the referred friend, but you can change them)"* Record their answer explicitly (enabled=yes/no) and any custom percentages they give. Do NOT skip this question. Ask it as a standalone question after collecting services and hours.
+
+NEVER ASK FOR (handled automatically by the system):
+- Maximum concurrent bookings / slotsPerHour — set automatically from Google Calendar
+- Opening days / schedule — determined from Google Calendar freebusy
+- Staff members — owner can add these later via commands
+- Languages spoken — owner can configure these later
+
+REFERRAL PROGRAM — ask this ONCE after the business details are confirmed:
+Ask the owner if they'd like to offer a referral discount to grow their customer base.
+Give a one-sentence explanation: "A customer who refers a friend gets a discount on their \
+next visit, and the referred friend gets a discount on their first visit."
+Then ask: *"Would you like to enable this? (yes/no — default is 25% off for the referrer \
+and 10% off for the new customer, but you can choose any percentages)"*
+Record their answer explicitly (enabled=yes/no) and any custom percentages they give.
+Do NOT skip this question. Ask it as a single standalone message.
+After they answer → show the mini-summary and output [CONFIRMED].
 
 CONVERSATION RULES:
-- Ask 1-2 questions at a time, never overwhelm with a long list
-- Priority order for early onboarding:
-    1) Greeting + website/maps availability question
-    2) If no link, ask business name
-    3) After Places confirmation, ask only missing fields
-- SMART COMBINING: For fields that have short answers, combine them into one question to speed up onboarding.
-  Good examples:
-    • "What days are you open, and what are your hours? (e.g. Mon–Sat 9am–7pm)"
-    • "How many clients can you serve at the same time — and roughly how long does each appointment take?"
-    • "Do you have any staff members, and what languages do you speak at the salon?"
-  Bad: asking each of those as a separate message.
-- If the owner gives partial info, acknowledge it and ask for what's missing
+- Keep it to the absolute minimum number of messages
+- Priority order:
+    1) Greeting + ask for website/maps/instagram link
+    2) System auto-fetches → confirmation card shown by system (not you)
+    3) After owner confirms → ask referral question (ONE message)
+    4) After referral answer → show mini-summary → [CONFIRMED]
+- If the owner gives partial info, acknowledge it and ask only for what is truly missing \
+(name, type, or address — nothing else)
 - If they want to change something they already said, happily accommodate it immediately
 - Use emojis sparingly to keep it friendly
 - Keep messages short — this is WhatsApp, not email
-- If the owner seems unsure about services/prices, help them think through it
-- After collecting enough info, ALWAYS present a clear summary
+- After collecting the 3 required fields + referral answer, ALWAYS present the summary
 
 HANDLING CHANGES AFTER CONFIRMATION:
 - The user may want to make changes even after previously confirming
@@ -250,28 +270,22 @@ HANDLING CHANGES AFTER CONFIRMATION:
 - Never refuse a change request at any stage
 
 WHEN YOU HAVE ENOUGH INFO:
-Present a formatted summary like this:
+Present a minimal summary like this:
 
 Here's what I've got for your business:
 
-[Business Name]
+*[Business Name]*
 Type: [type]
-[description]
-
-Services:
-  - [Service 1] — [duration] — [price]
-  - [Service 2] — [duration] — [price]
-
-Hours: [hours]
-Address: [address]
-Phone: [phone]
-Staff: [staff]
-Languages: [languages]
-Referral program: [Enabled — [X]% off for referrer, [Y]% off for referee | Disabled]
+📍 [address]
+[Services: ... — only if available]
+[Hours: ... — only if available]
+Referral program: [Enabled — [X]% off for referrer, [Y]% off for new customer | Disabled]
 
 Then ask: "Does this look correct? Reply *yes* to confirm or just tell me what to change."
 
-IMPORTANT: The Referral program line MUST always be in the summary. If they said yes/enabled, show the percentages. If they said no/disabled (or have not answered yet — you must ask before showing the summary), show "Disabled".
+IMPORTANT: The Referral program line MUST always be in the summary.
+Do NOT include slotsPerHour, openingDays, staff, or languages in the summary \
+— these are handled automatically.
 
 IMPORTANT RESPONSE FORMAT:
 - Respond with ONLY the message text to send to the user
@@ -336,12 +350,18 @@ Return ONLY valid JSON with this structure:
 }
 
 Rules:
-- Include ALL services mentioned in the conversation
+- Include ALL services mentioned in the conversation; use empty array [] if none mentioned
 - If price/duration not mentioned for a service, use empty string
-- For languages, use ISO codes (en, pt, es, fr, de, it)
+- For languages, use ISO codes (en, pt, es, fr, de, it); use empty array [] if not mentioned
 - Infer currency from the country/language if not explicitly stated
-- Be thorough — do not miss any information from the conversation
-- For openingDays, list the full day names the business is open (e.g. ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"])
+- openingDays: use empty array [] if not mentioned (availability is via Google Calendar)
+- hours: use empty string "" if not mentioned (availability is via Google Calendar)
+- staff: use empty array [] if not mentioned
+- slotsPerHour: use 0 if not mentioned — the caller will apply a per-type default
+- referralFeatureEnabled: set to true/false based on what the owner said; default false
+- referrerDiscountPercent / refereeDiscountPercent: extract from conversation; default 25/10
+- Be thorough — do not miss any information actually present in the conversation
+- For openingDays, list the full day names the business is open (e.g. ["Monday", "Tuesday"])
 """
 
 WEBSITE_EXTRACTION_PROMPT = """\
@@ -448,6 +468,56 @@ def _missing_fields(data: dict) -> list[str]:
         if len(incomplete) == len(services):
             missing.append("service prices and durations")
     return missing
+
+
+def _lead_to_business_json(lead: dict) -> dict:
+    """Convert a recepte.co lead dict to the business JSON format used by _finalize_business.
+
+    Maps the lead's field names (businessName, type, city, hours, services, etc.)
+    to the structure expected by ``_finalize_business``.  Missing fields are set
+    to safe defaults so finalisation never crashes on an incomplete lead.
+    """
+    return {
+        "name": lead.get("businessName", ""),
+        "businessType": lead.get("type", "other"),
+        "description": "",
+        "services": lead.get("services") or [],
+        "hours": lead.get("hours", ""),
+        "openingDays": lead.get("openingDays") or [],
+        "address": lead.get("address") or lead.get("city", ""),
+        "phone": "",
+        "staff": [],
+        "languages": [],
+        "specialties": [],
+        "website": lead.get("url", ""),
+        "currency": "EUR",
+        "slotsPerHour": 0,          # will be set by _default_slots_per_hour in _finalize_business
+        "referralFeatureEnabled": False,
+        "referrerDiscountPercent": 25,
+        "refereeDiscountPercent": 10,
+    }
+
+
+def _default_slots_per_hour(business_type: str) -> int:
+    """Return a sensible default slotsPerHour based on the business type.
+
+    Used when the owner never explicitly stated a capacity and Google Calendar
+    freebusy is not yet connected.  These are conservative starting values —
+    the owner can update them later via owner commands.
+    """
+    _map = {
+        "salon": 3,
+        "barbershop": 3,
+        "spa": 2,
+        "clinic": 1,
+        "gym": 10,
+        "restaurant": 20,
+        "cafe": 20,
+        "store": 5,
+        "other": 2,
+    }
+    key = (business_type or "other").lower().strip()
+    return _map.get(key, 2)
 
 
 # Country-code prefix → IANA timezone mapping for common business markets.
@@ -1268,6 +1338,15 @@ class OnboardingService:
                 await self._handle_website_confirm(session, phone, body, push_name, message_id)
                 return
 
+            # Deterministic referral-question flow (no LLM dependency)
+            if step == "referral_offer":
+                await self._handle_referral_offer(session, phone, body, push_name, message_id)
+                return
+
+            if step == "referral_confirm":
+                await self._handle_referral_confirm(session, phone, body, push_name, message_id)
+                return
+
             # Places multi-result pick step
             if step == "places_pick":
                 await self._handle_places_pick(session, phone, body, push_name, message_id)
@@ -1311,7 +1390,25 @@ class OnboardingService:
             )
             return
 
-        # 4. Brand-new user → normal cold-start onboarding
+        # 4. Brand-new user — check website_leads / recepte_leads first
+        #    If the owner registered on recepte.co before messaging WhatsApp,
+        #    show a confirmation card so they don't have to re-enter everything.
+        print(f"[LEAD-LOOKUP] New user {phone} — checking for pre-existing lead data")
+        logger.info("[LEAD-LOOKUP] New user %s — checking website_leads/recepte_leads", phone)
+        lead = db.get_website_lead_by_phone(phone)
+        if lead:
+            _col = lead.get("_collection", "unknown")
+            _biz = lead.get("businessName", "")
+            print(f"[LEAD-LOOKUP] Found lead in '{_col}' for {phone}: businessName={_biz!r}")
+            logger.info(
+                "[LEAD-LOOKUP] Lead found in '%s' for %s: businessName=%r — showing confirmation card",
+                _col, phone, _biz,
+            )
+            await self._show_lead_confirmation(phone, body, push_name, message_id, lead)
+            return
+
+        print(f"[LEAD-LOOKUP] No lead found for {phone} — starting normal cold-start onboarding")
+        logger.info("[LEAD-LOOKUP] No lead found for %s — starting normal onboarding", phone)
         await self._start_new(phone, body, push_name, message_id)
 
     # ── new session ───────────────────────────────────────────────────────
@@ -1387,22 +1484,131 @@ class OnboardingService:
             lines.append(f"  - Business name: {lead['businessName']}")
         if lead.get("type"):
             lines.append(f"  - Business type: {lead['type']}")
-        if lead.get("city"):
+        if lead.get("address"):
+            lines.append(f"  - Address: {lead['address']}")
+        elif lead.get("city"):
             lines.append(f"  - City / address: {lead['city']}")
         if lead.get("url"):
             lines.append(f"  - Website: {lead['url']}")
         if lead.get("country"):
             lines.append(f"  - Country: {lead['country']}")
+        if lead.get("hours"):
+            lines.append(f"  - Operating hours: {lead['hours']}")
+        services = lead.get("services") or []
+        if services:
+            lines.append(f"  - Services: {services}")
+
+        # Build skip list based on what is already known
+        skip_parts = ["business name", "type", "city"]
+        if lead.get("address"):
+            skip_parts.append("address")
+        if lead.get("url"):
+            skip_parts.append("website")
+        if lead.get("hours"):
+            skip_parts.append("operating hours")
+        if services:
+            skip_parts.append("services")
+
         lines += [
             "RULES based on the above:",
-            "  • Do NOT ask for business name, type, or city — we already have them.",
+            f"  • Do NOT ask for {', '.join(skip_parts)} — we already have them.",
             "  • Do NOT ask if they have a website — we already have it.",
-            "  • Focus ONLY on what is still missing: services (with prices/durations), "
-            "operating hours, staff members, business phone (if different from WhatsApp), languages.",
+        ]
+        # Only prompt for genuinely missing fields
+        missing_fields = []
+        if not services:
+            missing_fields.append("services (with prices/durations)")
+        if not lead.get("hours"):
+            missing_fields.append("operating hours")
+        missing_fields += ["staff members", "business phone (if different from WhatsApp)", "languages"]
+        lines.append(
+            f"  • Focus ONLY on what is still missing: {', '.join(missing_fields)}."
+        )
+        lines.append(
             "  • Start by gently confirming the pre-filled details look right, "
             "then proceed to ask for the missing fields.",
-        ]
+        )
         return "\n".join(lines)
+
+    async def _show_lead_confirmation(
+        self,
+        phone: str,
+        body: str,
+        push_name: str,
+        message_id: str,
+        lead: dict,
+    ) -> None:
+        """Create a ``recepte_confirm`` session and send the pre-filled data card.
+
+        Shared by both the recepte.co activation-message path and the cold-start
+        path (any new WhatsApp message when lead data is found in Firestore).
+        After sending the card the owner is expected to reply *yes*, *edit*, or *no*
+        — handled by ``_handle_recepte_confirm()``.
+        """
+        biz_name   = lead.get("businessName") or ""
+        owner_name = lead.get("name") or push_name or ""
+        biz_type   = lead.get("type", "")
+        city       = lead.get("city", "")
+        lang       = self.ai.detect_language(phone)
+        now        = datetime.utcnow().isoformat()
+
+        logger.info("[RECEPTE] Showing lead confirmation for %s: businessName=%r", phone, biz_name)
+        print(f"[LEAD-LOOKUP] Sending confirmation card to {phone}: businessName={biz_name!r}")
+
+        session_data = {
+            "ownerPhone": phone,
+            "pushName": owner_name,
+            "currentStep": "recepte_confirm",
+            "language": lang,
+            "conversationHistory": [{"role": "user", "content": body}],
+            "businessData": None,
+            "pairingSessionId": None,
+            "businessId": None,
+            "lastMessageId": message_id,
+            "recepteLeadData": lead,
+            "registrationSource": "recepte.co",
+            "timestamps": {
+                "startedAt": now,
+                "lastActivityAt": now,
+            },
+        }
+        db.upsert_onboarding_session(phone, session_data)
+
+        # Build a summary card from the lead data
+        greeting = f"Hi{' ' + owner_name if owner_name else ''}! 👋"
+        display_biz = f"🏢 *{biz_name}*" if biz_name else "🏢 *(Business name not available)*"
+        summary_lines = [
+            greeting,
+            "I see you want to activate Recepte for your business.\n",
+            "Here's what I found from your registration:\n",
+            display_biz,
+        ]
+        if biz_type:
+            summary_lines.append(f"📋 Type: {biz_type.title()}")
+        display_address = lead.get("address") or city
+        if display_address:
+            summary_lines.append(f"📍 {display_address}")
+        if lead.get("hours"):
+            summary_lines.append(f"🕐 Hours: {lead['hours']}")
+        lead_services = lead.get("services") or []
+        if lead_services and isinstance(lead_services, list):
+            summary_lines.append("\n*Services:*")
+            for svc in lead_services[:5]:
+                if isinstance(svc, dict):
+                    svc_line = f"  • {svc.get('name', '')}"
+                    if svc.get("duration"):
+                        svc_line += f" — {svc['duration']}"
+                    if svc.get("price"):
+                        svc_line += f" — {svc['price']}"
+                else:
+                    svc_line = f"  • {svc}"
+                summary_lines.append(svc_line)
+        summary_lines += [
+            "",
+            "Is this the right business? "
+            "Reply *yes* to confirm, *edit* to change details, or *no* to start fresh.",
+        ]
+        await self._send(phone, "\n".join(summary_lines))
 
     async def _start_recepte_onboarding(
         self,
@@ -1435,56 +1641,13 @@ class OnboardingService:
             await self._start_new(phone, body, push_name, message_id)
             return
 
-        biz_name = lead.get("businessName") or business_name_hint
-        owner_name = lead.get("name") or push_name or ""
-        biz_type = lead.get("type", "")
-        city = lead.get("city", "")
-        url = lead.get("url", "")
-        lang = self.ai.detect_language(phone)
-        now = datetime.utcnow().isoformat()
+        # Merge business name hint from the activation message if lead lacks one
+        if not lead.get("businessName") and business_name_hint:
+            lead = dict(lead)
+            lead["businessName"] = business_name_hint
 
-        logger.info("[RECEPTE] Lead found for %s: %s", phone, biz_name)
-        logger.info("[RECEPTE] Lead found for %s: businessName=%r", phone, biz_name)
-
-        session_data = {
-            "ownerPhone": phone,
-            "pushName": owner_name,
-            "currentStep": "recepte_confirm",
-            "language": lang,
-            "conversationHistory": [{"role": "user", "content": body}],
-            "businessData": None,
-            "pairingSessionId": None,
-            "businessId": None,
-            "lastMessageId": message_id,
-            "recepteLeadData": lead,
-            "registrationSource": "recepte.co",
-            "timestamps": {
-                "startedAt": now,
-                "lastActivityAt": now,
-            },
-        }
-        db.upsert_onboarding_session(phone, session_data)
-
-        # Build a summary message from the lead data
-        greeting = f"Hi{' ' + owner_name if owner_name else ''}! 👋"
-        summary_lines = [
-            greeting,
-            f"I see you want to activate Recepte for your business.\n",
-            "Here's what I found from your registration:\n",
-            f"🏢 *{biz_name}*",
-        ]
-        if biz_type:
-            summary_lines.append(f"📋 Type: {biz_type.title()}")
-        if city:
-            summary_lines.append(f"📍 {city}")
-        if url:
-            summary_lines.append(f"🌐 {url}")
-        summary_lines += [
-            "",
-            "Is this the right business? "
-            "Reply *yes* to continue, *edit* to change details, or *no* to start fresh.",
-        ]
-        await self._send(phone, "\n".join(summary_lines))
+        logger.info("[RECEPTE] Lead found for %s: businessName=%r", phone, lead.get("businessName"))
+        await self._show_lead_confirmation(phone, body, push_name, message_id, lead)
 
     async def _handle_recepte_confirm(
         self,
@@ -1567,37 +1730,196 @@ class OnboardingService:
             return
 
         # ── yes — confirmed ──────────────────────────────────────────────────
-        url = lead.get("url", "")
+        # Owner confirmed the minimal card — continue to deterministic
+        # referral-offer/referral-confirm steps (no LLM dependency here).
+        history.append({"role": "user", "content": body})
+        db.upsert_onboarding_session(phone, {"conversationHistory": history})
+        business_json = _lead_to_business_json(lead)
+        await self._start_referral_step(session, phone, push, business_json)
 
-        if url:
-            # Website URL known → extract services/hours/etc. automatically
-            await self._send(phone, "Perfect! Let me pull more details from your website... 🔍")
-            # Refresh session before passing to website handler
-            refreshed = db.get_onboarding_session(phone) or session
-            db.upsert_onboarding_session(phone, {"currentStep": "conversing"})
-            refreshed["currentStep"] = "conversing"
-            await self._handle_website_url(refreshed, phone, url, push)
+    # ── referral step ─────────────────────────────────────────────────────
+
+    async def _start_referral_step(
+        self,
+        session: dict,
+        phone: str,
+        push_name: str,
+        pre_extracted: dict,
+    ) -> None:
+        """Start deterministic referral question flow (no LLM dependency).
+
+        Called after the owner confirms their basic business details (name, type,
+        address) via either website/Maps confirmation or recepte lead confirmation.
+        """
+        history = session.get("conversationHistory", [])
+
+        db.upsert_onboarding_session(phone, {
+            "currentStep": "referral_offer",
+            "websiteExtractedData": pre_extracted,
+            "referralFeatureEnabled": None,
+            "referrerDiscountPercent": 25,
+            "refereeDiscountPercent": 10,
+        })
+        session["currentStep"] = "referral_offer"
+        session["websiteExtractedData"] = pre_extracted
+        session["referralFeatureEnabled"] = None
+        session["referrerDiscountPercent"] = 25
+        session["refereeDiscountPercent"] = 10
+
+        msg = (
+            "Great! Now, would you like to offer a referral discount to grow your customer base? "
+            "A customer who refers a friend gets a discount on their next visit, and the "
+            "referred friend gets a discount on their first visit.\n\n"
+            "Would you like to enable this? "
+            "(yes/no — default is 25% off for the referrer and 10% off for the new customer, "
+            "but you can choose any percentages)"
+        )
+        history.append({"role": "assistant", "content": msg})
+        db.upsert_onboarding_session(phone, {"conversationHistory": history})
+        await self._send(phone, msg)
+
+    async def _handle_referral_offer(
+        self,
+        session: dict,
+        phone: str,
+        body: str,
+        push_name: str,
+        message_id: str,
+    ) -> None:
+        """Handle owner response to referral enable question."""
+        import re as _re
+
+        normalized = body.strip().lower()
+        yes_words = {
+            "yes", "sim", "sí", "si", "ok", "enable", "enabled", "y", "yeah",
+            "yep", "sure", "correct", "right", "✅",
+        }
+        no_words = {
+            "no", "não", "nao", "disable", "disabled", "n", "nope", "nah",
+        }
+        is_yes = any(w in normalized for w in yes_words)
+        is_no = any(w in normalized for w in no_words)
+
+        if not is_yes and not is_no:
+            await self._send(
+                phone,
+                "Please reply *yes* to enable referral discounts or *no* to keep them disabled."
+            )
             return
 
-        # No URL — switch to AI conversation, skipping already-known fields
-        # and explicitly asking for any mandatory missing fields
-        db.upsert_onboarding_session(phone, {"currentStep": "conversing"})
-        history.append({"role": "user", "content": body})
-        extra_context = self._build_recepte_lead_context(lead)
-        extra_context += (
-            "\n\nThe owner has just confirmed that the pre-filled details are correct. "
-            "Now collect ONLY what is still missing: services (with prices and durations), "
-            "operating hours and working days, maximum number of clients you can serve at "
-            "the same time per hour (slotsPerHour), staff members (if applicable), "
-            "business phone (if different from WhatsApp), and languages spoken. "
-            "Ask 1-2 related questions at a time to keep it fast and conversational. "
-            "For example, combine 'What are your working days and hours?' into one question."
+        referral_enabled = bool(is_yes and not is_no)
+        referrer_pct = 25
+        referee_pct = 10
+
+        # Optional parsing: if owner writes custom percentages in the same message,
+        # accept first two values as referrer/referee (clamped to 1..90).
+        if referral_enabled:
+            nums = [int(n) for n in _re.findall(r"\b(\d{1,2})\b", normalized)]
+            if len(nums) >= 2:
+                referrer_pct = min(max(nums[0], 1), 90)
+                referee_pct = min(max(nums[1], 1), 90)
+
+        extracted = dict(session.get("websiteExtractedData") or {})
+        extracted["referralFeatureEnabled"] = referral_enabled
+        extracted["referrerDiscountPercent"] = referrer_pct
+        extracted["refereeDiscountPercent"] = referee_pct
+
+        biz_name = extracted.get("name") or "your business"
+        biz_type = extracted.get("businessType") or "other"
+        biz_addr = extracted.get("address") or ""
+        referral_line = (
+            f"Enabled — {referrer_pct}% off for referrer, {referee_pct}% off for new customer"
+            if referral_enabled
+            else "Disabled"
         )
-        ai_reply = await self._get_ai_response(history, push, lang, extra_context=extra_context)
-        _, clean_reply = self._check_confirmed(ai_reply)
-        history.append({"role": "assistant", "content": clean_reply})
-        db.upsert_onboarding_session(phone, {"conversationHistory": history})
-        await self._send(phone, clean_reply)
+
+        summary = (
+            f"Here's what I've got for your business:\n\n"
+            f"*{biz_name}*\n"
+            f"Type: {str(biz_type).replace('_', ' ').title()}\n"
+            f"📍 {biz_addr}\n"
+            f"Referral program: {referral_line}\n\n"
+            "Does this look correct? Reply *yes* to confirm or just tell me what to change."
+        )
+
+        history = session.get("conversationHistory", [])
+        history.append({"role": "user", "content": body})
+        history.append({"role": "assistant", "content": summary})
+
+        db.upsert_onboarding_session(phone, {
+            "currentStep": "referral_confirm",
+            "websiteExtractedData": extracted,
+            "referralFeatureEnabled": referral_enabled,
+            "referrerDiscountPercent": referrer_pct,
+            "refereeDiscountPercent": referee_pct,
+            "conversationHistory": history,
+            "lastMessageId": message_id,
+        })
+        session["currentStep"] = "referral_confirm"
+        session["websiteExtractedData"] = extracted
+
+        await self._send(phone, summary)
+
+    async def _handle_referral_confirm(
+        self,
+        session: dict,
+        phone: str,
+        body: str,
+        push_name: str,
+        message_id: str,
+    ) -> None:
+        """Handle final yes/no confirmation after referral summary."""
+        normalized = body.strip().lower()
+        yes_words = {
+            "yes", "sim", "sí", "si", "ok", "correct", "right", "confirm",
+            "save", "perfect", "great", "good", "sure", "yep", "yeah", "✅",
+        }
+        no_words = {
+            "no", "não", "nao", "wrong", "incorrect", "not right", "change",
+            "edit", "different", "nope", "nah",
+        }
+        is_yes = any(w in normalized for w in yes_words)
+        is_no = any(w in normalized for w in no_words)
+
+        history = session.get("conversationHistory", [])
+        history.append({"role": "user", "content": body})
+
+        if is_yes and not is_no:
+            db.upsert_onboarding_session(phone, {
+                "currentStep": "pairing",
+                "conversationHistory": history,
+                "lastMessageId": message_id,
+            })
+            session["currentStep"] = "pairing"
+            pre_extracted = session.get("websiteExtractedData") or None
+            await self._finalize_business(session, phone, history, pre_extracted=pre_extracted)
+            return
+
+        if is_no:
+            # Move back to conversational edit mode for explicit corrections.
+            db.upsert_onboarding_session(phone, {
+                "currentStep": "conversing",
+                "conversationHistory": history,
+                "lastMessageId": message_id,
+            })
+            session["currentStep"] = "conversing"
+            push = push_name or session.get("pushName", "")
+            lang = session.get("language", "en")
+            extra_context = (
+                "The owner rejected the final summary after the referral step. "
+                "Ask what to change, apply edits, then provide the updated summary and ask for confirmation again."
+            )
+            ai_reply = await self._get_ai_response(history, push, lang, extra_context=extra_context)
+            _, clean_reply = self._check_confirmed(ai_reply)
+            history.append({"role": "assistant", "content": clean_reply})
+            db.upsert_onboarding_session(phone, {"conversationHistory": history})
+            await self._send(phone, clean_reply)
+            return
+
+        await self._send(
+            phone,
+            "Please reply *yes* to confirm, or tell me what to change."
+        )
 
     # ── conversation handler ──────────────────────────────────────────────
 
@@ -2143,11 +2465,38 @@ class OnboardingService:
                     final_url = str(_redir.url)
                     resolved_maps_url = final_url
 
-                # Extract place name from canonical path
+                # Debug: log what URL was resolved to
+                logger.info("[ONBOARDING-DEBUG][MAPS] original_url=%s", url)
+                logger.info("[ONBOARDING-DEBUG][MAPS] final_url=%s", final_url)
+                print(f"[DEBUG-MAPS] original_url={url}")
+                print(f"[DEBUG-MAPS] final_url={final_url}")
+
+                # Extract place name from canonical path.
+                # Handles two common redirect targets:
+                #   /maps/place/BusinessName/@lat,lng/...  (standard business link)
+                #   /maps/dir/lat,lng/BusinessName/data=... (directions link)
                 _pm = re.search(r"/maps/place/([^/@?]+)", final_url)
                 place_name: str | None = (
                     _urlparse.unquote_plus(_pm.group(1)).strip() if _pm else None
                 )
+
+                # Fallback: directions URL — second path segment after /maps/dir/ is the destination name
+                if not place_name:
+                    _dm = re.search(r"/maps/dir/[^/]+/([^/@?]+)", final_url)
+                    if _dm:
+                        _candidate = _urlparse.unquote_plus(_dm.group(1)).strip()
+                        # Skip bare coordinates (lat,lng) and the literal word "data"
+                        if (
+                            _candidate
+                            and not re.match(r"^-?\d+\.?\d*,-?\d+\.?\d*$", _candidate)
+                            and _candidate.lower() not in ("data", "")
+                        ):
+                            place_name = _candidate
+                            logger.info("[ONBOARDING-DEBUG][MAPS] extracted from /maps/dir/ path: %s", place_name)
+                            print(f"[DEBUG-MAPS] extracted from /maps/dir/ path: {place_name}")
+
+                logger.info("[ONBOARDING-DEBUG][MAPS] place_name=%s", place_name)
+                print(f"[DEBUG-MAPS] place_name={place_name}")
 
                 if not place_name:
                     raise ValueError("No place name found in redirected Maps URL")
@@ -2171,28 +2520,11 @@ class OnboardingService:
                 lines.append(f"*{extracted['name']}*")
                 if extracted.get("businessType"):
                     lines.append(f"*{_t('label_type', lang)}:* {extracted['businessType'].replace('_', ' ').title()}")
-                if extracted.get("description"):
-                    lines.append(extracted["description"])
                 if extracted.get("address"):
                     lines.append(f"📍 {extracted['address']}")
-                if extracted.get("phone"):
-                    lines.append(f"📞 {extracted['phone']}")
-                services = extracted.get("services") or []
-                if services:
-                    lines.append(f"\n*{_t('label_services', lang)}:*")
-                    for svc in services[:8]:
-                        svc_line = f"  • {svc.get('name', '')}"
-                        if svc.get("duration"):
-                            svc_line += f" — {svc['duration']}"
-                        if svc.get("price"):
-                            svc_line += f" — {svc['price']}"
-                        lines.append(svc_line)
-                if extracted.get("hours"):
-                    lines.append(f"\n*{_t('label_hours', lang)}:* {extracted['hours']}")
-                if extracted.get("openingDays"):
-                    days = extracted.get("openingDays") or []
-                    if isinstance(days, (list, tuple)):
-                        lines.append(f"*{_t('label_open_days', lang)}:* {', '.join(days)}")
+                # Silently preserve services/hours in session for later — don't show now
+                if extracted.get("services") or extracted.get("hours"):
+                    lines.append("\n_I also found details about your services and hours — saved automatically if you confirm._")
 
                 summary = "\n".join(lines)
                 summary += f"\n\n{_t('confirm_prompt', lang)}"
@@ -2210,7 +2542,8 @@ class OnboardingService:
 
                 # ── Apify fallback for unsupported Maps URL formats ────────────
                 if settings.APIFY_API_KEY:
-                    logger.info("[ONBOARDING] Trying Apify Google Places fallback for %s", url)
+                    logger.info("[ONBOARDING] Trying Apify Google Places fallback — passing url=%s", resolved_maps_url)
+                    print(f"[DEBUG-MAPS-APIFY-FALLBACK] url_passed_to_apify={resolved_maps_url}")
                     try:
                         from app.integrations.apify_client import ApifyClient
                         apify_results = await asyncio.wait_for(
@@ -2232,18 +2565,10 @@ class OnboardingService:
                             lines.append(f"*{extracted['name']}*")
                             if extracted.get("businessType"):
                                 lines.append(f"*{_t('label_type', lang)}:* {extracted['businessType'].replace('_', ' ').title()}")
-                            if extracted.get("description"):
-                                lines.append(extracted["description"])
                             if extracted.get("address"):
                                 lines.append(f"📍 {extracted['address']}")
-                            if extracted.get("phone"):
-                                lines.append(f"📞 {extracted['phone']}")
-                            if extracted.get("hours"):
-                                lines.append(f"\n*{_t('label_hours', lang)}:* {extracted['hours']}")
-                            if extracted.get("openingDays"):
-                                days = extracted.get("openingDays") or []
-                                if isinstance(days, (list, tuple)) and days:
-                                    lines.append(f"*{_t('label_open_days', lang)}:* {', '.join(days)}")
+                            if extracted.get("services") or extracted.get("hours"):
+                                lines.append("\n_I also found details about your services and hours — saved automatically if you confirm._")
 
                             summary = "\n".join(lines)
                             summary += f"\n\n{_t('confirm_prompt', lang)}"
@@ -2386,43 +2711,15 @@ class OnboardingService:
             "websiteExtractedData": extracted,
         })
 
-        # Format summary for the owner to review
+        # Format minimal summary for the owner to review (name + type + address only)
         lines = [_t("website_found_header", lang)]
         lines.append(f"*{extracted.get('name', '')}*")
         if extracted.get("businessType"):
             lines.append(f"*{_t('label_type', lang)}:* {extracted['businessType']}")
-        if extracted.get("description"):
-            lines.append(extracted["description"])
-        lines.append("")
-        services = extracted.get("services") or []
-        if services:
-            lines.append(f"*{_t('label_services', lang)}:*")
-            for svc in services[:8]:
-                svc_line = f"  • {svc.get('name', '')}"
-                if svc.get("duration"):
-                    svc_line += f" — {svc['duration']}"
-                if svc.get("price"):
-                    svc_line += f" — {svc['price']}"
-                lines.append(svc_line)
-        if extracted.get("hours"):
-            lines.append(f"\n*{_t('label_hours', lang)}:* {extracted['hours']}")
-        if extracted.get("openingDays"):
-            try:
-                days = extracted.get("openingDays") or []
-                if isinstance(days, (list, tuple)):
-                    lines.append(f"*{_t('label_open_days', lang)}:* {', '.join(days)}")
-                else:
-                    lines.append(f"*{_t('label_open_days', lang)}:* {str(days)}")
-            except Exception:
-                pass
         if extracted.get("address"):
-            lines.append(f"*{_t('label_address', lang)}:* {extracted['address']}")
-        if extracted.get("phone"):
-            lines.append(f"*{_t('label_phone', lang)}:* {extracted['phone']}")
-        if extracted.get("staff"):
-            lines.append(f"*{_t('label_staff', lang)}:* {', '.join(extracted['staff'])}")
-        if extracted.get("languages"):
-            lines.append(f"*{_t('label_languages', lang)}:* {', '.join(extracted['languages'])}")
+            lines.append(f"📍 {extracted['address']}")
+        if extracted.get("services") or extracted.get("hours"):
+            lines.append("\n_I also found details about your services and hours — saved automatically if you confirm._")
 
         summary = "\n".join(lines)
         summary += f"\n\n{_t('confirm_prompt', lang)}"
@@ -2582,51 +2879,10 @@ class OnboardingService:
                 db.upsert_onboarding_session(phone, {"currentStep": "conversing"})
                 return
 
-            # Check for mandatory fields missing from website extraction
-            missing = _missing_fields(extracted)
-            if missing:
-                # Switch to conversing; AI will ask only for the missing fields
-                db.upsert_onboarding_session(phone, {"currentStep": "conversing"})
-                history = session.get("conversationHistory", [])
-                # The history already contains the Places selection and bot's confirmation
-                # card (added in _handle_places_pick / _run_places_search).
-                # Just append the owner's "Yes" confirmation.
-                history.append({"role": "user", "content": body})
-                push = push_name or session.get("pushName", "")
-                lang = session.get("language", "en")
-                confirmed_name = extracted.get("name") or ""
-                confirmed_type = extracted.get("businessType") or ""
-                confirmed_address = extracted.get("address") or ""
-                missing_ctx = (
-                    "IMPORTANT: The business owner has already selected and confirmed their business from a Google Places list. "
-                    "The following details are CONFIRMED — do NOT ask about them again under any circumstances:\n"
-                    f"  - Business name: '{confirmed_name}'\n"
-                    f"  - Business type: '{confirmed_type}'\n"
-                    + (f"  - Address: '{confirmed_address}'\n" if confirmed_address else "")
-                    + "Do NOT ask for a website or Google Maps link again.\n"
-                    "Now collect ONLY the following missing details:\n"
-                    + "\n".join(f"  - {m}" for m in missing)
-                    + "\n\nAsk 1-2 related questions at a time to keep it fast and conversational. "
-                    "Once you have everything, show the FULL summary (including the confirmed name/type/address) "
-                    "and ask for their final confirmation."
-                )
-                ai_reply = await self._get_ai_response(history, push, lang, extra_context=missing_ctx)
-                confirmed, clean_reply = self._check_confirmed(ai_reply)
-                history.append({"role": "assistant", "content": clean_reply})
-                db.upsert_onboarding_session(phone, {
-                    "conversationHistory": history,
-                    "lastMessageId": message_id,
-                })
-                await self._send(phone, clean_reply)
-                if confirmed:
-                    # Lock step before finalization to prevent re-entry
-                    db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
-                    await self._finalize_business(session, phone, history, pre_extracted=extracted)
-                return
-
-            # Lock step before finalization to prevent re-entry from concurrent messages
-            db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
-            await self._finalize_from_website(session, phone, extracted)
+            # Owner confirmed the minimal card — continue to deterministic
+            # referral-offer/referral-confirm steps before finalizing.
+            push = push_name or session.get("pushName", "")
+            await self._start_referral_step(session, phone, push, extracted)
             return
 
         if is_no:
@@ -2802,7 +3058,8 @@ class OnboardingService:
             "businessPhone": business_json.get("phone", ""),
             "staff": business_json.get("staff", []),
             "specialties": business_json.get("specialties", []),
-            "slotsPerHour": int(business_json.get("slotsPerHour") or 2),
+            "slotsPerHour": int(business_json.get("slotsPerHour") or 0)
+                or _default_slots_per_hour(business_json.get("businessType", "other")),
             "referralFeatureEnabled": bool(business_json.get("referralFeatureEnabled", False)),
             "referrerDiscountPercent": int(business_json.get("referrerDiscountPercent") or 25),
             "refereeDiscountPercent": int(business_json.get("refereeDiscountPercent") or 10),

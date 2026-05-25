@@ -135,6 +135,19 @@ class ApifyClient:
                 place_slug = parts[1].split("/", 1)[0].split("@", 1)[0].strip()
                 if place_slug:
                     return unquote_plus(place_slug)
+
+            # Fallback: directions URL /maps/dir/[src]/[PlaceName]/data=...
+            import re as _re
+            _dm = _re.search(r"/maps/dir/[^/]+/([^/@?]+)", parsed.path)
+            if _dm:
+                candidate = unquote_plus(_dm.group(1)).strip()
+                # Skip bare coordinates and the literal word "data"
+                if (
+                    candidate
+                    and not _re.match(r"^-?\d+\.?\d*,-?\d+\.?\d*$", candidate)
+                    and candidate.lower() not in ("data", "")
+                ):
+                    return candidate
         except Exception:
             pass
         return ""
@@ -239,6 +252,13 @@ class ApifyClient:
 
         resolved_url = await self._resolve_redirect_url(url)
         search_query = self._extract_search_query_from_url(resolved_url) or self._extract_search_query_from_url(url)
+
+        logger.info("[Apify-DEBUG][Places] original_url=%s", url)
+        logger.info("[Apify-DEBUG][Places] resolved_url=%s", resolved_url)
+        logger.info("[Apify-DEBUG][Places] search_query=%s", search_query)
+        print(f"[DEBUG-APIFY-PLACES] original_url={url}")
+        print(f"[DEBUG-APIFY-PLACES] resolved_url={resolved_url}")
+        print(f"[DEBUG-APIFY-PLACES] search_query={search_query}")
 
         run_inputs: list[dict[str, Any]] = [
             {
