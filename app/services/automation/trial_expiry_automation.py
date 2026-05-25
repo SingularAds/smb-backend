@@ -74,12 +74,16 @@ def _is_stopped(business: dict) -> bool:
     return False
 
 
-def _build_reminder_message(business: dict, days_after_expiry: int) -> str:
+def _build_reminder_message(
+    business: dict,
+    days_after_expiry: int,
+    starter_url: str | None = None,
+    pro_url: str | None = None,
+) -> str:
     """Build a WhatsApp/SMS reminder message for the owner."""
     biz_name = business.get("name") or "your business"
     starter_price = business.get("starterPriceEur") or 29
     pro_price = business.get("proPriceEur") or 69
-    tier = business.get("billingTier") or "T2"
 
     if days_after_expiry == 0:
         header = "⏰ *Your 7-day free trial has ended.*"
@@ -90,16 +94,32 @@ def _build_reminder_message(business: dict, days_after_expiry: int) -> str:
     else:
         header = "🔴 *Your AI receptionist has been offline for a week.*"
 
-    msg = (
-        f"{header}\n\n"
-        f"*{biz_name}* — your AI receptionist is currently paused because "
-        f"your free trial has expired and no plan has been selected yet.\n\n"
-        f"*Choose a plan to reactivate:*\n"
-        f"  • *Starter* — €{starter_price}/month — AI receptionist + bookings\n"
-        f"  • *PRO* — €{pro_price}/month — Everything + full marketing engine\n\n"
-        f"To subscribe, visit: {settings.BASE_URL.rstrip('/')}/billing\n\n"
-        f"Reply *STOP* to stop receiving these reminders."
-    )
+    if starter_url and pro_url:
+        msg = (
+            f"{header}\n\n"
+            f"*{biz_name}* — your AI receptionist is currently paused because "
+            f"your free trial has expired and no plan has been selected yet.\n\n"
+            f"*Choose a plan to reactivate:*\n"
+            f"  • *Starter* — €{starter_price}/month — AI receptionist + bookings\n"
+            f"    👉 {starter_url}\n\n"
+            f"  • *PRO* — €{pro_price}/month — Everything + full marketing engine\n"
+            f"    👉 {pro_url}\n\n"
+            f"💳 Your service resumes automatically once payment is confirmed.\n\n"
+            f"Reply *STOP* to stop receiving these reminders."
+        )
+    else:
+        # Fallback when Stripe checkout URL generation fails
+        pricing_url = f"{settings.BASE_URL.rstrip('/')}/pricing"
+        msg = (
+            f"{header}\n\n"
+            f"*{biz_name}* — your AI receptionist is currently paused because "
+            f"your free trial has expired and no plan has been selected yet.\n\n"
+            f"*Choose a plan to reactivate:*\n"
+            f"  • *Starter* — €{starter_price}/month — AI receptionist + bookings\n"
+            f"  • *PRO* — €{pro_price}/month — Everything + full marketing engine\n\n"
+            f"To subscribe, visit: {pricing_url}\n\n"
+            f"Reply *STOP* to stop receiving these reminders."
+        )
     return msg
 
 
@@ -113,7 +133,15 @@ async def _send_owner_reminder(business: dict, days_after_expiry: int) -> bool:
         )
         return False
 
-    msg = _build_reminder_message(business, days_after_expiry)
+    # Build permanent /subscribe deep-links.  Each click generates a fresh Stripe
+    # checkout session on demand, so the links never expire (unlike pre-generated
+    # checkout URLs that Stripe invalidates after ~24 hours).
+    biz_id = business.get("id") or ""
+    subscribe_base = f"{settings.BASE_URL.rstrip('/')}/api/v1/billing/subscribe"
+    starter_url = f"{subscribe_base}?businessId={biz_id}&plan=starter"
+    pro_url = f"{subscribe_base}?businessId={biz_id}&plan=pro"
+
+    msg = _build_reminder_message(business, days_after_expiry, starter_url=starter_url, pro_url=pro_url)
     sent = False
 
     # WhatsApp: use the global onboarding device (Recepte service number → owner)
