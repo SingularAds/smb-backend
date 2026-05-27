@@ -479,6 +479,114 @@ def _missing_fields(data: dict) -> list[str]:
     return missing
 
 
+# ── Deterministic schedule parser ────────────────────────────────────────────
+
+_DAYS_FULL = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+_DAY_INDEX: dict[str, int] = {
+    "mon": 0, "monday": 0,
+    "tue": 1, "tues": 1, "tuesday": 1,
+    "wed": 2, "wednesday": 2,
+    "thu": 3, "thur": 3, "thurs": 3, "thursday": 3,
+    "fri": 4, "friday": 4,
+    "sat": 5, "saturday": 5,
+    "sun": 6, "sunday": 6,
+}
+
+_DAY_TOKEN_PAT = (
+    r"(?:mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?"
+    r"|thu(?:r(?:s(?:day)?)?)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)"
+)
+
+
+def _resolve_day(token: str) -> int | None:
+    return _DAY_INDEX.get(token.strip().lower().rstrip("."))
+
+
+def _parse_opening_days(text: str) -> list[str] | None:
+    """Deterministically extract opening days from free-form text.
+
+    Handles everyday/daily, weekdays, weekends, day ranges (Mon–Fri),
+    and comma-separated day lists. Returns None when no day names are found.
+    """
+    tl = text.strip().lower()
+    if re.search(r"\b(every\s*day|everyday|daily|7\s*days?)\b", tl):
+        return _DAYS_FULL[:]
+    if re.search(r"\bweekdays?\b", tl):
+        return _DAYS_FULL[:5]
+    if re.search(r"\bweekends?\b", tl):
+        return _DAYS_FULL[5:]
+    # Range: "Monday to Friday" / "Mon-Sat" / "Mon–Sat" / "Mon. to Sat."
+    range_pat = re.compile(
+        r"(" + _DAY_TOKEN_PAT + r")\.?\s*(?:to|[-\u2013\u2014])\s*(" + _DAY_TOKEN_PAT + r")\.?",
+        re.IGNORECASE,
+    )
+    m = range_pat.search(text)
+    if m:
+        s = _resolve_day(m.group(1))
+        e = _resolve_day(m.group(2))
+        if s is not None and e is not None:
+            if s <= e:
+                return [_DAYS_FULL[i] for i in range(s, e + 1)]
+            else:  # wrap-around e.g. Sat–Mon
+                return [_DAYS_FULL[i] for i in list(range(s, 7)) + list(range(0, e + 1))]
+    # Comma-separated or single day names
+    list_pat = re.compile(r"\b(" + _DAY_TOKEN_PAT + r")\b", re.IGNORECASE)
+    hits = list_pat.findall(text)
+    if hits:
+        seen: set[int] = set()
+        result: list[str] = []
+        for h in hits:
+            idx = _resolve_day(h)
+            if idx is not None and idx not in seen:
+                seen.add(idx)
+                result.append(_DAYS_FULL[idx])
+        if result:
+            return sorted(result, key=lambda d: _DAYS_FULL.index(d))
+    return None
+
+
+def _parse_working_hours(text: str) -> str | None:
+    """Deterministically extract working hours from free-form text.
+
+    Returns "Open 24 hours" for 24/7 inputs, or a normalised
+    "HH:MMam–HH:MMpm" string for time ranges. Requires am/pm suffix,
+    colon format, or hour ≥ 13 to avoid false positives on bare digits.
+    """
+    tl = text.strip().lower()
+    if re.search(r"\b24\s*(?:hours?|hrs?|/\s*7)?\b", tl) or re.search(r"\ball\s*day\b", tl):
+        return "Open 24 hours"
+    _T = r"(\d{1,2}(?:[:.:]\d{2})?)\s*([ap]\.?m\.?)?"
+    range_re = re.compile(
+        _T + r"\s*(?:to|[-\u2013\u2014])\s*" + _T,
+        re.IGNORECASE,
+    )
+    m = range_re.search(text)
+    if m:
+        t1 = m.group(1)
+        ap1 = (m.group(2) or "").replace(".", "").lower()
+        t2 = m.group(3)
+        ap2 = (m.group(4) or "").replace(".", "").lower()
+        has_colon = ":" in t1 or ":" in t2
+        has_ampm = bool(ap1) or bool(ap2)
+        h1 = int(t1.split(":")[0].split(".")[0])
+        h2 = int(t2.split(":")[0].split(".")[0])
+        if has_colon or has_ampm or h1 >= 13 or h2 >= 13:
+            return f"{t1}{ap1}\u2013{t2}{ap2}"
+    return None
+
+
+def _parse_schedule(text: str) -> dict:
+    """Combine day and hour parsing into one call.
+
+    Returns {"openingDays": list | None, "hours": str | None}.
+    """
+    return {
+        "openingDays": _parse_opening_days(text),
+        "hours": _parse_working_hours(text),
+    }
+
+
 def _lead_to_business_json(lead: dict) -> dict:
     """Convert a recepte.co lead dict to the business JSON format used by _finalize_business.
 
@@ -2020,17 +2128,41 @@ class OnboardingService:
             history.append({"role": "user", "content": body})
 
             _pre = session.get("websiteExtractedData") or {}
-            _conv = await self._extract_business_data(history) or {}
             _merged: dict = dict(_pre)
-            for _k, _v in _conv.items():
-                if _v:
-                    _merged[_k] = _v
+
+            # ── Step 1: Deterministic parser — zero-latency, no LLM call ──────────
+            _parsed = _parse_schedule(body)
+            _det_found_days = bool(_parsed.get("openingDays"))
+            _det_found_hours = bool(_parsed.get("hours"))
+            if _det_found_days and not _merged.get("openingDays"):
+                _merged["openingDays"] = _parsed["openingDays"]
+            if _det_found_hours and not _merged.get("hours"):
+                _merged["hours"] = _parsed["hours"]
 
             # Only hours and days are blocking here; services are collected
             # naturally later by the AI in the referral/conversing flow.
             has_hours = bool(_merged.get("hours"))
             _od = _merged.get("openingDays") or []
             has_days = isinstance(_od, list) and any(str(d).strip() for d in _od)
+
+            # ── Step 2: LLM fallback — only when deterministic found nothing at all ─
+            if not (has_hours and has_days) and not _det_found_days and not _det_found_hours:
+                logger.debug("[ONBOARDING-PARSER] Deterministic parser found nothing — trying LLM fallback")
+                try:
+                    _conv = await self._extract_business_data(history) or {}
+                    if not has_hours and _conv.get("hours"):
+                        _merged["hours"] = _conv["hours"]
+                    if not has_days:
+                        _od_llm = _conv.get("openingDays") or []
+                        if isinstance(_od_llm, list) and any(str(d).strip() for d in _od_llm):
+                            _merged["openingDays"] = _od_llm
+                except Exception as _exc:
+                    logger.warning("[ONBOARDING-PARSER] LLM fallback failed: %s", _exc)
+
+                # Recompute after fallback attempt
+                has_hours = bool(_merged.get("hours"))
+                _od = _merged.get("openingDays") or []
+                has_days = isinstance(_od, list) and any(str(d).strip() for d in _od)
 
             db.upsert_onboarding_session(phone, {
                 "conversationHistory": history,
@@ -2048,13 +2180,13 @@ class OnboardingService:
             # Still missing one or both — send a targeted follow-up
             if has_days and not has_hours:
                 clean_reply = (
-                    "Thanks! Got your opening days.\n\n"
-                    "⏰ What are your working hours? (e.g. 9am–9pm)"
+                    "Got it! 👍 What are your working hours?\n\n"
+                    "Example: 9am–9pm"
                 )
             elif has_hours and not has_days:
                 clean_reply = (
-                    "Thanks! Got your working hours.\n\n"
-                    "📅 Which days are you open? (e.g. Monday to Saturday)"
+                    "Got it! 👍 Which days are you open?\n\n"
+                    "Example: Monday to Saturday"
                 )
             else:
                 clean_reply = (
