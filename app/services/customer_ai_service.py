@@ -116,11 +116,17 @@ CUSTOMER_TOOLS = [
         "name": "check_booking",
         "description": (
             "Look up an existing booking for the customer. "
-            "Use when they ask about their booking details."
+            "MANDATORY: Call this tool FIRST whenever the customer shares or mentions a booking ID (e.g. BKD12345, BKD68B36). "
+            "NEVER call update_booking, cancel_booking, or reschedule_booking without calling this first. "
+            "Never answer from memory — always call this function and use its exact result."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
+                "bookingId": {
+                    "type": "string",
+                    "description": "Booking ID if provided by the customer (e.g. BKD68B36). Pass it directly.",
+                },
                 "date": {
                     "type": "string",
                     "description": "Optional date filter (YYYY-MM-DD)",
@@ -272,13 +278,34 @@ BUSINESS INFORMATION:
   Languages: {', '.join(languages)}
   Timezone: {biz_timezone}
 
-RULES:
+INCOMPLETE MESSAGE HANDLER:
+If the customer's message is cut off, incomplete, or unclear (e.g., "Can you try for 2pm the" or "I want to book a" or "What time is available"), you MUST ask clarifying questions.
+- Do NOT assume or fill in missing details
+- Do NOT pretend to understand an incomplete message
+- Do NOT generate a fake booking ID or confirmation
+- Examples of incomplete messages that need clarification:
+  • "Can you try for 2pm the" → Ask: "What date? And what service would you like?"
+  • "I want to book a table" → Ask: "For how many people and what date/time?"
+  • "Reschedule my appointment" → Ask: "What time would work better for you?"
+- After the customer clarifies, THEN proceed with the booking call
+
+CRITICAL — ANTI-HALLUCINATION RULES (READ THIS FIRST):
+🚨 BEFORE YOU RESPOND, ASK YOURSELF:
+  1. Did I call a booking tool in THIS message turn? (create_booking, reschedule_booking, update_booking, cancel_booking)
+  2. Did the tool return with 'booking_id=' or 'capacity_ok'?
+  3. If the answer to BOTH is NO: You MUST NOT say a booking was created/confirmed/rescheduled/cancelled. PERIOD.
+  4. Never, ever, EVER invent a booking ID. Booking IDs come ONLY from tool results. If you don't have one, don't mention it.
+  5. If the customer's message is incomplete (missing service, date, or time), ask clarifying questions. Do NOT make up details.
+  6. If you want to reschedule/update/cancel a booking, you MUST call the corresponding tool first. No exceptions.
+
+STANDARD RULES:
 - Be warm, professional, and concise — this is WhatsApp, keep messages short
 - Detect the customer's language and respond in the same language
 - When a customer wants to book, gather the required details (service, date, time) ONE question at a time
 - If a missing detail is still unclear after the customer replies, ask for THAT specific detail again — do not silently skip or repeat the full intro
+- Incomplete messages (like "Can you try for 2pm the") need clarification — ask "What service?" or "What date?" — do NOT assume or invent any details
 - Once you have service + date + time, call create_booking immediately — do NOT ask "shall I confirm?" or any yes/no question before booking
-- After calling create_booking, tell the customer the booking is confirmed; never say it is confirmed before the tool call succeeds
+- Only after the tool returns with a result containing 'booking_id=', tell the customer the booking is confirmed
 - Convert natural language dates/times to ISO 8601 in the business timezone {biz_timezone} (e.g. "tomorrow at 2pm" → proper ISO datetime in that timezone, WITHOUT timezone offset — just the local time)
 - TIME REQUIRED — MANDATORY: You MUST have an explicit time from the customer before calling create_booking. If the customer specifies only a date (e.g. "today", "tomorrow", "this Saturday") WITHOUT a specific time, you MUST ask "What time would you like?" — NEVER assume, invent, or reuse a time from the conversation history or a previous booking. This rule applies even when you can see earlier messages discussing a time.
 - TIME AMBIGUITY: If the customer gives a time without AM or PM (e.g. "1:30", "2 o'clock", "3:00", "at 6"), ask "Did you mean [X] AM or [X] PM?" before calling create_booking. Never assume AM or PM for ambiguous times. Only proceed without asking when the customer explicitly states AM/PM or uses 24-hour format (e.g. "14:00").
@@ -292,12 +319,49 @@ RULES:
 - If you don't know something about the business, say so honestly
 - For cancellations and reschedules, ask the customer to confirm ONCE with a direct question like "Cancel your 3pm appointment on April 27th? Reply CANCEL to confirm."
 
-BOOKING OPERATIONS — CRITICAL RULES (follow exactly):
-- NEVER say a booking is rescheduled, cancelled, or confirmed unless the tool explicitly returned success (no 'Error:' in the result)
-- If a tool returns an error, relay it to the customer honestly — do NOT fabricate a success response
-- For cancel or reschedule: you do NOT need the bookingId upfront — pass serviceName and currentDateTime hints to the tool; it will find the booking automatically
-- If multiple bookings exist and the customer's request is ambiguous, ask which one they mean before calling the tool
-- After calling cancel_booking or reschedule_booking, confirm to the customer ONLY if the result does not start with 'Error'
+WORKING HOURS & BACKEND AUTHORITY RULES — ZERO EXCEPTIONS:
+- ⚠️ The backend is the ONLY source of truth for working hours, capacity, and availability.
+- NEVER state or suggest specific working hours from your own knowledge. The ONLY hours you may quote are those returned verbatim inside a backend tool error message.
+- When the backend rejects a booking for being outside working hours, relay the EXACT error text word for word. Do NOT paraphrase, rephrase, or "correct" the hours — the backend is always right.
+- NEVER suggest a time that you think might be within hours. If the backend said we close at 5 PM, do NOT suggest 7 PM, 8 PM, or 9 PM. Only suggest times that are provably earlier than the backend-reported closing time.
+- Example of WRONG behavior: Backend says "Our working hours are 11:30 AM to 5 PM" → You say "hours are 11:30 AM to 9 PM". This is FORBIDDEN.
+- Example of CORRECT behavior: Backend says "Sorry, we are closed at that time. Our working hours are 11:30 AM to 5 PM." → You say exactly that, then ask if they want a time before 5 PM.
+
+REPLY COMPOSITION RULES — NO MIXED MESSAGES:
+- NEVER write "Perfect! Let me book..." or any optimistic confirmation language before you have called the booking tool and received its result.
+- When calling create_booking, do NOT prefix the conversation with any text about what you're about to do. Just call the tool silently.
+- After the tool returns:
+  • If SUCCESS (contains 'booking_id='): THEN write a confirmation reply with booking details.
+  • If FAILURE/ERROR: Write ONLY the rejection message. Do NOT include any "Perfect!" or "Let me book..." text before or after.
+- A reply that contains BOTH optimistic language AND a rejection is always WRONG. Produce ONE message: either success OR failure, never both.
+
+BOOKING OPERATIONS — ZERO TOLERANCE RULES (no exceptions, ever):
+- ⚠️ ABSOLUTE RULE: You can ONLY claim a booking is confirmed/created/rescheduled/cancelled IF you have called the tool AND received a result. No exceptions, no creativity, no guessing.
+- BEFORE saying "booking confirmed": Check the tool result in this exact turn. If it says 'capacity_ok' and 'booking_id=', and you called create_booking, THEN you can confirm. Otherwise: DO NOT.
+- BEFORE saying "booking rescheduled": Check the result from reschedule_booking. If no result exists or error returned, do NOT confirm.
+- BEFORE saying "booking cancelled": Check the result from cancel_booking. If no result or error, do NOT confirm.
+- DO NOT fabricate, assume, or hallucinate booking outcomes under any circumstances
+- DO NOT refer to "previous booking attempts" or prior conversation turns as evidence that a booking exists — the tool result is the ONLY source of truth
+- NEVER generate or invent a booking ID. Booking IDs come ONLY from backend tool results (format: BK + alphanumeric, e.g. BK515E53)
+- If customer asks about a booking without providing the ID, call check_booking to look it up. Use the result provided by the tool.
+- If the tool call fails or returns an error, tell the customer exactly what the error is; NEVER claim the operation succeeded
+- If the tool returns 'no_capacity_config': Tell the customer "Sorry, no time slots are configured for that time. Please try a different time."
+- If the tool returns 'slot_blocked': Tell the customer "Sorry, that time slot is not available (it may be a lunch break or closed time). Please try a different time."
+- When gathering booking details from the customer:
+  • Service: Must be one of the business services listed above
+  • Date: Must be a specific day (today, tomorrow, a specific date), NOT vague ("sometime next week")
+  • Time: MUST be explicit (2pm, 14:00, 2:30pm) — NEVER assume if the customer says only a time without AM/PM
+  • Party size: Ask if not provided; default to 1 if customer doesn't specify
+- CONFIRMATION MESSAGE FORMAT: After successful booking tool call, include: party size, date, time, service name, and the booking ID from the tool result. Example: "Perfect! 2 people on May 27 at 2pm for Table Booking. Booking ID: BK515E53"
+
+BOOKING ID RULES — MANDATORY ZERO-TOLERANCE:
+- ⚠️ CRITICAL: When the customer sends or mentions ANY booking ID (pattern: BK + alphanumeric, e.g. BKD68B36, BK515E53), you MUST call check_booking FIRST — before ANY other action.
+- NEVER call update_booking, cancel_booking, or reschedule_booking based on a booking ID without first calling check_booking to verify the booking exists and retrieve its details.
+- Even if the customer explicitly says "cancel my booking BKD68B36" or "reschedule BKD68B36" — you MUST call check_booking first, show the customer the booking details, and THEN perform the requested action.
+- If the customer ONLY sends a booking ID (e.g. "BKD68B36" or "BKD68B36\nThis is my booking id") with NO explicit action — call check_booking ONLY. Show the booking details. Do NOT assume they want to update, cancel, or reschedule anything.
+- NEVER carry forward party size, service name, date, or time from earlier in the conversation when the customer shares a booking ID. Every operation must use ONLY what the customer explicitly provides in their current message. Previous conversation context is NOT a valid source of booking parameters.
+- If check_booking returns "No active bookings found", tell the customer the booking ID was not found in the current business system. Do NOT suggest it might be from another business or offer to create a new one immediately — ask if they have the correct booking ID.
+- NEVER guess or assume a booking ID from context. Booking IDs are only valid when explicitly provided by the customer in their current message or returned by a tool call.
 """
 
 
@@ -428,13 +492,18 @@ class CustomerAIService:
             )
 
             # Process the response
-            final_text_parts = []
+            # NOTE: pre_tool_text_parts collects any text Claude emits BEFORE the tool call
+            # (e.g. "Perfect! Let me book..."). We intentionally DISCARD this when a tool is
+            # called, because the final reply must come entirely from the follow-up response
+            # that has the actual tool result — preventing "Perfect! ... Sorry, only 3 seats."
+            pre_tool_text_parts: list[str] = []
+            final_text_parts: list[str] = []
             tool_results = []
             _booking_created_this_turn = False  # guard: only one create_booking per turn
 
             for block in response.content:
                 if block.type == "text":
-                    final_text_parts.append(block.text)
+                    pre_tool_text_parts.append(block.text)
                 elif block.type == "tool_use":
                     # Guard: prevent Claude emitting two create_booking blocks in one turn
                     if block.name == "create_booking" and _booking_created_this_turn:
@@ -461,6 +530,7 @@ class CustomerAIService:
                     })
 
             # If there were tool calls, send results back to Claude for final response
+            history_with_tools: list[dict] | None = None
             if tool_results:
                 # Build tool result messages
                 history_with_tools = list(history)
@@ -482,7 +552,9 @@ class CustomerAIService:
                     "content": tool_result_content,
                 })
 
-                # Get final response after tool execution
+                # Get final response after tool execution.
+                # We do NOT include pre_tool_text_parts here — the complete reply
+                # must be derived from the tool result only.
                 follow_up = await self.client.messages.create(
                     model=self.model,
                     max_tokens=1000,
@@ -494,8 +566,45 @@ class CustomerAIService:
                 for block in follow_up.content:
                     if block.type == "text":
                         final_text_parts.append(block.text)
+            else:
+                # No tool calls — use the pre-tool text directly
+                final_text_parts = pre_tool_text_parts
 
             final_reply = "\n".join(final_text_parts).strip() or "I'm here to help! How can I assist you?"
+            
+            # HALLUCINATION GUARD: If Claude generated a booking confirmation WITHOUT calling the tool, reject it
+            booking_keywords = [
+                "confirmed!", "confirmed for", "booking confirmed",
+                "reservation confirmed", "table for", "your booking",
+                "your reservation", "your table",
+                "booking id:", "booking id =", "booking id=",
+                "booking details", "booking details:",
+            ]
+            has_booking_language = any(keyword in final_reply.lower() for keyword in booking_keywords)
+            
+            # Did Claude call a booking-related tool in this turn?
+            called_booking_tool = any(
+                tr["name"] in ("create_booking", "reschedule_booking", "update_booking", "cancel_booking")
+                for tr in tool_results
+            )
+            
+            # BLOCK: Confirmation text without tool call = hallucination
+            if has_booking_language and not called_booking_tool:
+                logger.error(
+                    "[HALLUCINATION-DETECTED] Customer %s business %s: "
+                    "Claude generated booking confirmation without calling tool. "
+                    "Blocked response: %s", customer_phone, business["id"], final_reply[:200]
+                )
+                # Retry: force Claude to actually call the booking tool using conversation context.
+                # This preserves state (service, date, time, party) instead of asking all over again.
+                final_reply = await self._force_tool_retry(
+                    system=system,
+                    history=history,
+                    business=business,
+                    customer_phone=customer_phone,
+                    push_name=push_name,
+                )
+            
             try:
                 print("AI (customer) generated reply:", final_reply)
                 logger.debug("AI (customer) generated reply: %s", final_reply)
@@ -509,6 +618,87 @@ class CustomerAIService:
                 "Sorry, I'm having a small technical issue. "
                 "Please try again in a moment!"
             )
+
+    async def _force_tool_retry(
+        self,
+        system: str,
+        history: list[dict],
+        business: dict,
+        customer_phone: str,
+        push_name: str,
+    ) -> str:
+        """Called when hallucination guard fires. Forces Claude to actually call the booking
+        tool instead of fabricating a confirmation. Preserves full conversation context so
+        the customer does not have to repeat service/date/time/party.
+        """
+        override_system = (
+            system
+            + "\n\n"
+            "⚠️ SYSTEM OVERRIDE — READ THIS BEFORE RESPONDING:\n"
+            "You previously attempted to confirm a booking without calling the create_booking tool. "
+            "That response was BLOCKED. You must now call create_booking with the details already "
+            "established in this conversation. Do NOT write any confirmation text — call the tool "
+            "first, then respond based on its result. If the booking details are unclear, ask ONE "
+            "specific clarifying question (do NOT ask for everything again)."
+        )
+        try:
+            retry_response = await self.client.messages.create(
+                model=self.model,
+                max_tokens=800,
+                system=override_system,
+                messages=history,
+                tools=CUSTOMER_TOOLS,
+                tool_choice={"type": "any"},  # Force a tool call
+            )
+
+            retry_text_parts: list[str] = []
+            retry_tool_results = []
+            for block in retry_response.content:
+                if block.type == "tool_use":
+                    result = self._execute_tool(block.name, block.input, business, customer_phone, push_name)
+                    retry_tool_results.append({
+                        "tool_use_id": block.id,
+                        "name": block.name,
+                        "result": result,
+                    })
+
+            if retry_tool_results:
+                retry_history = list(history)
+                retry_history.append({"role": "assistant", "content": retry_response.content})
+                retry_history.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": tr["tool_use_id"], "content": tr["result"]}
+                        for tr in retry_tool_results
+                    ],
+                })
+                final_follow = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=500,
+                    system=system,
+                    messages=retry_history,
+                    tools=CUSTOMER_TOOLS,
+                )
+                for block in final_follow.content:
+                    if block.type == "text":
+                        retry_text_parts.append(block.text)
+            else:
+                for block in retry_response.content:
+                    if block.type == "text":
+                        retry_text_parts.append(block.text)
+
+            result_text = "\n".join(retry_text_parts).strip()
+            if result_text:
+                logger.info("[HALLUCINATION-RETRY] Recovered context for customer=%s", customer_phone)
+                return result_text
+        except Exception as retry_exc:
+            logger.error("[HALLUCINATION-RETRY] Retry failed for customer=%s: %s", customer_phone, retry_exc)
+
+        # Final fallback: minimal context-preserving message
+        return (
+            "I need to verify the booking details with the system. "
+            "Could you confirm the time you'd like? (with AM/PM please)"
+        )
 
     def _execute_tool(
         self,
@@ -569,6 +759,7 @@ class CustomerAIService:
                     "businessId": business_id,
                     "customerPhone": customer_phone,
                     "date": tool_input.get("date", ""),
+                    "bookingId": tool_input.get("bookingId", ""),
                 }
                 payload = vapi_service.check_booking_payload(args, call_info)
                 if payload.get("error"):
@@ -627,6 +818,7 @@ class CustomerAIService:
                         business,
                         f"❌ *Booking cancelled*\nCustomer: {cancelled_booking.get('customerName', push_name)}\n"
                         f"Phone: {customer_phone}\nService: {cancelled_booking.get('serviceName', '')}\n"
+                        f"Party Size: {cancelled_booking.get('partySize', '')}\n"
                         f"Booking ID: {booking_id}",
                     ))
                 except Exception as _auto_err:
@@ -671,6 +863,7 @@ class CustomerAIService:
                         business,
                         f"🔄 *Booking rescheduled*\nCustomer: {updated_bk.get('customerName', push_name)}\n"
                         f"Phone: {customer_phone}\nService: {updated_bk.get('serviceName', '')}\n"
+                        f"Party Size: {updated_bk.get('partySize', '')}\n"
                         f"New time: {new_dt_fmt}\nBooking ID: {booking_id}",
                     ))
                 except Exception as _notify_err:

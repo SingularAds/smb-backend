@@ -187,6 +187,7 @@ async def update_booking(
                     f"From: {old_datetime}\n"
                     f"To: {new_datetime}"
                     + (f"\n📞 {customer_phone}" if customer_phone else "")
+                    + (f"\n👥 Party size: {updated.get('partySize') or booking.get('partySize', 1)}" if updated.get('partySize') or booking.get('partySize') else "")
                 )
             else:
                 msg = (

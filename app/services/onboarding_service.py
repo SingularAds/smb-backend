@@ -219,22 +219,23 @@ then move to the referral question
 - After a business is confirmed from Google Places (owner replies yes), do NOT ask for \
 business name/type/address again unless the owner explicitly says they are wrong
 
-REQUIRED FIELDS — only 3 are mandatory:
+REQUIRED FIELDS — mandatory before final save:
 - Business name
 - Business type (salon, restaurant, clinic, gym, store, spa, barbershop, etc.)
 - Business address (city at minimum)
+- Operating hours
+- Opening days
 
-INFORMATION YOU CAN COLLECT IF NOT ALREADY EXTRACTED \
-(do NOT ask for these — accept them only if the owner volunteers or they were auto-scraped):
-- Services offered (with prices and durations) — great if available, not required
-- Operating hours — NOT required; availability is managed via Google Calendar freebusy
+INFORMATION YOU CAN COLLECT IF NOT ALREADY EXTRACTED:
+- Services offered (with prices and durations) — ask if missing
+- Operating hours — mandatory if missing
+- Opening days — mandatory if missing
 - Brief description of the business
 - Business phone number (if different from WhatsApp)
 - Any specialties or unique selling points
 
 NEVER ASK FOR (handled automatically by the system):
-- Maximum concurrent bookings / slotsPerHour — set automatically from Google Calendar
-- Opening days / schedule — determined from Google Calendar freebusy
+- Maximum concurrent bookings / slotsPerHour — set automatically from business defaults/commands
 - Staff members — owner can add these later via commands
 - Languages spoken — owner can configure these later
 
@@ -253,14 +254,18 @@ CONVERSATION RULES:
 - Priority order:
     1) Greeting + ask for website/maps/instagram link
     2) System auto-fetches → confirmation card shown by system (not you)
-    3) After owner confirms → ask referral question (ONE message)
-    4) After referral answer → show mini-summary → [CONFIRMED]
-- If the owner gives partial info, acknowledge it and ask only for what is truly missing \
-(name, type, or address — nothing else)
+    3) ⚠️ MANDATORY: If working hours OR opening days are not yet known, ask for BOTH
+       in ONE single message before moving on. Do NOT skip this step.
+       Example: "What are your working hours and which days are you open?
+       (e.g. Mon–Sat 9am–6pm)"
+    4) Ask referral question (ONE message)
+    5) After referral answer → show mini-summary (with hours + days) → [CONFIRMED]
+- If the owner gives partial info, acknowledge it and ask only for what is truly missing
+(name, type, address, hours, opening days)
 - If they want to change something they already said, happily accommodate it immediately
 - Use emojis sparingly to keep it friendly
 - Keep messages short — this is WhatsApp, not email
-- After collecting the 3 required fields + referral answer, ALWAYS present the summary
+- After collecting ALL 5 required fields (name, type, address, hours, opening days) + referral answer, ALWAYS present the summary
 
 HANDLING CHANGES AFTER CONFIRMATION:
 - The user may want to make changes even after previously confirming
@@ -277,15 +282,18 @@ Here's what I've got for your business:
 *[Business Name]*
 Type: [type]
 📍 [address]
+🕐 Hours: [hours, e.g. Mon–Sat 9am–6pm]
+📅 Open: [days, e.g. Monday to Saturday]
 [Services: ... — only if available]
-[Hours: ... — only if available]
 Referral program: [Enabled — [X]% off for referrer, [Y]% off for new customer | Disabled]
 
 Then ask: "Does this look correct? Reply *yes* to confirm or just tell me what to change."
 
 IMPORTANT: The Referral program line MUST always be in the summary.
-Do NOT include slotsPerHour, openingDays, staff, or languages in the summary \
-— these are handled automatically.
+IMPORTANT: The 🕐 Hours and 📅 Open lines MUST always be in the summary. If they are missing,
+ask the owner before showing the summary — never omit them.
+Do NOT include slotsPerHour, staff, or languages in the summary — these are handled automatically.
+⚠️ Do NOT output [CONFIRMED] if Hours or Open days are blank or missing from the summary.
 
 IMPORTANT RESPONSE FORMAT:
 - Respond with ONLY the message text to send to the user
@@ -454,8 +462,9 @@ def _missing_fields(data: dict) -> list[str]:
     missing = []
     if not data.get("hours"):
         missing.append("working hours (e.g. Mon–Fri 9am–6pm)")
-    if not data.get("slotsPerHour"):
-        missing.append("maximum clients you can serve at the same time per hour")
+    opening_days = data.get("openingDays") or []
+    if not isinstance(opening_days, list) or not [d for d in opening_days if str(d).strip()]:
+        missing.append("opening days (e.g. Monday to Saturday)")
     services = data.get("services") or []
     if not services:
         missing.append("services offered (with prices and durations if known)")
@@ -1514,19 +1523,14 @@ class OnboardingService:
             f"  • Do NOT ask for {', '.join(skip_parts)} — we already have them.",
             "  • Do NOT ask if they have a website — we already have it.",
         ]
-        # Only prompt for genuinely missing fields
-        missing_fields = []
-        if not services:
-            missing_fields.append("services (with prices/durations)")
-        if not lead.get("hours"):
-            missing_fields.append("operating hours")
-        missing_fields += ["staff members", "business phone (if different from WhatsApp)", "languages"]
         lines.append(
-            f"  • Focus ONLY on what is still missing: {', '.join(missing_fields)}."
+            "  • Check the conversation history to see what the owner has ALREADY provided "
+            "(hours, opening days, services, etc.). Do NOT re-ask for anything already mentioned."
         )
         lines.append(
-            "  • Start by gently confirming the pre-filled details look right, "
-            "then proceed to ask for the missing fields.",
+            "  • Collect whatever is still missing naturally (working hours, opening days, "
+            "services with prices/durations). Once all mandatory details are confirmed, "
+            "generate the confirmation summary and output [CONFIRMED]."
         )
         return "\n".join(lines)
 
@@ -1546,7 +1550,7 @@ class OnboardingService:
         — handled by ``_handle_recepte_confirm()``.
         """
         biz_name   = lead.get("businessName") or ""
-        owner_name = lead.get("name") or push_name or ""
+        owner_name = push_name or lead.get("name") or ""
         biz_type   = lead.get("type", "")
         city       = lead.get("city", "")
         lang       = self.ai.detect_language(phone)
@@ -1751,11 +1755,39 @@ class OnboardingService:
         Called after the owner confirms their basic business details (name, type,
         address) via either website/Maps confirmation or recepte lead confirmation.
         """
+        # Only hours and days are blocking for the referral step.
+        # Services are collected later by the AI in the conversing flow.
+        _pre_check = pre_extracted or {}
+        _blocking: list[str] = []
+        if not _pre_check.get("hours"):
+            _blocking.append("working hours (e.g. Mon–Sat 9am–6pm)")
+        _od_check = _pre_check.get("openingDays") or []
+        if not (isinstance(_od_check, list) and any(str(d).strip() for d in _od_check)):
+            _blocking.append("opening days (e.g. Monday to Saturday)")
+
+        if _blocking:
+            db.upsert_onboarding_session(phone, {
+                "currentStep": "conversing",
+                "websiteExtractedData": pre_extracted,
+                "mandatoryFieldsRequired": True,
+            })
+            history = session.get("conversationHistory", [])
+            blocking_str = " and ".join(_blocking)
+            clean_reply = (
+                f"Great, thanks for confirming! I just need your {blocking_str} to complete setup.\n\n"
+                "⏰📅 Please share them — for example: Mon–Sat 9am–6pm"
+            )
+            history.append({"role": "assistant", "content": clean_reply})
+            db.upsert_onboarding_session(phone, {"conversationHistory": history})
+            await self._send(phone, clean_reply)
+            return
+
         history = session.get("conversationHistory", [])
 
         db.upsert_onboarding_session(phone, {
             "currentStep": "referral_offer",
             "websiteExtractedData": pre_extracted,
+            "mandatoryFieldsRequired": False,
             "referralFeatureEnabled": None,
             "referrerDiscountPercent": 25,
             "refereeDiscountPercent": 10,
@@ -1827,20 +1859,32 @@ class OnboardingService:
         biz_name = extracted.get("name") or "your business"
         biz_type = extracted.get("businessType") or "other"
         biz_addr = extracted.get("address") or ""
+        biz_hours = extracted.get("hours") or ""
+        biz_days = extracted.get("openingDays") or []
         referral_line = (
             f"Enabled — {referrer_pct}% off for referrer, {referee_pct}% off for new customer"
             if referral_enabled
             else "Disabled"
         )
 
-        summary = (
-            f"Here's what I've got for your business:\n\n"
-            f"*{biz_name}*\n"
-            f"Type: {str(biz_type).replace('_', ' ').title()}\n"
-            f"📍 {biz_addr}\n"
-            f"Referral program: {referral_line}\n\n"
-            "Does this look correct? Reply *yes* to confirm or just tell me what to change."
-        )
+        summary_parts = [
+            f"Here's what I've got for your business:\n",
+            f"*{biz_name}*",
+            f"Type: {str(biz_type).replace('_', ' ').title()}",
+            f"📍 {biz_addr}",
+        ]
+        if biz_hours:
+            summary_parts.append(f"🕐 Hours: {biz_hours}")
+        else:
+            summary_parts.append("🕐 Hours: (not set — please confirm)")
+        if biz_days and isinstance(biz_days, list):
+            summary_parts.append(f"📅 Open: {', '.join(biz_days)}")
+        else:
+            summary_parts.append("📅 Open: (not set — please confirm)")
+        summary_parts.append(f"Referral program: {referral_line}")
+        summary_parts.append("\nDoes this look correct? Reply *yes* to confirm or just tell me what to change.")
+
+        summary = "\n".join(summary_parts)
 
         history = session.get("conversationHistory", [])
         history.append({"role": "user", "content": body})
@@ -1885,13 +1929,36 @@ class OnboardingService:
         history.append({"role": "user", "content": body})
 
         if is_yes and not is_no:
+            pre_extracted = session.get("websiteExtractedData") or {}
+            # Guard: ensure hours and days are present before finalizing
+            _rc_missing: list[str] = []
+            if not pre_extracted.get("hours"):
+                _rc_missing.append("working hours (e.g. Mon–Sat 9am–6pm)")
+            _rc_od = pre_extracted.get("openingDays") or []
+            if not (isinstance(_rc_od, list) and any(str(d).strip() for d in _rc_od)):
+                _rc_missing.append("opening days (e.g. Monday to Saturday)")
+            if _rc_missing:
+                _rc_missing_str = " and ".join(_rc_missing)
+                db.upsert_onboarding_session(phone, {
+                    "currentStep": "conversing",
+                    "conversationHistory": history,
+                    "lastMessageId": message_id,
+                })
+                session["currentStep"] = "conversing"
+                await self._send(
+                    phone,
+                    f"Almost done! I still need your {_rc_missing_str} before saving.\n\n"
+                    "⏰ What days and hours is your business open?\n"
+                    "   (e.g. Mon–Sat 9am–6pm, or Mon–Fri 10am–8pm)",
+                )
+                return
+
             db.upsert_onboarding_session(phone, {
                 "currentStep": "pairing",
                 "conversationHistory": history,
                 "lastMessageId": message_id,
             })
             session["currentStep"] = "pairing"
-            pre_extracted = session.get("websiteExtractedData") or None
             await self._finalize_business(session, phone, history, pre_extracted=pre_extracted)
             return
 
@@ -1942,6 +2009,64 @@ class OnboardingService:
             db.upsert_onboarding_session(phone, {"conversationHistory": _h})
             session["conversationHistory"] = _h
             await self._handle_website_url(session, phone, url, push_name)
+            return
+
+        # Mandatory-fields mode: after lead/website confirmation, when hours/days/services
+        # are still missing, treat incoming messages as business-detail input (NOT as
+        # Google Places/business-name queries). This prevents messages like
+        # "Monday to Sunday" from being misrouted to Places search.
+        if session.get("mandatoryFieldsRequired"):
+            history = session.get("conversationHistory", [])
+            history.append({"role": "user", "content": body})
+
+            _pre = session.get("websiteExtractedData") or {}
+            _conv = await self._extract_business_data(history) or {}
+            _merged: dict = dict(_pre)
+            for _k, _v in _conv.items():
+                if _v:
+                    _merged[_k] = _v
+
+            # Only hours and days are blocking here; services are collected
+            # naturally later by the AI in the referral/conversing flow.
+            has_hours = bool(_merged.get("hours"))
+            _od = _merged.get("openingDays") or []
+            has_days = isinstance(_od, list) and any(str(d).strip() for d in _od)
+
+            db.upsert_onboarding_session(phone, {
+                "conversationHistory": history,
+                "websiteExtractedData": _merged,
+            })
+            session["conversationHistory"] = history
+            session["websiteExtractedData"] = _merged
+
+            if has_hours and has_days:
+                db.upsert_onboarding_session(phone, {"mandatoryFieldsRequired": False})
+                session["mandatoryFieldsRequired"] = False
+                await self._start_referral_step(session, phone, push_name, _merged)
+                return
+
+            # Still missing one or both — send a targeted follow-up
+            if has_days and not has_hours:
+                clean_reply = (
+                    "Thanks! Got your opening days.\n\n"
+                    "⏰ What are your working hours? (e.g. 9am–9pm)"
+                )
+            elif has_hours and not has_days:
+                clean_reply = (
+                    "Thanks! Got your working hours.\n\n"
+                    "📅 Which days are you open? (e.g. Monday to Saturday)"
+                )
+            else:
+                clean_reply = (
+                    "Please share your opening days and working hours.\n\n"
+                    "Example: Monday to Saturday, 9am–9pm"
+                )
+            history.append({"role": "assistant", "content": clean_reply})
+            db.upsert_onboarding_session(phone, {
+                "conversationHistory": history,
+                "mandatoryFieldsRequired": True,
+            })
+            await self._send(phone, clean_reply)
             return
 
         # Google Places fast-path: if the message looks like a bare business name
@@ -2050,6 +2175,39 @@ class OnboardingService:
         # Check if the AI has signalled confirmation
         confirmed, clean_reply = self._check_confirmed(ai_reply)
 
+        # ── BACKEND GUARD: mandatory fields must be present before finalizing ──
+        # Even if the AI outputs [CONFIRMED], we intercept here if working hours
+        # or opening days are missing.  This is a safety net for cases where the
+        # AI ignored the system-prompt rules.  We do the check BEFORE sending the
+        # reply so the owner never sees a premature success message.
+        if confirmed:
+            _pre_check = session.get("websiteExtractedData") or {}
+            _conv_check = await self._extract_business_data(history) or {}
+            _merged_check: dict = dict(_pre_check)
+            for _k, _v in _conv_check.items():
+                if _v:
+                    _merged_check[_k] = _v
+
+            _guard_missing: list[str] = []
+            if not _merged_check.get("hours"):
+                _guard_missing.append("working hours (e.g. Mon–Sat 9am–6pm)")
+            _od_check = _merged_check.get("openingDays") or []
+            if not (isinstance(_od_check, list) and any(str(d).strip() for d in _od_check)):
+                _guard_missing.append("opening days (e.g. Monday to Saturday)")
+
+            if _guard_missing:
+                logger.warning(
+                    "[ONBOARDING-GUARD] [CONFIRMED] intercepted — %s still missing for phone=%s",
+                    _guard_missing, phone,
+                )
+                confirmed = False
+                _missing_str = " and ".join(_guard_missing)
+                clean_reply = (
+                    f"Almost there! I still need your {_missing_str} before I can save your details.\n\n"
+                    "⏰ What days and hours is your business open?\n"
+                    "   (e.g. Mon–Sat 9am–6pm, or Mon–Fri 10am–8pm)"
+                )
+
         # Store updated history
         history.append({"role": "assistant", "content": clean_reply})
         db.upsert_onboarding_session(phone, {
@@ -2069,20 +2227,10 @@ class OnboardingService:
             db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
             session["currentStep"] = "pairing"
 
-            # Merge any website-extracted baseline with conversation-derived data.
-            # This preserves website-scraped fields (services, hours, etc.) and fills
-            # any missing fields the AI collected during the conversation.
-            pre_extracted = session.get("websiteExtractedData") or None
-            if pre_extracted:
-                conv_json = await self._extract_business_data(history)
-                if conv_json and conv_json.get("name"):
-                    merged = dict(pre_extracted)
-                    for key, value in conv_json.items():
-                        if value:
-                            merged[key] = value
-                    await self._finalize_business(session, phone, history, pre_extracted=merged)
-                else:
-                    await self._finalize_business(session, phone, history, pre_extracted=pre_extracted)
+            # _merged_check was populated by the guard block above (it always runs
+            # when confirmed=True).  Reuse it to avoid a second LLM extraction call.
+            if _merged_check.get("name"):
+                await self._finalize_business(session, phone, history, pre_extracted=_merged_check)
             else:
                 await self._finalize_business(session, phone, history)
 
@@ -3759,6 +3907,18 @@ class OnboardingService:
                     phone_number=f"+{phone}",
                 )
                 code = result.get("code", "????-????")
+                await self._send(
+                    phone,
+                    "📱 *How to link your WhatsApp device using a pairing code:*\n\n"
+                    "1️⃣ Open *WhatsApp* on your phone\n"
+                    "2️⃣ Tap the *3-dot menu* (⋮) at the top right\n"
+                    "3️⃣ Tap *Linked Devices*\n"
+                    "4️⃣ Tap *Link a Device*\n"
+                    "5️⃣ When the camera opens, tap *'Link with phone number instead'*\n"
+                    "6️⃣ Enter your phone number, then enter the code below:\n\n"
+                    "_The code expires in 60 seconds — enter it quickly!_",
+                )
+                await asyncio.sleep(1)
                 await self._send(phone, f"🔑 Your pairing code:\n\n*{code}*")
                 await asyncio.sleep(1)
                 await self._send(
@@ -3803,14 +3963,22 @@ class OnboardingService:
     async def _transition_to_calendar_setup(self, session: dict, phone: str) -> None:
         """Move to Step 2: Google Calendar integration."""
         db.upsert_onboarding_session(phone, {"currentStep": "calendar_setup"})
-        business_id = session.get("businessId", "")
-        base_url = settings.BASE_URL.rstrip("/")
-        calendar_link = f"{base_url}/api/v1/calendar/connect?business_id={business_id}"
 
         msg = (
-            "📅 *Step 2/3 — Google Calendar*\n\n"
-            "Would you like to connect your Google Calendar?\n"
-            "This will automatically sync all bookings to your calendar.\n\n"
+            "📅 *Step 2/3 — Google Calendar Integration*\n\n"
+            "Connecting your Google Calendar lets your bookings appear automatically in your calendar, "
+            "and lets you control when you're available.\n\n"
+            "✅ *Optional: Set booking capacity per time slot*\n"
+            "To limit how many people can book a specific time slot, create an event in Google Calendar:\n\n"
+            "1️⃣ Open *Google Calendar* on your phone or computer\n"
+            "2️⃣ Tap *+* (or click a time slot) to create a new event\n"
+            "3️⃣ Set the event *title* to something like: *capacity: 20*\n"
+            "   _(This means a maximum of 20 people can book that slot)_\n"
+            "4️⃣ Set the event *time* to your full working hours (e.g. 10 AM – 10 PM)\n"
+            "5️⃣ Set it to *repeat daily* (or set it for each working day)\n"
+            "6️⃣ Save the event\n\n"
+            "⚠️ *If you skip this step*, all time slots within your working hours will be open for bookings with no limit.\n\n"
+            "Would you like to connect your Google Calendar now?\n"
             "Reply *YES* to connect or *SKIP* to continue without it."
         )
         await self._send(phone, msg)

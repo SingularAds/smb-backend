@@ -601,9 +601,6 @@ async def whatsmeow_webhook(
     Returns 200 immediately; actual processing runs as a background task
     so the bridge doesn't time out waiting for Claude / Firestore calls.
     """
-    print("\n" + "🔔"*40)
-    print(f"� [WEBHOOK ENDPOINT HIT] — {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print("🔔"*40 + "\n")
     
     # ── secret validation ─────────────────────────────────────────────
     expected = settings.WEBHOOK_SECRET or settings.X_WEBHOOK_SECRET

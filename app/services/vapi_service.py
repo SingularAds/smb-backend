@@ -1,4 +1,4 @@
-"""VAPI Service — Firestore backed
+﻿"""VAPI Service — Firestore backed
 
 Handles all server-side logic triggered by VAPI webhook messages.
 
@@ -18,6 +18,7 @@ We handle (this file):
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -77,14 +78,34 @@ def _cal_create_both(booking_data: dict, business: dict) -> tuple[str | None, st
     service_name = booking_data.get("serviceName", "Appointment")
     duration_minutes = int(booking_data.get("serviceDuration") or 60)
     notes = booking_data.get("notes", "")
+    party_size = int(booking_data.get("partySize") or 1)
 
     end_dt = start_dt + timedelta(minutes=duration_minutes)
     business_name = business.get("name", "Business")
     tz_str = business.get("timezone") or settings.GOOGLE_CALENDAR_TIMEZONE or "UTC"
 
+    # Clear, human-readable event format so the owner recognises bookings made by the AI.
+    # "Reservation - Name - Party of N" is the title; full details go in the description.
+    _party_suffix = f" - Party of {party_size}" if party_size > 1 else ""
+    _title = (
+        f"Reservation - {customer_name}{_party_suffix}"
+        if customer_name
+        else f"Reservation{_party_suffix} - {service_name}"
+    )
+    _description_parts = [
+        f"Booking ID: {booking_id}",
+        f"Phone: {customer_phone}" if customer_phone else None,
+        f"Service: {service_name}" if service_name else None,
+        f"Duration: {duration_minutes}min",
+        f"Business: {business_name}",
+        f"BusinessID: {biz_id}",
+        f"Notes: {notes}" if notes else None,
+    ]
+    _description = "\n".join(p for p in _description_parts if p)
+
     event = {
-        'summary': f"[{business_name}] {service_name} - {customer_name}" if customer_name else f"[{business_name}] {service_name}",
-        'description': f"Business: {business_name}\nBusinessID: {biz_id}\nBookingID: {booking_id}\nCustomer: {customer_name}\nPhone: {customer_phone}\nNotes: {notes}",
+        'summary': _title,
+        'description': _description,
         'start': {'dateTime': start_dt.isoformat(), 'timeZone': tz_str},
         'end': {'dateTime': end_dt.isoformat(), 'timeZone': tz_str},
         'extendedProperties': {
@@ -107,6 +128,9 @@ def _cal_create_both(booking_data: dict, business: dict) -> tuple[str | None, st
                 start_dt=start_dt,
                 duration_minutes=duration_minutes,
                 notes=notes,
+                booking_id=booking_id,
+                party_size=party_size,
+                business_name=business_name,
                 timezone=tz_str,
                 calendar_id=owner_calendar_id,
                 refresh_token=refresh_token,
@@ -479,46 +503,188 @@ def tool_create_booking(args: dict[str, Any], call_info: dict) -> str:
         caller_phone = customer_phone
         print(f"[vapi_service] callerPhone was business phone — corrected to {caller_phone!r}")
 
-    # Capacity check: reject if adding this party would exceed slotsPerHour headcount
-    try:
-        capacity_per_hour = max(1, int(business.get("slotsPerHour") or 1))
-    except (TypeError, ValueError):
-        capacity_per_hour = 1
-
     date_str = booking_dt.date().isoformat()
-    day_bookings = _list_day_bookings(business["id"], date_str)
-    
-    # Also check Google Calendar for conflicts
-    calendar_events = _get_google_calendar_events_for_day(date_str, business["id"])
-    calendar_conflicts = sum(
-        1 for event in calendar_events
-        if _calendar_event_overlaps_slot(booking_dt_local, duration, event)
-    )
-    
-    # Count existing bookings at this time
-    booked_headcount = sum(
-        _get_party_size(b)
-        for b in day_bookings
-        if _slot_overlaps_booking(booking_dt, duration, b)
-    )
-    
-    # For capacity=1, any calendar conflict blocks the slot entirely
-    if capacity_per_hour == 1 and calendar_conflicts > 0:
-        return _err(
-            f"Sorry, that time slot is already booked. "
-            f"Please choose a different time."
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # BOOKING VALIDATION PIPELINE
+    # Step A → B → C → D (working hours → day check → calendar → capacity)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # ── STEP A: Opening day check ─────────────────────────────────────────
+    _DEFAULT_OPENING_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    raw_opening_days = business.get("openingDays")
+    if isinstance(raw_opening_days, list) and raw_opening_days:
+        effective_opening_days = [str(d).strip() for d in raw_opening_days if d]
+    else:
+        effective_opening_days = _DEFAULT_OPENING_DAYS
+
+    requested_weekday = booking_dt_local.strftime("%A")
+    if effective_opening_days and requested_weekday not in effective_opening_days:
+        open_days_str = ", ".join(effective_opening_days)
+        logger.info(
+            "[Availability] Rejected — closed on %s, open days: %s, business=%s",
+            requested_weekday, open_days_str, business.get("id"),
         )
-    
-    # Add calendar conflicts to total headcount
-    total_headcount = booked_headcount + calendar_conflicts
-    
-    if total_headcount + party_size > capacity_per_hour:
-        remaining = max(0, capacity_per_hour - total_headcount)
         return _err(
-            f"Sorry, that time slot only has capacity for {remaining} more "
-            f"{'person' if remaining == 1 else 'people'}. "
-            f"Please choose a different time."
+            f"Sorry, we are closed on {requested_weekday}s. "
+            f"We are open on: {open_days_str}. "
+            "Please choose a different day."
         )
+
+    # ── STEP B: Working hours check ───────────────────────────────────────
+    is_within_hours, hours_desc = _is_within_business_hours(business, booking_dt_local)
+    if not is_within_hours:
+        logger.info(
+            "[Availability] Rejected — outside working hours: slot=%s hours=%s business=%s",
+            booking_dt_local.strftime("%H:%M"), hours_desc, business.get("id"),
+        )
+        return _err(
+            "Sorry, we are closed at that time. "
+            + (f"Our working hours are {hours_desc}." if hours_desc else "Please check our working hours and try again.")
+        )
+
+    # ── STEP C: Calendar blocking & capacity check ────────────────────────
+    is_cal_connected = bool(
+        business.get("calendarConnected")
+        and str(business.get("calendarRefreshToken") or "").strip()
+    )
+    slot_end_dt = booking_dt_utc + timedelta(minutes=duration)
+
+    if is_cal_connected:
+        # C1: All-day blocking event (holiday, vacation, full closure)
+        is_blocked_day, blocked_summary, day_block_err = _find_all_day_blocking_event(
+            business=business,
+            booking_dt_utc=booking_dt_utc,
+            biz_tz=biz_tz,
+        )
+        if day_block_err == "calendar_fetch_failed":
+            logger.warning(
+                "[Availability] Calendar unavailable for business=%s — skipping calendar checks",
+                business.get("id"),
+            )
+        elif is_blocked_day:
+            logger.info(
+                "[Availability] Rejected — full-day block: business=%s date=%s event=%r",
+                business.get("id"), booking_dt_local.date().isoformat(), blocked_summary,
+            )
+            _summary_lower = (blocked_summary or "").lower()
+            if any(kw in _summary_lower for kw in ("holiday", "public holiday")):
+                return _err("Sorry, we are closed for a public holiday on that day. Please choose a different date.")
+            elif any(kw in _summary_lower for kw in ("vacation", "leave")):
+                return _err("Sorry, we are on leave on that day. Please choose a different date.")
+            else:
+                return _err("Sorry, we are fully closed on that day. Please choose a different date.")
+        else:
+            # C2: Timed events in the booking window — blocking & capacity
+            cal_events = _get_owner_calendar_events_for_window(business, booking_dt_utc, slot_end_dt)
+            if cal_events is not None:
+                timed_events = [ev for ev in cal_events if not ev.get("isAllDay")]
+
+                # ── LLM-first interpretation (multilingual / freeform event titles) ──
+                event_summaries = [
+                    ev.get("summary", "").strip() for ev in timed_events
+                    if ev.get("summary", "").strip()
+                ]
+                slot_capacity: int | None = None
+                is_blocked = False
+                block_msg = ""
+
+                if event_summaries:
+                    llm_result = _llm_interpret_calendar_events(event_summaries)
+                    if llm_result.get("is_blocking"):
+                        is_blocked = True
+                        block_msg = llm_result.get("block_message") or (
+                            f"Sorry, we are unavailable at that time ({llm_result.get('block_reason', 'closed')}). "
+                            "Please choose a different time."
+                        )
+                        logger.info(
+                            "[Availability] LLM-detected partial-day block: business=%s slot=%s reason=%r",
+                            business.get("id"), booking_dt_local.isoformat(), llm_result.get("block_reason"),
+                        )
+                    elif llm_result.get("capacity") is not None:
+                        slot_capacity = llm_result["capacity"]
+                        logger.info(
+                            "[LLM-CapacityParser] Extracted capacity=%d from events=%s",
+                            slot_capacity, event_summaries,
+                        )
+
+                # ── Regex fallback (when LLM found nothing) ──────────────────
+                if not is_blocked and slot_capacity is None:
+                    is_blocked, block_keyword, block_msg = _find_timed_blocking_event(timed_events)
+                    if is_blocked:
+                        logger.info(
+                            "[Availability] Regex-detected partial-day block: business=%s slot=%s keyword=%r",
+                            business.get("id"), booking_dt_local.isoformat(), block_keyword,
+                        )
+
+                if not is_blocked and slot_capacity is None:
+                    for ev in timed_events:
+                        c = _parse_capacity_from_summary(ev.get("summary", ""), ev.get("description", ""))
+                        if c is not None:
+                            slot_capacity = c
+                            logger.info(
+                                "[RegexCapacityParser] Extracted capacity=%d from event summary=%r",
+                                slot_capacity, ev.get("summary"),
+                            )
+                            break
+
+                # ── Evaluate result ───────────────────────────────────────────
+                if is_blocked:
+                    return _err(block_msg)
+
+                # C3: Capacity check — use calendar capacity if found
+                if slot_capacity is not None:
+                    day_bookings = _list_day_bookings(business["id"], date_str)
+                    reserved = sum(
+                        _get_party_size(b) for b in day_bookings
+                        if _slot_overlaps_booking(booking_dt_local, duration, b)
+                        and (b.get("status") or "").lower() not in ("cancelled", "rejected")
+                    )
+                    logger.info(
+                        "[CapacityCheck] business=%s slot=%s capacity=%d reserved=%d requested=%d",
+                        business.get("id"), booking_dt_local.isoformat(),
+                        slot_capacity, reserved, party_size,
+                    )
+                    if reserved + party_size > slot_capacity:
+                        remaining = max(0, slot_capacity - reserved)
+                        if remaining <= 0:
+                            return _err(
+                                f"Sorry, the {booking_dt_local.strftime('%I:%M %p').lstrip('0')} slot is fully booked. "
+                                "Please choose a different time."
+                            )
+                        return _err(
+                            f"Sorry, only {remaining} {'seat is' if remaining == 1 else 'seats are'} available "
+                            f"for that time slot, but you requested {party_size}. "
+                            f"Would you like to book for {remaining} {'person' if remaining == 1 else 'people'} instead, "
+                            "or choose a different time?"
+                        )
+                # ── STEP D: No capacity mentioned + no blocking → allow booking
+                else:
+                    logger.info(
+                        "[Availability] No capacity config & no blocking event — allowing booking: "
+                        "business=%s slot=%s", business.get("id"), booking_dt_local.isoformat(),
+                    )
+    else:
+        # No calendar connected — DB-based capacity fallback (only if slotsPerHour set)
+        parallel_capacity = _get_parallel_capacity(business)
+        # Only apply DB check when the owner explicitly configured a capacity
+        has_explicit_capacity = bool(
+            business.get("parallelCapacity") or business.get("slotsPerHour")
+        )
+        if has_explicit_capacity and parallel_capacity > 0:
+            day_bookings = _list_day_bookings(business["id"], date_str)
+            overlap_count = sum(
+                1 for b in day_bookings
+                if _slot_overlaps_booking(booking_dt, duration, b)
+            )
+            logger.info(
+                "[Capacity] DB-based check (no calendar): overlaps=%d parallelCapacity=%d business=%s",
+                overlap_count, parallel_capacity, business.get("id"),
+            )
+            if overlap_count >= parallel_capacity:
+                return _err("Sorry, that time slot is fully booked. Please choose a different time.")
+
+    # ─────────────────────────────────────────────────────────────────────
 
     # Only store a real name — never store generic placeholders in Firestore
     safe_name = customer_name if _is_real_name(customer_name) else ""
@@ -935,52 +1101,48 @@ def reschedule_booking_payload(args: dict[str, Any], call_info: dict) -> dict[st
     if args.get("partySize") is not None:
         new_party_size = max(_to_int(args.get("partySize"), 1), 1)
 
-    # Capacity check for the target slot
-    try:
-        capacity_per_hour = max(1, int(business.get("slotsPerHour") or 1))
-    except (TypeError, ValueError):
-        capacity_per_hour = 1
-
+    # ── Freebusy capacity check for the target slot (reschedule) ─────────────
+    # Any event on owner's calendar = busy.  We must exclude the CURRENT booking's
+    # own calendar event — it will be deleted/moved right after this check passes.
+    parallel_capacity = _get_parallel_capacity(business)
     duration = _to_int(booking.get("serviceDuration") or args.get("durationMinutes", 60), 60)
     date_str = new_dt_utc.date().isoformat()
-    day_bookings = _list_day_bookings(business["id"], date_str)
-    
-    # Check Google Calendar for conflicts
-    calendar_events = _get_google_calendar_events_for_day(date_str, business["id"])
-    calendar_conflicts = sum(
-        1 for event in calendar_events
-        if _calendar_event_overlaps_slot(new_dt_local, duration, event)
+
+    is_cal_connected = bool(
+        business.get("calendarConnected")
+        and str(business.get("calendarRefreshToken") or "").strip()
     )
-    
-    # For capacity=1, any calendar conflict blocks the slot (unless it's the current booking's event)
-    if capacity_per_hour == 1 and calendar_conflicts > 0:
-        return {
-            "error": (
-                f"Sorry, that time slot is already booked. "
-                f"Please choose a different time."
-            )
-        }
-    
-    if capacity_per_hour > 1:
-        # Count headcount at the target slot, EXCLUDING this booking (it's moving)
-        other_headcount = sum(
-            _get_party_size(b)
-            for b in day_bookings
+    if is_cal_connected:
+        slot_end_dt = new_dt_utc + timedelta(minutes=duration)
+        cal_events = _get_owner_calendar_events_for_window(business, new_dt_utc, slot_end_dt)
+        # Exclude the existing booking's own calendar event to avoid counting it twice.
+        # The event is identified by the booking's summary pattern (if stored as extendedProperty
+        # we'd use that, but here we rely on the count being < capacity).
+        overlap_count = len(cal_events)
+        # Subtract 1 if the current booking already has a calendar event in this window
+        # (it's being moved, so it should not count against capacity at the new slot).
+        # We conservatively do NOT subtract because the old event is at a different time.
+        print(
+            f"[Capacity-Reschedule] Calendar check: {overlap_count} event(s) in new slot, "
+            f"parallelCapacity={parallel_capacity}, business={business['id']}"
+        )
+    else:
+        day_bookings = _list_day_bookings(business["id"], date_str)
+        # Exclude the booking being rescheduled from the count
+        overlap_count = sum(
+            1 for b in day_bookings
             if b.get("id") != booking_id and _slot_overlaps_booking(new_dt_utc, duration, b)
         )
-        
-        total_headcount = other_headcount + calendar_conflicts
-        
-        if total_headcount + new_party_size > capacity_per_hour:
-            remaining = max(0, capacity_per_hour - total_headcount)
-            return {
-                "error": (
-                    f"Sorry, that time slot only has capacity for {remaining} more "
-                    f"{'person' if remaining == 1 else 'people'}. "
-                    f"Your party of {new_party_size} won't fit. "
-                    f"Please choose a different time or reduce the party size."
-                )
-            }
+        print(
+            f"[Capacity-Reschedule] DB check: {overlap_count} booking(s) in new slot, "
+            f"parallelCapacity={parallel_capacity}, business={business['id']}"
+        )
+
+    if overlap_count >= parallel_capacity:
+        return {
+            "error": "Sorry, that time slot is fully booked. Please choose a different time."
+        }
+    # ─────────────────────────────────────────────────────────────────────────
 
     updates: dict[str, Any] = {
         "datetime": new_dt_utc.isoformat(),
@@ -1494,6 +1656,451 @@ def tool_log_complaint(args: dict[str, Any], call_info: dict) -> str:
     return _ok("Complaint recorded. The business owner has been notified and we will follow up.")
 
 
+# ── Working hours validation helpers ─────────────────────────────────────────
+
+def _parse_hours_range(hours: "str | dict | None") -> "tuple[Any, Any]":
+    """Parse business hours into (open_time, close_time) as datetime.time objects.
+
+    Handles formats:
+      - dict: {"start": "09:00", "end": "18:00"}
+      - str:  "9am-10pm", "9:00-22:00", "10 AM - 10 PM", "Mon-Thu 9:00-18:00"
+    Returns (None, None) if unparseable.
+    """
+    from datetime import time as dt_time
+
+    if not hours:
+        return None, None
+
+    if isinstance(hours, dict):
+        try:
+            start_str = str(hours.get("start") or "09:00")
+            end_str = str(hours.get("end") or "18:00")
+            sh, sm = map(int, (start_str.split(":")[:2] + ["0"])[:2])
+            eh, em = map(int, (end_str.split(":")[:2] + ["0"])[:2])
+            return dt_time(sh, sm), dt_time(eh, em)
+        except Exception:
+            return None, None
+
+    if not isinstance(hours, str):
+        return None, None
+
+    hours_str = hours.strip()
+
+    # Try 24h format: "9:00-18:00" or "09:00 - 18:00"
+    m = re.search(r'(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})', hours_str)
+    if m:
+        try:
+            return (
+                __import__("datetime").time(int(m.group(1)), int(m.group(2))),
+                __import__("datetime").time(int(m.group(3)), int(m.group(4))),
+            )
+        except ValueError:
+            pass
+
+    # Try AM/PM format: "9am-10pm", "10 AM - 10 PM", "9:30AM-10:30PM"
+    am_pm_re = re.compile(
+        r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*[-–to\s]+\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)',
+        re.IGNORECASE,
+    )
+    m = am_pm_re.search(hours_str)
+    if m:
+        try:
+            sh = int(m.group(1)); sm = int(m.group(2) or 0); sp = m.group(3).lower()
+            eh = int(m.group(4)); em = int(m.group(5) or 0); ep = m.group(6).lower()
+            if sp == "pm" and sh != 12:
+                sh += 12
+            elif sp == "am" and sh == 12:
+                sh = 0
+            if ep == "pm" and eh != 12:
+                eh += 12
+            elif ep == "am" and eh == 12:
+                eh = 0
+            from datetime import time as dt_time
+            return dt_time(sh, sm), dt_time(eh, em)
+        except (ValueError, AttributeError):
+            pass
+
+    # Try bare hour AM/PM pairs: "9am to 10pm" (no colon)
+    pairs = re.findall(r'(\d{1,2})\s*(am|pm)', hours_str, re.IGNORECASE)
+    if len(pairs) >= 2:
+        try:
+            sh, sp = int(pairs[0][0]), pairs[0][1].lower()
+            eh, ep = int(pairs[1][0]), pairs[1][1].lower()
+            if sp == "pm" and sh != 12:
+                sh += 12
+            elif sp == "am" and sh == 12:
+                sh = 0
+            if ep == "pm" and eh != 12:
+                eh += 12
+            elif ep == "am" and eh == 12:
+                eh = 0
+            from datetime import time as dt_time
+            return dt_time(sh, 0), dt_time(eh, 0)
+        except (ValueError, AttributeError):
+            pass
+
+    return None, None
+
+
+def _is_within_business_hours(business: dict, booking_dt_local: datetime) -> "tuple[bool, str]":
+    """Check whether *booking_dt_local* falls inside the business's working hours.
+
+    Returns ``(is_open, human_readable_hours_string)``.
+    When no hours are configured returns ``(True, '')`` — do not block the booking.
+    """
+    hours_raw = business.get("hours") or business.get("hoursRaw") or ""
+    open_t, close_t = _parse_hours_range(hours_raw)
+
+    if open_t is None or close_t is None:
+        return True, ""
+
+    def _fmt(t: "Any") -> str:
+        h, m = t.hour, t.minute
+        ampm = "AM" if h < 12 else "PM"
+        h12 = h % 12 or 12
+        return f"{h12}:{m:02d} {ampm}" if m else f"{h12} {ampm}"
+
+    hours_desc = f"{_fmt(open_t)} to {_fmt(close_t)}"
+    booking_time = booking_dt_local.time()
+
+    if open_t <= close_t:
+        is_open = open_t <= booking_time < close_t
+    else:
+        # Overnight hours (e.g. 10pm–2am)
+        is_open = booking_time >= open_t or booking_time < close_t
+
+    return is_open, hours_desc
+
+
+# ── LLM-based multilingual calendar event interpreter ────────────────────────
+
+def _llm_interpret_calendar_events(event_summaries: "list[str]") -> "dict[str, Any]":
+    """Use Claude Haiku to interpret calendar event titles in ANY language/format.
+
+    Handles:
+      - English: "Lunch Break", "Capacity:30", "closed"
+      - French: "Pause déjeuner", "Capacité: 30"
+      - Spanish: "Almuerzo", "Capacidad: 20", "Cerrado"
+      - Hindi: "दोपहर का भोजन", "क्षमता: 15"
+      - Chinese: "午休", "容量:30"
+      - Any other freeform capacity notation: "CAP=30", "MAX 50", "50 tables"
+
+    Returns dict with keys:
+      - ``is_blocking``: bool — true if any event signals the business is closed/unavailable
+      - ``block_reason``: str — English description like "lunch break", "holiday", "closed"
+      - ``block_message``: str — friendly user-facing message (empty if not blocking)
+      - ``capacity``: int | None — extracted capacity if any event specifies it
+    """
+    if not event_summaries:
+        return {"is_blocking": False, "block_reason": "", "block_message": "", "capacity": None}
+
+    try:
+        from anthropic import Anthropic
+        from app.config import settings
+
+        summaries_text = "\n".join(f"- {s}" for s in event_summaries[:8])
+        prompt = (
+            "You are analyzing Google Calendar event titles for a business booking system.\n\n"
+            f"Event titles found in the requested time window:\n{summaries_text}\n\n"
+            "Respond with ONLY a JSON object (no explanation, no markdown):\n"
+            "{\n"
+            '  "is_blocking": true or false,\n'
+            '  "block_reason": "short English reason if blocking, e.g. lunch break / holiday / closed / maintenance",\n'
+            '  "block_message": "friendly customer-facing message if blocking, e.g. Sorry, we are on lunch break. Please choose a time outside our lunch break.",\n'
+            '  "capacity": null or integer (the max bookings/people for this slot if explicitly mentioned)\n'
+            "}\n\n"
+            "Rules:\n"
+            "- is_blocking = true if any event means the business is closed/unavailable "
+            "(e.g. lunch, break, holiday, maintenance, closed, off, vacation, private event, blocked)\n"
+            "- is_blocking = false for normal reservations or appointment events\n"
+            "- capacity = integer only if an event explicitly states the max slots/people/tables/chairs "
+            "(in any language), e.g. 'Capacity:30', 'Capacidad:20', 'capacity=3', '50 tables', 'столів:20'\n"
+            "- If neither blocking nor capacity applies, return is_blocking=false, capacity=null"
+        )
+
+        client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model="claude-haiku-4-20250514",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = (response.content[0].text or "").strip()
+        # Extract JSON even if there is extra whitespace or code fences
+        m = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
+        if m:
+            parsed = json.loads(m.group(0))
+            logger.info(
+                "[LLM-CalendarParser] events=%s → is_blocking=%s capacity=%s reason=%r",
+                event_summaries, parsed.get("is_blocking"), parsed.get("capacity"), parsed.get("block_reason"),
+            )
+            return {
+                "is_blocking": bool(parsed.get("is_blocking", False)),
+                "block_reason": str(parsed.get("block_reason") or ""),
+                "block_message": str(parsed.get("block_message") or ""),
+                "capacity": int(parsed["capacity"]) if parsed.get("capacity") is not None and str(parsed.get("capacity", "")).isdigit() else None,
+            }
+    except Exception as exc:
+        logger.warning("[LLM-CalendarParser] Failed (falling back to regex): %s", exc)
+
+    # Fallback: return empty — caller will fall back to regex helpers
+    return {"is_blocking": False, "block_reason": "", "block_message": "", "capacity": None}
+
+
+# ── Calendar blocking-event helpers ──────────────────────────────────────────
+
+# Keywords whose presence in an event summary signals the slot is unavailable.
+# Ordered longest-first so "lunch break" matches before "lunch".
+_BLOCKING_KEYWORDS: list[str] = sorted([
+    "public holiday",
+    "lunch break",
+    "team break",
+    "tea break",
+    "not available",
+    "out of office",
+    "day off",
+    "off day",
+    "private event",
+    "holiday",
+    "vacation",
+    "maintenance",
+    "unavailable",
+    "blocked",
+    "private",
+    "closed",
+    "lunch",
+    "break",
+    "leave",
+    "busy",
+    "block",
+    "off",
+    "ooo",
+], key=len, reverse=True)
+
+_BLOCKING_MESSAGES: dict[str, str] = {
+    "public holiday": "Sorry, we are closed for a public holiday on that day. Please choose a different date.",
+    "lunch break":    "Sorry, we are on our lunch break at that time. Please choose a time outside our lunch break.",
+    "team break":     "Sorry, we have a scheduled team break at that time. Please choose a different time.",
+    "tea break":      "Sorry, we have a tea break at that time. Please choose a different time.",
+    "not available":  "Sorry, we are not available at that time. Please choose a different time.",
+    "out of office":  "Sorry, we are out of office at that time. Please choose a different time.",
+    "day off":        "Sorry, we are off on that day. Please choose a different date.",
+    "off day":        "Sorry, we are off on that day. Please choose a different date.",
+    "private event":  "Sorry, we have a private event at that time. Please choose a different time.",
+    "holiday":        "Sorry, we are closed for a holiday. Please choose a different date.",
+    "vacation":       "Sorry, we are on vacation. Please choose a different date.",
+    "maintenance":    "Sorry, we are closed for maintenance at that time. Please choose a different time.",
+    "unavailable":    "Sorry, we are unavailable at that time. Please choose a different time.",
+    "blocked":        "Sorry, that time slot is blocked. Please choose a different time.",
+    "private":        "Sorry, we have a private event at that time. Please choose a different time.",
+    "closed":         "Sorry, we are closed at that time. Please choose a different time.",
+    "lunch":          "Sorry, that time falls within our lunch break. Please choose a time before or after lunch.",
+    "break":          "Sorry, we have a scheduled break at that time. Please choose a different time.",
+    "leave":          "Sorry, we are on leave at that time. Please choose a different time.",
+    "busy":           "Sorry, we are unavailable at that time. Please choose a different time.",
+    "block":          "Sorry, that time slot is blocked. Please choose a different time.",
+    "off":            "Sorry, we are off at that time. Please choose a different time.",
+    "ooo":            "Sorry, we are out of office at that time. Please choose a different time.",
+}
+
+
+def _find_timed_blocking_event(events: "list[dict]") -> "tuple[bool, str, str]":
+    """Scan timed calendar events for blocking keywords in their summary.
+
+    Returns ``(is_blocked, matched_keyword, user_friendly_message)``.
+    """
+    for ev in events:
+        if ev.get("isAllDay"):
+            continue
+        summary_lower = (ev.get("summary") or "").strip().lower()
+        if not summary_lower:
+            continue
+        for keyword in _BLOCKING_KEYWORDS:
+            if keyword in summary_lower:
+                msg = _BLOCKING_MESSAGES.get(keyword, "Sorry, that time slot is unavailable. Please choose a different time.")
+                logger.info(
+                    "[BlockingEvent] Timed blocking event detected: summary=%r keyword=%r",
+                    ev.get("summary"), keyword,
+                )
+                return True, keyword, msg
+    return False, "", ""
+
+
+# ── Capacity parsing from calendar event summary ──────────────────────────────
+
+_CAPACITY_PATTERNS: "list[re.Pattern[str]]" = [
+    re.compile(r'\bcapacity\s*[=:]\s*(\d+)',       re.IGNORECASE),
+    re.compile(r'\[capacity\s*=\s*(\d+)\]',        re.IGNORECASE),
+    re.compile(r'\bmax\s+(?:capacity\s+)?(\d+)\b', re.IGNORECASE),
+    re.compile(r'\b(\d+)\s+slots?\b',              re.IGNORECASE),
+    re.compile(r'\b(\d+)\s+pax\b',                 re.IGNORECASE),
+    re.compile(r'\btable\s+for\s+(\d+)\b',         re.IGNORECASE),
+    re.compile(r'\bavailable\s+(\d+)\b',            re.IGNORECASE),
+    re.compile(r'\bseats?\s*(?:[=:for]+)\s*(\d+)\b', re.IGNORECASE),
+]
+
+
+def _parse_capacity_from_summary(summary: str, description: str = "") -> "int | None":
+    """Parse slot capacity from a calendar event title or description.
+
+    Returns the capacity as an integer, or ``None`` if no capacity is found.
+    """
+    for text in (summary or "", description or ""):
+        for pattern in _CAPACITY_PATTERNS:
+            m = pattern.search(text)
+            if m:
+                try:
+                    val = int(m.group(1))
+                    if 0 < val <= 10000:
+                        logger.info("[CapacityParser] Extracted capacity=%d from: %r", val, text[:60])
+                        return val
+                except (ValueError, IndexError):
+                    pass
+    return None
+
+
+# ── Freebusy-based calendar helpers ─────────────────────────────────────────
+
+def _get_parallel_capacity(business: dict) -> int:
+    """Return the maximum number of simultaneous bookings allowed for a business.
+
+    Priority:
+      1. ``parallelCapacity`` field (new field — set during onboarding or by owner)
+      2. ``slotsPerHour`` field (legacy / backward-compat)
+      3. Default by business type (conservative fallback)
+    """
+    for field in ("parallelCapacity", "slotsPerHour"):
+        val = business.get(field)
+        if val:
+            try:
+                n = int(val)
+                if n > 0:
+                    return n
+            except (TypeError, ValueError):
+                pass
+
+    # Default by business type when neither field is set
+    _defaults = {
+        "restaurant": 20, "café": 10, "cafe": 10,
+        "hair salon": 3, "salon": 3, "barbershop": 2, "barber": 2,
+        "gym": 10, "fitness": 10, "clinic": 2, "medical": 2,
+        "spa": 3, "nail": 3, "store": 5, "shop": 5,
+    }
+    biz_type = str(business.get("businessType") or business.get("type") or "").lower().strip()
+    return _defaults.get(biz_type, 1)
+
+
+def _get_owner_calendar_events_for_window(
+    business: dict, start_dt: datetime, end_dt: datetime
+) -> list[dict] | None:
+    """Fetch ALL events from the owner's OAuth calendar overlapping [start_dt, end_dt].
+
+    Any event on the owner's calendar is treated as a busy slot — no title
+    parsing, no businessId filtering.  This is the freebusy-based approach.
+
+        Returns:
+            - list[dict] on successful fetch (may be empty)
+            - [] when calendar is not connected
+            - None when calendar API fetch fails (caller should fail safe)
+    """
+    refresh_token = str(business.get("calendarRefreshToken") or "").strip()
+    if not refresh_token or not business.get("calendarConnected"):
+        return []
+
+    try:
+        from app.integrations.google_calendar import GoogleCalendarClient
+        cal = GoogleCalendarClient()
+        calendar_id = business.get("ownerCalendarId") or "primary"
+        events = cal.get_events_in_window(
+            refresh_token=refresh_token,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            calendar_id=calendar_id,
+        )
+        if events is None:
+            logger.error(
+                "[Calendar-Freebusy] Calendar fetch failed for business=%s window=[%s, %s]",
+                business.get("id"),
+                start_dt.isoformat(),
+                end_dt.isoformat(),
+            )
+            return None
+        print(
+            f"[Calendar-Freebusy] {len(events)} event(s) in window "
+            f"[{start_dt.isoformat()}, {end_dt.isoformat()}] "
+            f"for business={business.get('id')}"
+        )
+        return events
+    except Exception as exc:
+        logger.warning(
+            "[Calendar-Freebusy] Failed to fetch owner calendar events for business=%s: %s",
+            business.get("id"), exc,
+        )
+        return None
+
+
+def _event_spans_local_date(event: dict, local_date_str: str) -> bool:
+    """Return True when an all-day event spans the given local date.
+
+    Google all-day events are represented as [start.date, end.date) where end is
+    exclusive, so we check start <= target < end.
+    """
+    start_date = str(event.get("startDate") or "").strip()
+    end_date = str(event.get("endDate") or "").strip()
+    if not start_date or not end_date:
+        return False
+    return start_date <= local_date_str < end_date
+
+
+def _find_all_day_blocking_event(
+    business: dict,
+    booking_dt_utc: datetime,
+    biz_tz,
+) -> tuple[bool, str | None, str | None]:
+    """Check requested local date against all-day events from owner calendar.
+
+    Returns:
+      (is_blocked, blocking_summary, error_code)
+      error_code is set to "calendar_fetch_failed" when API fetch fails.
+    """
+    local_date = booking_dt_utc.astimezone(biz_tz).date().isoformat()
+    local_day_start = biz_tz.localize(
+        datetime.strptime(local_date, "%Y-%m-%d").replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+    )
+    local_day_end = local_day_start + timedelta(days=1)
+
+    events = _get_owner_calendar_events_for_window(
+        business,
+        local_day_start.astimezone(pytz.UTC),
+        local_day_end.astimezone(pytz.UTC),
+    )
+    if events is None:
+        logger.error(
+            "[Availability] Calendar unavailable; fail-safe reject for business=%s date=%s",
+            business.get("id"),
+            local_date,
+        )
+        return False, None, "calendar_fetch_failed"
+
+    all_day_events = [ev for ev in events if ev.get("isAllDay")]
+    if all_day_events:
+        logger.info(
+            "[Calendar-DayBlock] Found %d all-day event(s) for business=%s date=%s",
+            len(all_day_events),
+            business.get("id"),
+            local_date,
+        )
+
+    for ev in all_day_events:
+        if _event_spans_local_date(ev, local_date):
+            summary = (ev.get("summary") or "(no title)").strip() or "(no title)"
+            logger.info("[Calendar-DayBlock] Found all-day blocking event: %s", summary)
+            return True, summary, None
+
+    return False, None, None
+
+
 # ── Tool: getAvailableSlots ──────────────────────────────────────────────────
 
 def _get_google_calendar_events_for_day(date: str, business_id: str) -> list[dict]:
@@ -1740,20 +2347,81 @@ def get_available_slots_payload(args: dict[str, Any], call_info: dict) -> dict[s
     candidate_slots = _default_slots(date, business.get("hours"))
     slot_source = "default-hours"
 
-    # slotsPerHour = person capacity: total headcount allowed per hour slot.
-    # e.g. slotsPerHour=40 means 40 people can be booked in the same 1-hour slot.
-    # A party of 4 uses 4 of those 40 slots.
-    try:
-        capacity_per_hour = max(1, int(business.get("slotsPerHour") or 1))
-    except (TypeError, ValueError):
-        capacity_per_hour = 1
+    # parallelCapacity = max simultaneous bookings (any event on calendar = 1 booking).
+    # Falls back to slotsPerHour for backward compatibility, then type-based default.
+    parallel_capacity = _get_parallel_capacity(business)
 
-    # Fetch both Firestore bookings AND Google Calendar events for this business
-    day_bookings = _list_day_bookings(business["id"], date)
-    calendar_events = _get_google_calendar_events_for_day(date, business["id"])
+    # Fetch availability data for the whole day in one shot (avoid N API calls)
+    is_cal_connected = bool(
+        business.get("calendarConnected")
+        and str(business.get("calendarRefreshToken") or "").strip()
+    )
+    if is_cal_connected:
+        # Fetch ALL owner calendar events for the whole day (one API call)
+        day_start_dt = datetime.strptime(date, "%Y-%m-%d").replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        day_end_dt = day_start_dt + timedelta(days=1)
+        all_day_cal_events = _get_owner_calendar_events_for_window(
+            business, day_start_dt, day_end_dt
+        )
+        if all_day_cal_events is None:
+            logger.error(
+                "[Availability] Calendar unavailable while fetching slots for business=%s date=%s",
+                business.get("id"),
+                date,
+            )
+            return {"error": "Calendar is temporarily unavailable. Please try again shortly."}
+
+        day_block_event = next(
+            (
+                ev
+                for ev in all_day_cal_events
+                if ev.get("isAllDay") and _event_spans_local_date(ev, date)
+            ),
+            None,
+        )
+        if day_block_event:
+            summary = (day_block_event.get("summary") or "(no title)").strip() or "(no title)"
+            logger.info("[Calendar-DayBlock] Found all-day blocking event: %s", summary)
+            logger.info(
+                "[Availability] Booking rejected: business unavailable for full day (business=%s date=%s)",
+                business.get("id"),
+                date,
+            )
+            return {
+                "businessId": business["id"],
+                "date": date,
+                "durationMinutes": duration,
+                "partySize": requested_party,
+                "capacity": 0,
+                "slotRemaining": {},
+                "earliestDateTime": None,
+                "slotSource": "calendar-day-block",
+                "closedDay": True,
+                "requestedWeekday": requested_weekday,
+                "openingDays": effective_opening_days,
+                "totalCandidates": len(candidate_slots),
+                "slots": [],
+                "totalAvailable": 0,
+            }
+
+        # Keep only timed events for per-slot checks
+        timed_cal_events = [ev for ev in all_day_cal_events if not ev.get("isAllDay")]
+        # Always fetch DB bookings — needed for capacity counting
+        day_bookings = _list_day_bookings(business["id"], date)
+    else:
+        timed_cal_events = []
+        day_bookings = _list_day_bookings(business["id"], date)
+
     earliest_slot_dt = _resolve_earliest_slot_datetime(args, date)
     filtered_slots: list[str] = []
-    slot_remaining: dict[str, int] = {}  # remaining headcount per available slot
+    slot_remaining: dict[str, int] = {}
+
+    # Per-request LLM call cache keyed by frozenset of event summaries.
+    # This avoids calling the LLM twice for the same set of calendar events
+    # when multiple candidate slots share the same overlapping events.
+    _slot_llm_cache: dict[frozenset, dict] = {}
 
     for slot in candidate_slots:
         slot_start = _parse_slot_datetime(slot)
@@ -1761,42 +2429,76 @@ def get_available_slots_payload(args: dict[str, Any], call_info: dict) -> dict[s
             continue
         if earliest_slot_dt and slot_start < earliest_slot_dt:
             continue
-        
-        # Sum partySize of existing non-cancelled bookings that overlap this slot (Firestore)
-        booked_headcount = sum(
-            _get_party_size(booking)
-            for booking in day_bookings
-            if _slot_overlaps_booking(slot_start, duration, booking)
-        )
-        
-        # Check Google Calendar events - if any event overlaps, treat it as blocking
-        # For capacity=1, any overlapping event blocks the slot entirely
-        # For capacity>1, treat each calendar event as 1 person (conservative approach)
-        calendar_conflicts = sum(
-            1 for event in calendar_events
-            if _calendar_event_overlaps_slot(slot_start, duration, event)
-        )
-        
-        # If capacity is 1 and there's ANY calendar conflict, block the slot
-        if capacity_per_hour == 1 and calendar_conflicts > 0:
-            continue
-        
-        # For higher capacity, add calendar conflicts to the headcount
-        total_headcount = booked_headcount + calendar_conflicts
-        remaining = capacity_per_hour - total_headcount
-        
-        # Slot is available only if the requested party can fit in remaining capacity
-        if total_headcount + requested_party <= capacity_per_hour:
+
+        if is_cal_connected:
+            # Get events that overlap this specific slot window
+            slot_events = [
+                ev for ev in timed_cal_events
+                if _calendar_event_overlaps_slot(slot_start, duration, ev)
+            ]
+
+            # ── Blocking check: regex fast-path → LLM fallback ─────────────
+            is_blocked, _, _ = _find_timed_blocking_event(slot_events)
+            slot_capacity: int | None = None
+
+            if not is_blocked and slot_events:
+                slot_summaries = [ev.get("summary", "").strip() for ev in slot_events if ev.get("summary", "").strip()]
+                if slot_summaries:
+                    cache_key = frozenset(slot_summaries)
+                    if cache_key not in _slot_llm_cache:
+                        _slot_llm_cache[cache_key] = _llm_interpret_calendar_events(slot_summaries)
+                    llm_r = _slot_llm_cache[cache_key]
+                    if llm_r.get("is_blocking"):
+                        is_blocked = True
+                    elif llm_r.get("capacity") is not None:
+                        slot_capacity = llm_r["capacity"]
+
+            if is_blocked:
+                continue
+
+            # ── Capacity check: regex fast-path → already set by LLM above ─
+            if slot_capacity is None:
+                for ev in slot_events:
+                    c = _parse_capacity_from_summary(ev.get("summary", ""), ev.get("description", ""))
+                    if c is not None:
+                        slot_capacity = c
+                        break
+
+            if slot_capacity is not None:
+                # Capacity-based check: count existing confirmed bookings (party-size aware)
+                reserved = sum(
+                    _get_party_size(b) for b in day_bookings
+                    if _slot_overlaps_booking(slot_start, duration, b)
+                    and (b.get("status") or "").lower() not in ("cancelled", "rejected")
+                )
+                remaining = slot_capacity - reserved
+            else:
+                # No capacity configured → slot is available (unlimited)
+                remaining = 999  # effectively unlimited; no restriction
+        else:
+            # No calendar — use DB booking count against configured capacity
+            slot_capacity = None
+            overlap_count = sum(
+                1 for b in day_bookings
+                if _slot_overlaps_booking(slot_start, duration, b)
+            )
+            remaining = parallel_capacity - overlap_count
+
+        if remaining > 0:
+            # Filter out slots where requested party exceeds remaining capacity
+            if slot_capacity is not None if is_cal_connected else True:
+                if is_cal_connected and slot_capacity is not None and remaining < requested_party:
+                    continue  # Not enough capacity for this group
             iso = slot_start.isoformat()
             filtered_slots.append(iso)
-            slot_remaining[iso] = remaining
+            slot_remaining[iso] = min(remaining, 999)  # cap display value
 
     return {
         "businessId": business["id"],
         "date": date,
         "durationMinutes": duration,
         "partySize": requested_party,
-        "capacity": capacity_per_hour,
+        "capacity": parallel_capacity,
         "slotRemaining": slot_remaining,
         "earliestDateTime": earliest_slot_dt.isoformat() if earliest_slot_dt else None,
         "slotSource": slot_source,
@@ -1820,6 +2522,11 @@ def tool_get_available_slots(args: dict[str, Any], call_info: dict) -> str:
     show_remaining = capacity > 1  # Only annotate when venue has multi-person capacity
 
     if payload.get("closedDay"):
+        if payload.get("slotSource") == "calendar-day-block":
+            return _ok(
+                "The business is unavailable for this full day due to a calendar block. "
+                "Please ask the customer to choose a different date."
+            )
         weekday = payload.get("requestedWeekday", date)
         open_days = payload.get("openingDays", [])
         open_days_str = ", ".join(open_days) if open_days else "their regular business days"

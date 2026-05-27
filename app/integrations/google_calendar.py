@@ -134,6 +134,9 @@ class GoogleCalendarClient:
         start_dt: datetime,
         duration_minutes: int = 60,
         notes: str = "",
+        booking_id: str = "",
+        party_size: int = 1,
+        business_name: str = "",
         timezone: str = "Europe/Lisbon",
         calendar_id: str = None,
         refresh_token: str | None = None,
@@ -158,14 +161,26 @@ class GoogleCalendarClient:
                 start_dt = tz.localize(start_dt)
                 end_dt = tz.localize(end_dt)
 
+            title_party = f" - Party of {party_size}" if int(party_size or 1) > 1 else ""
+            event_title = (
+                f"Reservation - {customer_name}{title_party}"
+                if customer_name else f"Reservation{title_party} - {service_name}"
+            )
+
+            details = [
+                f"Booking ID: {booking_id}" if booking_id else None,
+                f"Customer: {customer_name}" if customer_name else None,
+                f"Phone: {customer_phone}" if customer_phone else None,
+                f"Service: {service_name}" if service_name else None,
+                f"Party Size: {int(party_size or 1)}",
+                f"Duration: {duration_minutes}min",
+                f"Business: {business_name}" if business_name else None,
+                f"Notes: {notes}" if notes else None,
+            ]
+
             event_body = {
-                "summary": f"{service_name} — {customer_name}",
-                "description": (
-                    f"Customer: {customer_name}\n"
-                    f"Phone: {customer_phone}\n"
-                    f"Service: {service_name}\n"
-                    + (f"Notes: {notes}" if notes else "")
-                ),
+                "summary": event_title,
+                "description": "\n".join(x for x in details if x),
                 "start": {
                     "dateTime": start_dt.isoformat(),
                     "timeZone": timezone,
@@ -365,6 +380,159 @@ class GoogleCalendarClient:
         except HttpError as e:
             logger.error("[GoogleCalendar] get_free_slots error: %s", e)
             return []
+
+    def get_events_in_window(
+        self,
+        refresh_token: str,
+        start_dt: datetime,
+        end_dt: datetime,
+        calendar_id: str = "primary",
+    ) -> list[dict] | None:
+        """Return all calendar events that overlap the [start_dt, end_dt] window.
+
+        ANY event on the owner's calendar is treated as a busy/blocked slot,
+        regardless of the event title or source.  This is the freebusy-based
+        availability check: if an event exists in the window, the slot is occupied.
+
+        Args:
+            refresh_token: Owner's OAuth refresh token.
+            start_dt: Window start (timezone-aware preferred; naive treated as UTC).
+            end_dt: Window end.
+            calendar_id: Calendar to query (default "primary").
+
+        Returns:
+            List of event dicts on success, or ``None`` when Calendar API access fails.
+            Event dict keys include:
+              - start / end (ISO string dateTime when timed)
+              - startDate / endDate (YYYY-MM-DD when all-day)
+              - summary (str)
+              - isAllDay (bool)
+        """
+        if not refresh_token:
+            return []
+        try:
+            service = self._get_service(refresh_token=refresh_token)
+            if not service:
+                return None
+
+            # Ensure timezone-aware ISO strings for the API
+            if start_dt.tzinfo is None:
+                import pytz as _pytz
+                start_dt = _pytz.utc.localize(start_dt)
+            if end_dt.tzinfo is None:
+                import pytz as _pytz
+                end_dt = _pytz.utc.localize(end_dt)
+
+            events_result = service.events().list(
+                calendarId=calendar_id,
+                timeMin=start_dt.isoformat(),
+                timeMax=end_dt.isoformat(),
+                singleEvents=True,
+                orderBy="startTime",
+            ).execute()
+
+            result = []
+            for ev in events_result.get("items", []):
+                start_val = ev.get("start", {})
+                end_val = ev.get("end", {})
+                start_str = start_val.get("dateTime")
+                end_str = end_val.get("dateTime")
+                start_date = start_val.get("date")
+                end_date = end_val.get("date")
+
+                # Ignore events that should not block availability.
+                status = (ev.get("status") or "").lower()
+                if status == "cancelled":
+                    logger.info(
+                        "[Calendar-DayBlock] Ignored event id=%s reason=cancelled",
+                        ev.get("id", "?"),
+                    )
+                    continue
+
+                start_val = ev.get("start", {})
+                end_val = ev.get("end", {})
+
+                start_str = start_val.get("dateTime")
+                end_str = end_val.get("dateTime")
+
+                start_date = start_val.get("date")
+                end_date = end_val.get("date")
+
+                is_all_day = bool(start_date and end_date)
+
+                # Ignore events that should not block availability.
+                status = (ev.get("status") or "").lower()
+                if status == "cancelled":
+                    logger.info(
+                        "[Calendar-DayBlock] Ignored event id=%s reason=cancelled",
+                        ev.get("id", "?"),
+                    )
+                    continue
+
+                transparency = (ev.get("transparency") or "").lower()
+
+                # IMPORTANT:
+                # Ignore transparent events ONLY for timed events.
+                # All-day owner events should still block the date.
+                if transparency == "transparent" and not is_all_day:
+                    logger.info(
+                        "[Calendar-DayBlock] Ignored timed event id=%s reason=transparent/free",
+                        ev.get("id", "?"),
+                    )
+                    continue
+
+                attendees = ev.get("attendees") or []
+                self_attendee = next((a for a in attendees if a.get("self")), None)
+                if (self_attendee or {}).get("responseStatus") == "declined":
+                    logger.info(
+                        "[Calendar-DayBlock] Ignored event id=%s reason=self-declined",
+                        ev.get("id", "?"),
+                    )
+                    continue
+
+                # Ignore subscribed/public holiday feeds so they don't accidentally
+                # block business availability.
+                organizer_email = str((ev.get("organizer") or {}).get("email") or "").lower()
+                creator_email = str((ev.get("creator") or {}).get("email") or "").lower()
+                if (
+                    "group.v.calendar.google.com" in organizer_email
+                    or "group.v.calendar.google.com" in creator_email
+                ):
+                    logger.info(
+                        "[Calendar-DayBlock] Ignored public holiday calendar event: %s",
+                        ev.get("summary", "(no title)"),
+                    )
+                    continue
+
+                if start_str and end_str:
+                    result.append({
+                        "start": start_str,
+                        "end": end_str,
+                        "summary": ev.get("summary", ""),
+                        "isAllDay": False,
+                    })
+                    continue
+
+                if start_date and end_date:
+                    result.append({
+                        "startDate": start_date,
+                        "endDate": end_date,
+                        "summary": ev.get("summary", ""),
+                        "isAllDay": True,
+                    })
+
+            logger.debug(
+                "[GoogleCalendar] get_events_in_window: %d event(s) in [%s, %s]",
+                len(result), start_dt.isoformat(), end_dt.isoformat(),
+            )
+            return result
+
+        except HttpError as e:
+            logger.error("[GoogleCalendar] get_events_in_window error: %s", e)
+            return None
+        except Exception as exc:
+            logger.error("[GoogleCalendar] get_events_in_window unexpected error: %s", exc)
+            return None
 
 
 google_calendar = GoogleCalendarClient()
