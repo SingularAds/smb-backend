@@ -945,6 +945,33 @@ def _language_key_from_text(text: str, fallback: str = "en") -> str:
     return (fallback or "en")[:2].lower()
 
 
+def _detect_msg_language(text: str) -> str:
+    """Detect language from message text.
+
+    Uses script-pattern matching for non-Latin scripts first (Arabic, Hindi,
+    CJK, etc.) and then ``langdetect`` for Latin-script languages (Portuguese,
+    Spanish, French, etc.).  Returns a 2-letter ISO code, or an empty string
+    when detection fails or the text is too short to be reliable.
+    """
+    if not text or not text.strip():
+        return ""
+    # Non-Latin script fast-path (no external library needed)
+    for lang_code, pattern in _LANG_SCRIPT_PATTERNS.items():
+        if pattern.search(text):
+            return lang_code
+    # Latin-script fallback: use langdetect
+    stripped = text.strip()
+    if len(stripped) >= 3:
+        try:
+            from langdetect import detect as _ld  # type: ignore[import]
+            result = _ld(stripped)
+            if result:
+                return result[:2].lower()
+        except Exception:
+            pass
+    return ""
+
+
 def _last_user_message(history: list[dict]) -> str:
     for msg in reversed(history or []):
         if msg.get("role") == "user":
@@ -1860,7 +1887,11 @@ class OnboardingService:
     async def _start_new(
         self, phone: str, body: str, push_name: str, message_id: str
     ) -> None:
-        lang = self.ai.detect_language(phone)
+        # Detect language from message content first (handles cases where the
+        # phone-number prefix doesn't match the user's actual language, e.g.
+        # a Portuguese speaker on an Indian number).
+        _msg_lang = _detect_msg_language(body)
+        lang = _msg_lang or self.ai.detect_language(phone)
         now = datetime.utcnow().isoformat()
 
         # Build initial conversation with the user's first message
@@ -6036,8 +6067,28 @@ class OnboardingService:
                 user_message = _last_user_message(history)
                 language_hint = session.get("language", "en") if session else "en"
                 target_lang = _language_key_from_text(user_message, language_hint)
+                # For Latin-script languages (Portuguese, Spanish, French, etc.),
+                # _language_key_from_text returns "en" when language_hint is "en"
+                # because it only detects non-Latin scripts via regex.  Use
+                # langdetect as a fallback to identify the actual language.
+                if target_lang == "en" and user_message:
+                    _dml = _detect_msg_language(user_message)
+                    if _dml and _dml != "en":
+                        target_lang = _dml
+                        # Persist the detected language so subsequent template
+                        # messages in this session are translated without
+                        # re-running langdetect every time.
+                        if session and session.get("language", "en") == "en":
+                            try:
+                                db.upsert_onboarding_session(
+                                    phone, {"language": target_lang}
+                                )
+                            except Exception:
+                                pass
                 if target_lang != "en" and _looks_like_english(message):
-                    message = await self._localize_static(message, user_message, language_hint)
+                    message = await self._localize_static(
+                        message, user_message, target_lang
+                    )
             try:
                 logger.debug("Onboarding AI -> %s: %s", phone, message)
             except Exception:
