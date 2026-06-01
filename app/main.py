@@ -87,6 +87,13 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan events"""
     init_firebase()
+    # Seed Global Recepte KB in Firestore if it doesn't exist yet.
+    try:
+        from app.services.global_kb import seed_global_kb
+        seed_global_kb()
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Global KB seeding failed: %s", exc)
     start_scheduler()
     yield
     stop_scheduler()
@@ -167,6 +174,29 @@ app.include_router(calendar.router, prefix="/auth/google", tags=["Calendar-OAuth
 app.include_router(recepte.router, prefix="/api/v1/recepte", tags=["Recepte"])
 # Booking reminders cron endpoint
 app.include_router(reminders.router, prefix="/api/v1/reminders", tags=["Reminders"])
+
+
+# ── Legacy billing redirect URLs (old Stripe sessions used /billing/*) ──
+
+@app.get("/billing/success")
+async def billing_success_legacy(
+    biz: str = "",
+    plan: str = "",
+):
+    """Redirect old Stripe success URLs to the canonical billing success page."""
+    from fastapi.responses import RedirectResponse
+    from urllib.parse import urlencode
+
+    q = urlencode({k: v for k, v in {"biz": biz, "plan": plan}.items() if v})
+    target = f"/api/v1/billing/success?{q}" if q else "/api/v1/billing/success"
+    return RedirectResponse(url=target, status_code=302)
+
+
+@app.get("/billing/cancel")
+async def billing_cancel_legacy():
+    from fastapi.responses import RedirectResponse
+
+    return RedirectResponse(url="/api/v1/billing/cancel", status_code=302)
 
 
 # ── Root Endpoint ──

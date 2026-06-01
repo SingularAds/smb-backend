@@ -45,7 +45,11 @@ async def stripe_webhook(
 
     event = verify_webhook(payload, stripe_signature)
     if event is None:
-        logger.warning("[STRIPE] Webhook signature verification failed")
+        logger.warning(
+            "[STRIPE] Webhook signature verification failed — check STRIPE_WEBHOOK_SECRET "
+            "matches the signing secret for endpoint POST /webhooks/stripe "
+            "(Stripe CLI: use the whsec_... from `stripe listen`, not the Dashboard secret)"
+        )
         return Response(
             content='{"error":"Invalid signature"}',
             status_code=400,
@@ -74,33 +78,26 @@ async def stripe_webhook(
     return {"received": True, "result": result}
 
 
-async def _notify_owner_plan_activated(event: dict) -> None:
-    """Send the business owner a WhatsApp payment-success confirmation.
-
-    Called as a fire-and-forget task after checkout.session.completed is
-    processed.  Failures are logged but never raise so they cannot affect the
-    Stripe webhook acknowledgement.
-    """
+async def notify_owner_plan_activated_for_business(
+    business_id: str, plan: str = "starter"
+) -> None:
+    """Send the owner a WhatsApp payment-success confirmation."""
     try:
         import app.firestore as db
         from app.services.automation.whatsapp_notifier import send_to_owner
 
-        session: dict = (event.get("data") or {}).get("object") or {}
-        meta: dict = session.get("metadata") or {}
-        business_id: str = meta.get("businessId") or ""
-        plan: str = meta.get("plan") or "starter"
-
         if not business_id:
-            logger.warning("[STRIPE] _notify_owner_plan_activated: no businessId in metadata")
             return
 
         business = db.get_business_by_id(business_id)
         if not business:
-            logger.warning("[STRIPE] _notify_owner_plan_activated: business %s not found", business_id)
+            logger.warning(
+                "[STRIPE] notify_owner: business %s not found", business_id
+            )
             return
 
         biz_name = business.get("name") or "your business"
-        plan_label = plan.title()
+        plan_label = (plan or business.get("plan") or "starter").title()
 
         msg = (
             f"✅ *Payment confirmed — {biz_name}*\n\n"
@@ -114,13 +111,22 @@ async def _notify_owner_plan_activated(event: dict) -> None:
         if sent:
             logger.info(
                 "[STRIPE] Payment confirmation WhatsApp sent to owner of business=%s plan=%s",
-                business_id, plan,
+                business_id, plan_label,
             )
         else:
             logger.warning(
-                "[STRIPE] Payment confirmation WhatsApp NOT sent for business=%s — no ownerPhone?",
+                "[STRIPE] Payment confirmation WhatsApp NOT sent for business=%s",
                 business_id,
             )
     except Exception as exc:
-        logger.exception("[STRIPE] _notify_owner_plan_activated failed: %s", exc)
+        logger.exception("[STRIPE] notify_owner_plan_activated failed: %s", exc)
+
+
+async def _notify_owner_plan_activated(event: dict) -> None:
+    """Webhook path — extract business id from checkout session event."""
+    session: dict = (event.get("data") or {}).get("object") or {}
+    meta: dict = session.get("metadata") or {}
+    business_id: str = meta.get("businessId") or ""
+    plan: str = meta.get("plan") or "starter"
+    await notify_owner_plan_activated_for_business(business_id, plan)
 

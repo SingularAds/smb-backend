@@ -216,27 +216,73 @@ def create_billing_portal_session(business: dict, return_url: str) -> str | None
 
 # ── Webhook handling ──────────────────────────────────────────────────────────
 
+def _webhook_secrets() -> list[str]:
+    """Return one or more signing secrets (comma-separated in env)."""
+    raw = (settings.STRIPE_WEBHOOK_SECRET or "").strip()
+    if not raw:
+        return []
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
 def verify_webhook(payload: bytes, signature: str) -> dict | None:
     """Verify the Stripe webhook signature and parse the event.
 
     Returns the parsed event dict on success, or None on failure.
     Never raises — invalid webhooks are silently rejected here and the
     caller returns HTTP 400.
+
+    Supports multiple secrets in STRIPE_WEBHOOK_SECRET (comma-separated), e.g.
+    Dashboard production secret + Stripe CLI ``stripe listen`` secret.
     """
-    if not _stripe_configured or not settings.STRIPE_WEBHOOK_SECRET:
+    secrets = _webhook_secrets()
+    if not _stripe_configured or not secrets:
         logger.warning("[STRIPE] Webhook secret not configured — rejecting webhook")
         return None
+    last_err: Exception | None = None
+    for secret in secrets:
+        try:
+            event = stripe.Webhook.construct_event(payload, signature, secret)
+            return dict(event)
+        except stripe.error.SignatureVerificationError as exc:
+            last_err = exc
+            continue
+        except Exception as exc:
+            logger.error("[STRIPE] Webhook parse error: %s", exc)
+            return None
+    logger.warning("[STRIPE] Webhook signature verification failed: %s", last_err)
+    return None
+
+
+def sync_checkout_session(session_id: str) -> str:
+    """Activate subscription from a completed Checkout Session (webhook fallback).
+
+    Called from the billing success page when Stripe redirects after payment.
+    Idempotent — safe if the webhook already updated the business doc.
+    """
+    if not _stripe_configured or not session_id:
+        return "stripe_not_configured"
+
+    import app.firestore as db  # deferred
+
     try:
-        event = stripe.Webhook.construct_event(
-            payload, signature, settings.STRIPE_WEBHOOK_SECRET
+        session = stripe.checkout.Session.retrieve(session_id)
+    except stripe.StripeError as exc:
+        logger.error("[STRIPE] Could not retrieve session %s: %s", session_id, exc)
+        return "retrieve_failed"
+
+    payment_status = getattr(session, "payment_status", None) or ""
+    status = getattr(session, "status", None) or ""
+    if payment_status != "paid":
+        logger.info(
+            "[STRIPE] sync_checkout_session %s payment_status=%s — not activating",
+            session_id, payment_status,
         )
-        return dict(event)
-    except stripe.error.SignatureVerificationError as exc:
-        logger.warning("[STRIPE] Webhook signature verification failed: %s", exc)
-        return None
-    except Exception as exc:
-        logger.error("[STRIPE] Webhook parse error: %s", exc)
-        return None
+        return f"unpaid:{payment_status}"
+
+    session_dict = session.to_dict() if hasattr(session, "to_dict") else dict(session)
+    result = _on_checkout_completed(session_dict, db)
+    logger.info("[STRIPE] sync_checkout_session %s → %s", session_id, result)
+    return result
 
 
 def handle_webhook_event(event: dict) -> str:
@@ -297,23 +343,58 @@ def _on_checkout_completed(session: dict, db) -> str:
     if not business:
         return "business_not_found"
 
+    import datetime as _dt
+
     business_id: str = business["id"]
     plan: str = (session.get("metadata") or {}).get("plan") or "starter"
     stripe_customer_id: str | None = session.get("customer")
     stripe_subscription_id: str | None = session.get("subscription")
 
+    now_utc = _dt.datetime.now(tz=_dt.timezone.utc)
+
+    # ── Plan stacking: carry over unused days from any existing active period ─
+    # If the business has an active trial or paid period with days remaining,
+    # those days are added to the new 30-day subscription period.
+    carryover_days = 0
+    for date_field in ("planExpiresAt", "subscriptionRenewalDate"):
+        existing_raw = business.get(date_field, "")
+        if not existing_raw:
+            continue
+        try:
+            existing_dt = _dt.datetime.fromisoformat(
+                str(existing_raw).replace("Z", "+00:00")
+            )
+            if existing_dt.tzinfo is None:
+                existing_dt = existing_dt.replace(tzinfo=_dt.timezone.utc)
+            if existing_dt > now_utc:
+                days_left = (existing_dt - now_utc).days
+                carryover_days = max(carryover_days, days_left)
+                break  # found a future date — no need to check further fields
+        except (ValueError, TypeError):
+            pass
+
+    # Provisional expiry = 30 days from now + any carried-over days.
+    # This is updated to the accurate Stripe value when
+    # customer.subscription.created/updated fires shortly after.
+    plan_expires_at = now_utc + _dt.timedelta(days=30 + carryover_days)
+
     updates: dict = {
-        "plan":                 plan,
-        "billingStatus":        "active",
-        "stripeSubscriptionId": stripe_subscription_id,
+        "plan":                    plan,
+        "billingStatus":           "active",
+        "stripeSubscriptionId":    stripe_subscription_id,
+        # Provisional dates — overwritten by _on_subscription_updated
+        "subscriptionRenewalDate": plan_expires_at.isoformat(),
+        "planExpiresAt":           plan_expires_at.isoformat(),
     }
+    if carryover_days:
+        updates["subscriptionCarryoverDays"] = carryover_days
     if stripe_customer_id and not business.get("stripeCustomerId"):
         updates["stripeCustomerId"] = stripe_customer_id
 
     db.update_business_doc(business_id, updates)
     logger.info(
-        "[STRIPE] checkout.session.completed → business=%s plan=%s subscription=%s",
-        business_id, plan, stripe_subscription_id,
+        "[STRIPE] checkout.session.completed → business=%s plan=%s subscription=%s carryover_days=%d",
+        business_id, plan, stripe_subscription_id, carryover_days,
     )
     return "activated"
 
@@ -355,6 +436,15 @@ def _on_subscription_updated(sub: dict, db) -> str:
                 int(period_end_ts), tz=_dt.timezone.utc
             )
             updates["subscriptionRenewalDate"] = renewal_dt.isoformat()
+
+            # planExpiresAt = Stripe renewal date + any carryover bonus days
+            # (set by _on_checkout_completed when days were stacked from a prior period)
+            carryover = int(business.get("subscriptionCarryoverDays") or 0)
+            effective_expiry = renewal_dt + _dt.timedelta(days=carryover)
+            updates["planExpiresAt"] = effective_expiry.isoformat()
+            if carryover:
+                # Clear once applied so it doesn't compound on the next renewal
+                updates["subscriptionCarryoverDays"] = 0
         except (TypeError, ValueError, OSError):
             pass
 

@@ -1150,3 +1150,29 @@ def get_website_lead_by_phone(phone: str) -> dict | None:
     print(f"[LEAD-LOOKUP] No lead found for phone={phone_clean}")
     logger.info("[LEAD-LOOKUP] No lead found for %s", phone_clean)
     return None
+
+
+# -- Global KB (system/recepte_kb) --------------------------------------------
+
+def get_global_kb() -> dict | None:
+    """Return the Global Recepte KB document from Firestore.
+
+    Stored at `system/recepte_kb` as `{content: "...", updatedAt: "..."}`.
+    Returns None when the document does not exist.
+    """
+    doc = _db().collection("system").document("recepte_kb").get()
+    if not doc.exists:
+        return None
+    return doc.to_dict()
+
+
+def set_global_kb(content: str) -> None:
+    """Write or overwrite the Global KB document in Firestore.
+
+    Args:
+        content: Plain-text KB content to store.
+    """
+    _db().collection("system").document("recepte_kb").set({
+        "content": content,
+        "updatedAt": _now_iso(),
+    })

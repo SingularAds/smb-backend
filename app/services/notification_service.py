@@ -198,6 +198,18 @@ class NotificationService:
                 f"📅 {service_name} on {booking_datetime}\n"
                 f"Merci!"
             ),
+            "de": (
+                f"✅ Ihre Buchung ist bestätigt!\n"
+                f"📍 {business_name}\n"
+                f"📅 {service_name} am {booking_datetime}\n"
+                f"Vielen Dank!"
+            ),
+            "it": (
+                f"✅ La tua prenotazione è confermata!\n"
+                f"📍 {business_name}\n"
+                f"📅 {service_name} il {booking_datetime}\n"
+                f"Grazie!"
+            ),
             "en": (
                 f"✅ Your booking is confirmed!\n"
                 f"📍 {business_name}\n"
@@ -219,6 +231,26 @@ class NotificationService:
                 f"Olá {customer_name},\n"
                 f"Recebemos o seu feedback e vamos analisá-lo.\n"
                 f"Obrigado por nos contactar — {business_name}"
+            ),
+            "es": (
+                f"Hola {customer_name},\n"
+                f"Hemos recibido tu comentario y lo analizaremos.\n"
+                f"Gracias por contactarnos — {business_name}"
+            ),
+            "fr": (
+                f"Bonjour {customer_name},\n"
+                f"Nous avons bien reçu votre avis et allons l'examiner.\n"
+                f"Merci de nous avoir contactés — {business_name}"
+            ),
+            "de": (
+                f"Hallo {customer_name},\n"
+                f"Wir haben Ihr Feedback erhalten und werden es prüfen.\n"
+                f"Vielen Dank — {business_name}"
+            ),
+            "it": (
+                f"Ciao {customer_name},\n"
+                f"Abbiamo ricevuto il tuo feedback e lo esamineremo.\n"
+                f"Grazie per averci contattato — {business_name}"
             ),
             "en": (
                 f"Hi {customer_name},\n"
@@ -270,6 +302,24 @@ class NotificationService:
                 f"📅 {service_name} on {new_datetime}\n"
                 f"¡Gracias!"
             ),
+            "fr": (
+                f"🔁 Votre rendez-vous a été reprogrammé !\n"
+                f"📍 {business_name}\n"
+                f"📅 {service_name} le {new_datetime}\n"
+                f"Merci!"
+            ),
+            "de": (
+                f"🔁 Ihr Termin wurde umgebucht!\n"
+                f"📍 {business_name}\n"
+                f"📅 {service_name} am {new_datetime}\n"
+                f"Vielen Dank!"
+            ),
+            "it": (
+                f"🔁 Il tuo appuntamento è stato riprogrammato!\n"
+                f"📍 {business_name}\n"
+                f"📅 {service_name} il {new_datetime}\n"
+                f"Grazie!"
+            ),
             "en": (
                 f"🔁 Your appointment was rescheduled!\n"
                 f"📍 {business_name}\n"
@@ -317,6 +367,24 @@ class NotificationService:
                 f"📍 {business_name}\n"
                 f"📅 {service_name} on {booking_datetime}\n"
                 f"¡Si cambias de opinión, contáctanos!"
+            ),
+            "fr": (
+                f"❌ Votre rendez-vous a été annulé\n"
+                f"📍 {business_name}\n"
+                f"📅 {service_name} le {booking_datetime}\n"
+                f"N'hésitez pas à réserver à nouveau !"
+            ),
+            "de": (
+                f"❌ Ihr Termin wurde storniert\n"
+                f"📍 {business_name}\n"
+                f"📅 {service_name} am {booking_datetime}\n"
+                f"Sie können jederzeit neu buchen!"
+            ),
+            "it": (
+                f"❌ Il tuo appuntamento è stato cancellato\n"
+                f"📍 {business_name}\n"
+                f"📅 {service_name} il {booking_datetime}\n"
+                f"Puoi riprenotare in qualsiasi momento!"
             ),
             "en": (
                 f"❌ Your appointment was cancelled\n"
@@ -390,68 +458,30 @@ class NotificationService:
 
         days_until: 0 = today, 1 = tomorrow, 2 = in 2 days, 3 = in 3 days
         """
+        from app.services.i18n import t as _t
         svc_emoji = self._service_emoji(business_type, business_name)
+        lang2 = (language or "en")[:2].lower()
+
         if days_until == 0:
-            timing = {
-                "en": "is TODAY",
-                "pt": "é HOJE",
-                "es": "es HOY",
-                "fr": "est AUJOURD'HUI",
-            }
+            timing = _t("reminder_today", lang2)
             emoji = "🌟"
         elif days_until == 1:
-            timing = {
-                "en": "is TOMORROW",
-                "pt": "é AMANHÃ",
-                "es": "es MAÑANA",
-                "fr": "est DEMAIN",
-            }
+            timing = _t("reminder_tomorrow", lang2)
             emoji = "⏰"
         else:
-            timing = {
-                "en": f"is in {days_until} days",
-                "pt": f"é em {days_until} dias",
-                "es": f"es en {days_until} días",
-                "fr": f"est dans {days_until} jours",
-            }
+            timing = _t("reminder_in_days", lang2, n=days_until)
             emoji = "📅"
 
-        lang = language if language in timing else "en"
-        msgs = {
-            "pt": (
-                f"{emoji} Olá {customer_name}! Lembrete amigável:\n"
-                f"A sua marcação {timing[lang]}!\n"
-                f"📍 {business_name}\n"
-                f"{svc_emoji} {service_name}\n"
-                f"🕐 {booking_datetime}\n"
-                f"Esperamos vê-lo(a) em breve! 😊"
-            ),
-            "es": (
-                f"{emoji} ¡Hola {customer_name}! Recordatorio amistoso:\n"
-                f"¡Tu cita {timing[lang]}!\n"
-                f"📍 {business_name}\n"
-                f"{svc_emoji} {service_name}\n"
-                f"🕐 {booking_datetime}\n"
-                f"¡Nos vemos pronto! 😊"
-            ),
-            "fr": (
-                f"{emoji} Bonjour {customer_name}! Petit rappel :\n"
-                f"Votre rendez-vous {timing[lang]} !\n"
-                f"📍 {business_name}\n"
-                f"{svc_emoji} {service_name}\n"
-                f"🕐 {booking_datetime}\n"
-                f"À très bientôt ! 😊"
-            ),
-            "en": (
-                f"{emoji} Hey {customer_name}! Friendly reminder:\n"
-                f"Your appointment {timing[lang]}!\n"
-                f"📍 {business_name}\n"
-                f"{svc_emoji} {service_name}\n"
-                f"🕐 {booking_datetime}\n"
-                f"See you soon! 😊"
-            ),
-        }
-        body = msgs.get(lang, msgs["en"]) + self._wa_footer(business_phone)
+        body = _t(
+            "reminder_body", lang2,
+            emoji=emoji,
+            name=customer_name,
+            timing=timing,
+            biz=business_name,
+            svc_emoji=svc_emoji,
+            service=service_name,
+            dt=booking_datetime,
+        ) + self._wa_footer(business_phone)
         return self._send(customer_phone, body)
 
 

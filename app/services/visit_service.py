@@ -55,6 +55,7 @@ from datetime import datetime, timezone, timedelta
 from app import firestore as db
 from app.services.automation.whatsapp_notifier import send_to_customer
 from app.services.referral_service import on_booking_completed
+from app.services.i18n import t, get_customer_language
 
 logger = logging.getLogger(__name__)
 
@@ -210,13 +211,12 @@ async def _handle_yes(
     customer_name = booking.get("customerName") or "there"
     service = booking.get("serviceName") or "your visit"
     biz_name = business.get("name", "us")
+    lang = get_customer_language(business_id, customer_phone)
 
     await send_to_customer(
         business,
         customer_phone,
-        f"✅ *Thank you, {customer_name}!*\n\n"
-        f"So glad you came in for *{service}* at *{biz_name}*! "
-        f"We hope to see you again soon. 😊",
+        t("visit_thanks", lang, name=customer_name, service=service, biz=biz_name),
     )
 
 
@@ -244,12 +244,10 @@ async def _handle_no(
     customer_name = booking.get("customerName") or "there"
     service = booking.get("serviceName") or "your appointment"
     biz_name = business.get("name", "us")
+    lang = get_customer_language(business_id, customer_phone)
 
     await send_to_customer(
         business,
         customer_phone,
-        f"👋 *No worries, {customer_name}!*\n\n"
-        f"Thanks for letting us know. We'd love to have you visit *{biz_name}* "
-        f"for *{service}* soon!\n\n"
-        f"Would you like to reschedule? Just tell us a date and time that works for you. 📅",
+        t("visit_noshow", lang, name=customer_name, service=service, biz=biz_name),
     )

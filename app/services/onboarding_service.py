@@ -31,6 +31,23 @@ from app.config import settings
 from app import firestore as db
 from app.services.whatsmeow_client import PairingStateConflict, WhatsmeowClient
 from app.services.ai_service import AIService
+from app.services.onboarding_plan_info import (
+    build_plan_info_for_tool,
+    classify_billing_message,
+    format_checkout_link_message,
+    format_checkout_link_prompt,
+    format_current_plan_status_reply,
+    format_payment_confirmed_reply,
+    format_payment_pending_reply,
+    format_plan_pricing_reply,
+    format_plan_pricing_reply_for_phone,
+    has_pending_checkout,
+    has_plan_catalog_inquiry,
+    has_plan_pricing_intent,
+    is_payment_confirmation_attempt,
+    is_subscription_paid_in_db,
+    parse_plan_selection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +344,44 @@ When an owner writes something like "my WhatsApp disconnected" or "reconnect my 
   • If the device was force-logged-out by WhatsApp → the system sends a fresh pairing code.
   • Either way, you simply acknowledge the request and assure them it's being handled.
 - Always respond with warmth: "Sure! Let me reconnect your WhatsApp device…" and let the system handle the rest.
+
+HANDLING DEMO REQUESTS DURING ONBOARDING:
+When the owner asks for a demo ("show me how it works", "I want to see a demo", etc.):
+- The system will automatically pause onboarding and switch to demo mode.
+- Run the booking demo as described in the DEMO sales phase.
+- After the demo ends, the system will restore the onboarding state automatically.
+- You will receive a context note saying "The booking demo just ended. Resume the onboarding."
+- At that point: briefly acknowledge the demo, then continue asking for any missing business details.
+- Do NOT restart from the beginning — pick up exactly where you left off.
+- Do NOT mention pricing or subscriptions when resuming onboarding.
+
+HANDLING CONVERSATIONAL / INTENT MESSAGES:
+When the owner's first message is conversational ("I came through ads", "I heard about you",
+"I'm interested", etc.) instead of business data:
+- Respond warmly and naturally — do NOT treat this as a business name or run a Places search.
+- Proceed with the normal onboarding flow: ask for their website, Maps link, or Instagram.
+- Mandatory fields (name, type, address, hours) must still be collected — they cannot be skipped.
+
+GENERAL PRODUCT & PRICING QUESTIONS (use the Global Knowledge Base below):
+A Knowledge Base section may appear below containing information about what Recepte is,
+its features, plans, pricing, and the free trial.  Use it to answer any general questions.
+
+DIFFERENTIATE these two situations:
+1. Owner is EXPLORING (asking before onboarding is complete):
+   - Give a helpful overview from the KB: describe the platform, mention the free trial,
+     and give APPROXIMATE pricing (e.g. "plans start from €9/month, up to €29/month").
+   - DO NOT show the full feature-by-feature catalog yet — just a friendly summary.
+   - Say something like "I'll show you exact pricing once you've finished setup and can
+     try everything free for 7 days first!"
+   - This keeps the onboarding moving while still being genuinely helpful.
+
+2. Owner is ALREADY ONBOARDED (has an active plan and asks about pricing or billing):
+   - Use the `get_plan_info` tool (if available) or the information in the context to
+     show their exact current plan, price, and renewal date.
+   - Show the exact plan catalog when they ask about upgrading or switching.
+
+NEVER refuse a general question by saying "I can't discuss pricing during onboarding."
+ALWAYS answer general questions warmly and naturally using the KB context.
 """
 
 # Separate prompt for generating the business JSON after confirmation
@@ -867,6 +922,94 @@ def _t(key: str, lang: str) -> str:
     return bucket.get(lang2) or bucket.get("en") or key
 
 
+_LANG_SCRIPT_PATTERNS: dict[str, re.Pattern] = {
+    "el": re.compile(r"[\u0370-\u03FF\u1F00-\u1FFF]"),
+    "ru": re.compile(r"[\u0400-\u04FF]"),
+    "ar": re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]"),
+    "hi": re.compile(r"[\u0900-\u097F]"),
+    "he": re.compile(r"[\u0590-\u05FF]"),
+    "th": re.compile(r"[\u0E00-\u0E7F]"),
+    "ja": re.compile(r"[\u3040-\u30FF]"),
+    "zh": re.compile(r"[\u4E00-\u9FFF]"),
+    "ko": re.compile(r"[\uAC00-\uD7AF]"),
+}
+
+_STATIC_TRANSLATION_CACHE: dict[tuple[str, str], str] = {}
+
+
+def _language_key_from_text(text: str, fallback: str = "en") -> str:
+    if text:
+        for lang, pattern in _LANG_SCRIPT_PATTERNS.items():
+            if pattern.search(text):
+                return lang
+    return (fallback or "en")[:2].lower()
+
+
+def _last_user_message(history: list[dict]) -> str:
+    for msg in reversed(history or []):
+        if msg.get("role") == "user":
+            return str(msg.get("content") or "")
+    return ""
+
+
+_ENGLISH_HINT_WORDS: tuple[str, ...] = (
+    "please", "reply", "share", "link", "confirm", "confirming", "save",
+    "business", "name", "hours", "open", "days", "calendar", "pairing",
+    "code", "skip", "done", "now", "what", "your", "you", "would",
+    "should", "connect", "setup", "start", "continue", "next",
+)
+
+
+def _looks_like_english(text: str) -> bool:
+    if not text:
+        return False
+    cleaned = re.sub(r"[^A-Za-z ]", " ", text).lower()
+    padded = f" {cleaned} "
+    hits = 0
+    for word in _ENGLISH_HINT_WORDS:
+        if f" {word} " in padded:
+            hits += 1
+            if hits >= 2:
+                return True
+    return False
+
+
+_LINK_REQUEST_MESSAGES: dict[str, str] = {
+    "en": (
+        "Great — to start, please share your business website, Google Maps link, "
+        "or Instagram profile. If you don't have a link, just send your business "
+        "name and I'll search it for you."
+    ),
+    "pt": (
+        "Perfeito — para começar, partilha o site do teu negócio, um link do Google Maps "
+        "ou o teu Instagram. Se não tiveres link, diz-me só o nome do negócio e eu procuro por ti."
+    ),
+    "es": (
+        "Perfecto — para empezar, comparte el sitio web de tu negocio, un enlace de Google Maps "
+        "o tu Instagram. Si no tienes enlace, dime solo el nombre del negocio y lo busco por ti."
+    ),
+    "fr": (
+        "Parfait — pour commencer, partage le site de ton entreprise, un lien Google Maps "
+        "ou ton Instagram. Si tu n'as pas de lien, dis-moi simplement le nom de l'entreprise "
+        "et je le chercherai pour toi."
+    ),
+    "de": (
+        "Perfekt — zum Start bitte die Website deines Unternehmens, einen Google-Maps-Link "
+        "oder dein Instagram. Wenn du keinen Link hast, schick mir einfach den "
+        "Unternehmensnamen und ich suche ihn fuer dich."
+    ),
+    "it": (
+        "Perfetto — per iniziare, condividi il sito web della tua attivita, un link di Google Maps "
+        "o il tuo Instagram. Se non hai un link, dimmi solo il nome dell'attivita e lo cerco per te."
+    ),
+}
+
+
+def _link_request_message(lang: str) -> str:
+    lang2 = (lang or "en")[:2].lower()
+    return _LINK_REQUEST_MESSAGES.get(lang2, _LINK_REQUEST_MESSAGES["en"])
+
+
 def _infer_timezone_from_phone(phone: str) -> str:
     """Infer an IANA timezone from a phone number's country calling code.
 
@@ -903,8 +1046,14 @@ def _looks_like_business_name(text: str) -> bool:
         "what", "how", "why", "when", "where", "can ", "could",
         "do ", "does", "is ", "are ", "should", "will ", "i ", "my ",
         "we ", "they ", "it ", "the business", "our ", "this ",
+        # Additional starters to guard against ad/intent messages
+        "came ", "got ", "found ", "saw ", "heard ", "want ", "looking ",
+        "interested", "just ", "only ", "please ", "need ", "trying ",
     )
     if any(lower.startswith(s) for s in _sentence_starters):
+        return False
+    # Exclude messages that are clearly conversational noise (ad referrals, etc.)
+    if _is_conversational_noise(stripped):
         return False
     # Exclude URLs (handled separately)
     if "http" in lower or "www." in lower or ".com" in lower:
@@ -946,6 +1095,79 @@ def _extract_stated_business_name(text: str) -> str | None:
                     return stripped[idx: idx + len(name)]
                 return name
     return None
+
+
+# ---------------------------------------------------------------------------
+# Demo-request detection helpers
+# ---------------------------------------------------------------------------
+
+_DEMO_REQUEST_RE = re.compile(
+    r"\b("
+    r"demo|d[eé]mo"
+    r"|show\s+me"
+    r"|how\s+(?:does\s+)?(?:it\s+)?works?"
+    r"|como\s+funciona"
+    r"|try\s+(?:it\s+)?(?:out)?"
+    r"|see\s+(?:it\s+)?in\s+action"
+    r"|preview"
+    r"|test\s+(?:it|this|recepte)"
+    r"|quero\s+(?:ver|demo)"
+    r"|mostrar?\s+como"
+    r"|ver\s+(?:como|demo|um\s+exemplo)"
+    r"|probar|d[eé]monstr[ae]"
+    r"|quiero\s+ver"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_demo_request(text: str) -> bool:
+    """Return True when the owner's message is clearly asking for a demo."""
+    return bool(_DEMO_REQUEST_RE.search(text.strip()))
+
+
+_ONBOARDING_WORD_RE = re.compile(
+    r"\b(onboard(?:ing)?|on-?boarding|on\s*boarding|onbording|obording)\b",
+    re.IGNORECASE,
+)
+_ONBOARDING_START_RE = re.compile(
+    r"\b(start|begin|ready|lets|let's|go\s+ahead|set\s+up|setup)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_onboarding_start_intent(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return bool(_ONBOARDING_WORD_RE.search(stripped) and _ONBOARDING_START_RE.search(stripped))
+
+
+_CONVERSATIONAL_NOISE_RE = re.compile(
+    r"("
+    r"came?\s+(?:through|from|via)\s+(?:an?\s+)?ads?"
+    r"|saw\s+(?:an?\s+)?(?:ad|advertisement|post)\b"
+    r"|found\s+(?:you|this|recepte)\s+(?:through|from|on|via)"
+    r"|heard\s+(?:about|of)\s+(?:you|this|recepte)"
+    r"|referred\s+by"
+    r"|someone\s+told\s+me"
+    r"|(?:google|facebook|instagram|tiktok)\s+ads?"
+    r"|just\s+(?:looking|browsing|exploring|curious)"
+    r"|what\s+(?:is|does)\s+recepte"
+    r"|tell\s+me\s+(?:more|about)"
+    r"|how\s+does\s+(?:this|it|recepte)\s+work"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_conversational_noise(text: str) -> bool:
+    """Return True when text is clearly not business data.
+
+    Prevents messages like 'I came through ads' or 'I heard about you'
+    from being mistaken for a business name or triggering Places searches.
+    """
+    return bool(_CONVERSATIONAL_NOISE_RE.search(text.strip()))
 
 
 # Matches the WhatsApp deep-link activation message sent from recepte.co:
@@ -1197,18 +1419,34 @@ Detect the language from the owner's message and ALWAYS reply in that SAME langu
 - Any other language → match it exactly.
 Never switch languages unless the owner does first.
 
+EXISTING BUSINESS RULE (NEVER BREAK THIS):
+The owner's business is ALREADY CONFIGURED AND LIVE on Recepte.
+You MUST NEVER:
+- Ask onboarding or setup questions (e.g. business name, type, address, hours, services, staff, categories).
+- Generate a numbered or bulleted setup questionnaire labelled "Step 1", "PASSO 1", "ÉTAPE 1", \
+"Schritt 1", "PASO 1", or anything that looks like an onboarding intake form.
+- Act as if you are conducting a first-time business setup or onboarding session.
+If the owner says "start onboarding", "setup my business", "configure", "onboard again", \
+"let's begin", or any similar phrase: respond warmly that their business is already set up \
+on Recepte, and offer to help them update a specific setting, reconnect WhatsApp, \
+or answer any questions — but do NOT collect business information.
+
 SIMPLE ACKNOWLEDGMENTS:
 If the owner sends a short acknowledgment — "Ok", "Okay", "Thanks", "Got it", \
-"Sure", "Alright", "Fine", "Done", "Great", "👍", "Noted", or similar — respond \
-with a brief, warm one-sentence reply and nothing more. Do NOT escalate. Do NOT \
-ask what they want unless they seem confused.
-Example: "Great! Let me know if there's anything else I can help with. 😊"
+"Sure", "Alright", "Fine", "Great", "👍", "Noted", or similar — respond \
+with a brief, warm one-sentence reply and nothing more.
+EXCEPTION: If they recently received a payment link and say "Done" or "I paid", \
+call get_plan_info to verify payment in our database — NEVER assume payment succeeded.
+Never say "Perfect!" or confirm payment unless the database shows an active plan.
 
 PLAN & BILLING QUESTIONS:
+Recepte has EXACTLY TWO subscription plans: *Starter* and *Pro*. There is no Basic, \
+Enterprise, Premium, or third plan — never invent plan names.
 When the owner asks about their current plan, subscription, billing costs, validity, \
-renewal date, plan features, or expiry — call the `get_plan_info` tool IMMEDIATELY \
-to fetch their real plan details, then tell them directly and clearly. \
+renewal date, plan features, available plans, pricing, or expiry — call the \
+`get_plan_info` tool IMMEDIATELY and use ONLY the data it returns. \
 Never say "I don't have access to billing information."
+Never list more than two plans. Never guess prices or features.
 
 SUPPORT ESCALATION:
 Call `request_support` ONLY when the owner EXPLICITLY says:
@@ -1223,9 +1461,17 @@ Translate this sentence to match the owner's language. Add nothing else.
 
 WHAT YOU CAN HELP WITH:
 - Explaining the owner's current plan and features (use get_plan_info)
+- Sending a payment link when they want to subscribe (use send_checkout_link)
 - Explaining how Recepte works and what it offers
 - Guiding WhatsApp reconnection or device pairing
 - Answering general questions about the service
+
+SUBSCRIPTION FLOW:
+- Only Starter and Pro exist. Never invent other plan names.
+- When the owner chooses a plan, call send_checkout_link — do NOT repeat the full catalog.
+- Payment is confirmed ONLY via our database (Stripe webhook). Never trust "Done" or "I paid".
+- If payment is not in the database, say it is still pending — never congratulate or confirm.
+- For "which plan am I on?" call get_plan_info and summarize renewal/expiry dates.
 
 CONFIDENTIALITY — CRITICAL:
 Never reveal any technical or internal details, including:
@@ -1241,6 +1487,14 @@ TONE:
 - Warm, helpful, direct
 - Keep messages concise — this is WhatsApp, not email
 - Use emojis sparingly
+
+GENERAL PRODUCT QUESTIONS (use the Global Knowledge Base below):
+A Knowledge Base section appears below with information about Recepte's features,
+plans, pricing, free trial, and onboarding guidance.  When the owner asks general
+questions about the platform — what features exist, what Recepte does, how billing
+works, or roughly what things cost — answer naturally from the KB.
+For questions about THEIR SPECIFIC plan, renewal date, or billing status, ALWAYS
+call `get_plan_info` first and use only the data it returns.
 """
 
 # Claude tool definitions for the post-onboarding (support) AI.
@@ -1248,14 +1502,33 @@ POST_ONBOARDING_TOOLS: list[dict] = [
     {
         "name": "get_plan_info",
         "description": (
-            "Get the owner's current subscription plan details from the database. "
-            "Call this whenever the owner asks about their plan, subscription, billing, "
-            "costs, validity, renewal date, expiry, or what features they have access to."
+            "Get the owner's current subscription status AND the full plan catalog. "
+            "Recepte has exactly TWO plans: Starter and Pro. "
+            "Call when the owner asks about their plan, renewal, expiry, or features."
         ),
         "input_schema": {
             "type": "object",
             "properties": {},
             "required": [],
+        },
+    },
+    {
+        "name": "send_checkout_link",
+        "description": (
+            "Send a Stripe payment link for the owner to subscribe. "
+            "Recepte has exactly TWO plans: 'starter' or 'pro'. "
+            "Call when the owner wants to subscribe, upgrade, or pay for a plan."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "plan": {
+                    "type": "string",
+                    "description": "Plan to subscribe to: 'starter' or 'pro'",
+                    "enum": ["starter", "pro"],
+                },
+            },
+            "required": ["plan"],
         },
     },
     {
@@ -1296,6 +1569,50 @@ class OnboardingService:
         self.ai = AIService()
         self.client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
         self.model = "claude-sonnet-4-20250514"
+
+    async def _localize_static(
+        self,
+        text: str,
+        user_message: str,
+        language_hint: str = "en",
+    ) -> str:
+        if not text:
+            return text
+
+        lang_key = _language_key_from_text(user_message, language_hint)
+        if lang_key == "en":
+            return text
+
+        cache_key = (lang_key, text)
+        cached = _STATIC_TRANSLATION_CACHE.get(cache_key)
+        if cached:
+            return cached
+
+        prompt = (
+            "Translate the assistant message into the SAME language as the user's message.\n"
+            "Preserve line breaks, emojis, markdown, numbers, URLs, and any bracketed tokens "
+            "like [CONFIRMED], plus any placeholders inside {} exactly. Do NOT add or remove content. If it is already in that "
+            "language, return it unchanged.\n\n"
+            f"Language hint (if ambiguous): {lang_key}\n\n"
+            f"User message:\n{user_message}\n\n"
+            f"Assistant message:\n{text}"
+        )
+
+        try:
+            response = await self.client.messages.create(
+                model=self.model,
+                max_tokens=400,
+                system="You are a translation engine. Output only the translated message.",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            translated = (response.content[0].text or "").strip()
+            if translated:
+                _STATIC_TRANSLATION_CACHE[cache_key] = translated
+                return translated
+        except Exception as exc:
+            logger.warning("[LANG] Static translation failed: %s", exc)
+
+        return text
 
     # ── main entry point ──────────────────────────────────────────────────
 
@@ -1338,6 +1655,16 @@ class OnboardingService:
                 )
                 return
         # ─────────────────────────────────────────────────────────────────────
+
+        # Pricing questions during setup steps (pairing, calendar, call forwarding).
+        if session and has_plan_pricing_intent(body):
+            _setup_steps = {
+                "pairing", "pairing_mode_choice", "pairing_qr_active",
+                "pairing_scam_warning", "calendar_setup", "call_forwarding",
+            }
+            if session.get("currentStep", "") in _setup_steps:
+                await self._handle_pricing_question(session, phone, body)
+                return
 
         if session:
             step = session.get("currentStep", "conversing")
@@ -1551,10 +1878,16 @@ class OnboardingService:
             "pairingSessionId": None,
             "businessId": None,
             "lastMessageId": message_id,
-            # Sales-phase tracking (new)
+            # Sales-phase tracking
             "salesPhase": "discovery",
             "demoMessageCount": 0,
             "senderIdentity": "sofia",
+            # Interruptible-onboarding state
+            "mode": "onboarding",
+            "temporaryMode": None,
+            "resumeOnboardingAfterDemo": False,
+            "onboardingContextBeforeDemo": None,
+            "justResumedFromDemo": False,
             "timestamps": {
                 "startedAt": now,
                 "lastActivityAt": now,
@@ -1566,6 +1899,25 @@ class OnboardingService:
         url = _extract_url(body)
         if url:
             await self._handle_website_url(session_data, phone, url, push_name)
+            return
+
+        # Fast-path: if first message is a demo request, activate demo mode now
+        if _is_demo_request(body):
+            await self._handle_demo_request_during_onboarding(
+                session_data, phone, body, push_name, message_id
+            )
+            return
+
+        # Explicit onboarding-start intent: ask for website/maps/instagram first
+        if _is_onboarding_start_intent(body):
+            reply = _link_request_message(lang)
+            conversation_history.append({"role": "assistant", "content": reply})
+            db.upsert_onboarding_session(phone, {
+                "conversationHistory": conversation_history,
+                "askedForLink": True,
+            })
+            await self._send(phone, reply)
+            logger.info("[ONBOARDING] Link request sent for %s (start intent)", phone)
             return
 
         # Get AI response to their first message
@@ -1885,6 +2237,11 @@ class OnboardingService:
                 f"Great, thanks for confirming! I just need your {blocking_str} to complete setup.\n\n"
                 "⏰📅 Please share them — for example: Mon–Sat 9am–6pm"
             )
+            clean_reply = await self._localize_static(
+                clean_reply,
+                _last_user_message(history),
+                session.get("language", "en"),
+            )
             history.append({"role": "assistant", "content": clean_reply})
             db.upsert_onboarding_session(phone, {"conversationHistory": history})
             await self._send(phone, clean_reply)
@@ -1913,6 +2270,11 @@ class OnboardingService:
             "Would you like to enable this? "
             "(yes/no — default is 25% off for the referrer and 10% off for the new customer, "
             "but you can choose any percentages)"
+        )
+        msg = await self._localize_static(
+            msg,
+            _last_user_message(history),
+            session.get("language", "en"),
         )
         history.append({"role": "assistant", "content": msg})
         db.upsert_onboarding_session(phone, {"conversationHistory": history})
@@ -2053,12 +2415,17 @@ class OnboardingService:
                     "lastMessageId": message_id,
                 })
                 session["currentStep"] = "conversing"
-                await self._send(
-                    phone,
+                missing_reply = (
                     f"Almost done! I still need your {_rc_missing_str} before saving.\n\n"
                     "⏰ What days and hours is your business open?\n"
-                    "   (e.g. Mon–Sat 9am–6pm, or Mon–Fri 10am–8pm)",
+                    "   (e.g. Mon–Sat 9am–6pm, or Mon–Fri 10am–8pm)"
                 )
+                missing_reply = await self._localize_static(
+                    missing_reply,
+                    body,
+                    session.get("language", "en"),
+                )
+                await self._send(phone, missing_reply)
                 return
 
             db.upsert_onboarding_session(phone, {
@@ -2106,6 +2473,18 @@ class OnboardingService:
             "lastMessageId": message_id,
             "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
         })
+
+        # ── Demo-request interruption ─────────────────────────────────────
+        # If the owner is in onboarding discovery and asks for a demo,
+        # pause onboarding, run the demo, then resume where we left off.
+        # This check runs before everything else (URL, Places, etc.) so that
+        # an explicit demo request is always honoured.
+        _cur_sales_phase = session.get("salesPhase", "discovery")
+        if _cur_sales_phase == "discovery" and _is_demo_request(body):
+            await self._handle_demo_request_during_onboarding(
+                session, phone, body, push_name, message_id
+            )
+            return
 
         # Fast-path: if the owner sends a website URL, extract from it
         url = _extract_url(body)
@@ -2193,6 +2572,11 @@ class OnboardingService:
                     "Please share your opening days and working hours.\n\n"
                     "Example: Monday to Saturday, 9am–9pm"
                 )
+            clean_reply = await self._localize_static(
+                clean_reply,
+                body,
+                session.get("language", "en"),
+            )
             history.append({"role": "assistant", "content": clean_reply})
             db.upsert_onboarding_session(phone, {
                 "conversationHistory": history,
@@ -2201,11 +2585,46 @@ class OnboardingService:
             await self._send(phone, clean_reply)
             return
 
+        # Explicit onboarding-start intent: reset phase and ask for link first
+        if _is_onboarding_start_intent(body) and not session.get("askedForLink"):
+            history = session.get("conversationHistory", [])
+            history.append({"role": "user", "content": body})
+            reply = _link_request_message(session.get("language", "en"))
+            history.append({"role": "assistant", "content": reply})
+            db.upsert_onboarding_session(phone, {
+                "conversationHistory": history,
+                "askedForLink": True,
+                "salesPhase": "discovery",
+                "senderIdentity": "sofia",
+                "demoMessageCount": 0,
+                "mode": "onboarding",
+                "temporaryMode": None,
+                "resumeOnboardingAfterDemo": False,
+                "justResumedFromDemo": False,
+            })
+            session.update({
+                "conversationHistory": history,
+                "askedForLink": True,
+                "salesPhase": "discovery",
+                "senderIdentity": "sofia",
+                "demoMessageCount": 0,
+                "mode": "onboarding",
+                "temporaryMode": None,
+                "resumeOnboardingAfterDemo": False,
+                "justResumedFromDemo": False,
+            })
+            await self._send(phone, reply)
+            logger.info("[ONBOARDING] Link request sent for %s (reset start intent)", phone)
+            return
+
         # Google Places fast-path: if the message looks like a bare business name
         # and the Places API is configured, search for up to 5 matches.
+        # Guard: skip Places search for conversational noise (ad referrals, intent
+        # statements) even if the heuristic passes — they are never business names.
         if (
             settings.GOOGLE_PLACES_API_KEY
             and _looks_like_business_name(body)
+            and not _is_conversational_noise(body)
             and len(session.get("conversationHistory", [])) < 6
         ):
             # Persist user message BEFORE branching so history stays in sync
@@ -2269,15 +2688,29 @@ class OnboardingService:
             db.upsert_onboarding_session(phone, {"demoMessageCount": new_demo_count})
             session["demoMessageCount"] = new_demo_count
             if new_demo_count >= 4:
-                _ctx_parts.append(
-                    "CRITICAL — BREAK CHARACTER NOW: This is turn 4+ of the demo. "
-                    "You MUST close the roleplay by ending your message with EXACTLY "
-                    "this sentence (translate only if not conversing in Portuguese, "
-                    "but preserve the meaning): "
-                    '"E pronto. A tua cliente está marcada. Tu nem largaste a tesoura." '
-                    "After this sentence, add one line pivoting back to pricing/next steps. "
-                    "Add nothing else after that line."
-                )
+                if session.get("resumeOnboardingAfterDemo"):
+                    # Demo was a temporary interruption of onboarding — tell Sofia
+                    # to break character and transition back to onboarding, NOT pricing.
+                    _ctx_parts.append(
+                        "CRITICAL — BREAK CHARACTER NOW: This is turn 4+ of the demo. "
+                        "You MUST close the roleplay by ending your message with EXACTLY "
+                        "this sentence (translate if not in Portuguese but preserve meaning): "
+                        '"E pronto. A tua cliente está marcada. Tu nem largaste a tesoura." '
+                        "After that sentence add EXACTLY one more line: "
+                        '"Agora vamos continuar a configurar o teu negócio! 🚀" '
+                        "(translate that line too if needed). "
+                        "Do NOT mention pricing, subscription, or payment. Add nothing else."
+                    )
+                else:
+                    _ctx_parts.append(
+                        "CRITICAL — BREAK CHARACTER NOW: This is turn 4+ of the demo. "
+                        "You MUST close the roleplay by ending your message with EXACTLY "
+                        "this sentence (translate only if not conversing in Portuguese, "
+                        "but preserve the meaning): "
+                        '"E pronto. A tua cliente está marcada. Tu nem largaste a tesoura." '
+                        "After this sentence, add one line pivoting back to pricing/next steps. "
+                        "Add nothing else after that line."
+                    )
 
         # Daniel persona override — used after human escalation
         if sender_identity == "daniel":
@@ -2286,6 +2719,26 @@ class OnboardingService:
                 'Begin your message with "Daniel aqui (o humano)." '
                 "Be direct, personal, and resolve the owner's issue."
             )
+
+        # If onboarding just resumed after demo, inject context so the AI knows
+        # to continue collecting the remaining business details.
+        if session.get("justResumedFromDemo"):
+            db.upsert_onboarding_session(phone, {"justResumedFromDemo": False})
+            session["justResumedFromDemo"] = False
+            _saved = session.get("onboardingContextBeforeDemo") or {}
+            _resume_note = (
+                "CONTEXT: The booking demo just ended. You are back in onboarding mode. "
+                "Resume naturally — acknowledge the demo briefly, then continue collecting "
+                "any missing business details. Do NOT restart from the beginning; pick up "
+                "where you left off."
+            )
+            if _saved.get("websiteExtractedData"):
+                import json as _json
+                _resume_note += (
+                    f"\n\nBusiness data already collected: "
+                    f"{_json.dumps(_saved['websiteExtractedData'], ensure_ascii=False)}"
+                )
+            _ctx_parts.append(_resume_note)
 
         _combined_ctx = "\n\n".join(_ctx_parts)
 
@@ -2299,10 +2752,32 @@ class OnboardingService:
                 history, push, lang, phone, session, extra_context=_combined_ctx
             )
 
-        # After the demo break-character message advance the phase to pricing.
+        # After the demo break-character message, advance to pricing OR resume onboarding.
         if sales_phase == "demo" and session.get("demoMessageCount", 0) >= 4:
-            db.upsert_onboarding_session(phone, {"salesPhase": "pricing", "demoMessageCount": 0})
-            session["salesPhase"] = "pricing"
+            if session.get("resumeOnboardingAfterDemo"):
+                # Temporary demo during onboarding — restore discovery state
+                _saved_ctx = session.get("onboardingContextBeforeDemo") or {}
+                _restore: dict = {
+                    "salesPhase": "discovery",
+                    "demoMessageCount": 0,
+                    "mode": "onboarding",
+                    "temporaryMode": None,
+                    "resumeOnboardingAfterDemo": False,
+                    "justResumedFromDemo": True,
+                }
+                if _saved_ctx.get("websiteExtractedData"):
+                    _restore["websiteExtractedData"] = _saved_ctx["websiteExtractedData"]
+                if _saved_ctx.get("mandatoryFieldsRequired"):
+                    _restore["mandatoryFieldsRequired"] = _saved_ctx["mandatoryFieldsRequired"]
+                db.upsert_onboarding_session(phone, _restore)
+                session["salesPhase"] = "discovery"
+                session["mode"] = "onboarding"
+                session["temporaryMode"] = None
+                session["resumeOnboardingAfterDemo"] = False
+                session["justResumedFromDemo"] = True
+            else:
+                db.upsert_onboarding_session(phone, {"salesPhase": "pricing", "demoMessageCount": 0})
+                session["salesPhase"] = "pricing"
 
         # Check if the AI has signalled confirmation
         confirmed, clean_reply = self._check_confirmed(ai_reply)
@@ -2339,6 +2814,11 @@ class OnboardingService:
                     "⏰ What days and hours is your business open?\n"
                     "   (e.g. Mon–Sat 9am–6pm, or Mon–Fri 10am–8pm)"
                 )
+                clean_reply = await self._localize_static(
+                    clean_reply,
+                    body,
+                    session.get("language", "en"),
+                )
 
         # Store updated history
         history.append({"role": "assistant", "content": clean_reply})
@@ -2367,6 +2847,90 @@ class OnboardingService:
                 await self._finalize_business(session, phone, history)
 
     # ── website extraction flow ───────────────────────────────────────────
+
+    # ── Demo interrupt: pause onboarding, run demo, resume after ─────────
+
+    async def _handle_demo_request_during_onboarding(
+        self,
+        session: dict,
+        phone: str,
+        body: str,
+        push_name: str,
+        message_id: str,
+    ) -> None:
+        """Pause onboarding temporarily and start the booking demo.
+
+        Saves the current onboarding state (websiteExtractedData,
+        mandatoryFieldsRequired, currentStep) so it can be restored
+        after the demo ends.  Required onboarding fields (name, type,
+        address, hours) are NOT skipped — they will be collected when
+        onboarding resumes.
+        """
+        # Snapshot what we have so far so nothing is lost
+        onboarding_ctx = {
+            "salesPhase": "discovery",
+            "websiteExtractedData": session.get("websiteExtractedData"),
+            "mandatoryFieldsRequired": session.get("mandatoryFieldsRequired", False),
+            "currentStep": session.get("currentStep", "conversing"),
+        }
+
+        # Switch to demo mode — keep currentStep as "conversing" so routing
+        # still flows through _handle_conversation on follow-up messages.
+        db.upsert_onboarding_session(phone, {
+            "salesPhase": "demo",
+            "demoMessageCount": 0,
+            "mode": "demo",
+            "temporaryMode": "demo",
+            "resumeOnboardingAfterDemo": True,
+            "onboardingContextBeforeDemo": onboarding_ctx,
+            "lastMessageId": message_id,
+        })
+        session.update({
+            "salesPhase": "demo",
+            "demoMessageCount": 0,
+            "mode": "demo",
+            "temporaryMode": "demo",
+            "resumeOnboardingAfterDemo": True,
+            "onboardingContextBeforeDemo": onboarding_ctx,
+        })
+
+        # Add user's message to history
+        history = session.get("conversationHistory", [])
+        history.append({"role": "user", "content": body})
+
+        push = push_name or session.get("pushName", "")
+        lang = session.get("language", "en")
+
+        # Build demo context — tell Sofia that after the demo she must return to
+        # onboarding (not pivot to pricing).
+        _demo_phase_prompt = SALES_PHASE_PROMPTS.get("demo", "")
+        _resume_note = (
+            "\n\nIMPORTANT: After the demo roleplay ends (steps 4-6), break character "
+            "with the standard line and then tell the owner you are returning to finish "
+            "setting up their business. Do NOT mention pricing or subscriptions."
+        )
+        _combined = _demo_phase_prompt + _resume_note
+
+        # Always use the tool-capable path so demo can execute properly
+        ai_reply = await self._get_ai_response_with_tools(
+            history, push, lang, phone, session, extra_context=_combined
+        )
+        _, clean_reply = self._check_confirmed(ai_reply)
+
+        # First AI turn counts as demo exchange 1
+        new_demo_count = 1
+        history.append({"role": "assistant", "content": clean_reply})
+        db.upsert_onboarding_session(phone, {
+            "conversationHistory": history,
+            "demoMessageCount": new_demo_count,
+        })
+        session["demoMessageCount"] = new_demo_count
+
+        await self._send(phone, clean_reply)
+        logger.info(
+            "[DEMO-INTERRUPT] Onboarding paused for demo. phone=%s savedCtx=%s",
+            phone, {k: bool(v) for k, v in onboarding_ctx.items()},
+        )
 
     @staticmethod
     def _place_to_dict(place: dict) -> dict:
@@ -3210,10 +3774,41 @@ class OnboardingService:
             f"Their phone prefix suggests they speak: {language}. "
             "Respond in that language if they write in it, otherwise match their language."
         )
+        try:
+            from app.services.global_kb import build_kb_prompt_section
+            kb_section = build_kb_prompt_section()
+        except Exception as exc:
+            kb_section = ""
+            logger.warning("[GLOBAL_KB] Failed to build KB section: %s", exc)
 
-        system = f"{ONBOARDING_SYSTEM_PROMPT}\n\n{context_note}\n{lang_note}"
+        parts: list[str] = [ONBOARDING_SYSTEM_PROMPT]
+        components = ["base_system"]
         if extra_context:
-            system = f"{system}\n\n{extra_context}"
+            parts.append(extra_context)
+            components.append("mode_sales_context")
+        if kb_section:
+            parts.append(kb_section)
+            kb_len = len(kb_section)
+            kb_tokens = max(1, kb_len // 4)
+            logger.info(
+                "[GLOBAL_KB] Injected into onboarding prompt (chars=%d, approx_tokens=%d)",
+                kb_len, kb_tokens,
+            )
+            components.append("global_kb")
+        else:
+            logger.warning("[GLOBAL_KB] KB section empty for onboarding prompt")
+        if context_note:
+            parts.append(context_note)
+            components.append("owner_context")
+        if lang_note:
+            parts.append(lang_note)
+            components.append("language_hint")
+
+        system = "\n\n".join(parts)
+        logger.info(
+            "[PROMPT] onboarding components: %s + history + user_message",
+            " + ".join(components),
+        )
 
         try:
             response = await self.client.messages.create(
@@ -3230,7 +3825,7 @@ class OnboardingService:
                     "Claude returned empty content (stop_reason=%r) — using fallback",
                     stop,
                 )
-                return "Sorry, I had a small hiccup! Could you repeat that? 😅"
+                return "Sorry, I had a small hiccup! Could you repeat that? "
             reply_text = response.content[0].text.strip()
             try:
                 logger.debug("AI (onboarding) reply: %s", reply_text)
@@ -3239,7 +3834,7 @@ class OnboardingService:
             return reply_text
         except Exception as exc:
             logger.exception("Claude conversation error: %s", exc)
-            return "Sorry, I had a small hiccup! Could you repeat that? 😅"
+            return "Sorry, I had a small hiccup! Could you repeat that? "
 
     def _check_confirmed(self, ai_reply: str) -> tuple[bool, str]:
         """Check if the AI response contains [CONFIRMED] and strip it."""
@@ -4342,6 +4937,297 @@ class OnboardingService:
 
     # ── Billing recovery helpers ──────────────────────────────────────────────
 
+    async def _send_plan_checkout_link(
+        self,
+        phone: str,
+        biz: dict,
+        plan: str,
+        session: dict | None,
+    ) -> bool:
+        """Generate a Stripe checkout link for *plan* and send it to *phone*.
+
+        Stores ``pendingCheckoutPlan`` and ``checkoutLinkSentAt`` in the
+        onboarding session so later "I paid" messages can be matched.
+
+        Returns True on success, False when Stripe is not configured or the
+        checkout session could not be created.
+        """
+        from app.services.billing.stripe_service import create_checkout_session
+        from app.services.billing.checkout_urls import checkout_redirect_urls
+        from app.services.onboarding_plan_info import format_checkout_link_message
+
+        plan_key = plan.lower()
+        if plan_key not in ("starter", "pro"):
+            logger.warning("[BILLING] Unknown plan %r — cannot create checkout", plan_key)
+            return False
+
+        biz_id = biz.get("id", "")
+        success_url, cancel_url = checkout_redirect_urls(biz_id, plan_key)
+
+        checkout_url = create_checkout_session(
+            business=biz,
+            plan=plan_key,
+            success_url=success_url,
+            cancel_url=cancel_url,
+        )
+
+        if not checkout_url:
+            logger.warning("[BILLING] Stripe checkout URL generation failed for biz=%s plan=%s", biz_id, plan_key)
+            await self._send(
+                phone,
+                "Sorry, I had trouble generating your payment link. Please try again in a moment.",
+            )
+            return False
+
+        msg = format_checkout_link_message(biz, plan_key, checkout_url)
+        await self._send(phone, msg)
+
+        # Persist checkout state so the "I paid" handler can verify correctly.
+        db.upsert_onboarding_session(phone, {
+            "pendingCheckoutPlan": plan_key,
+            "checkoutLinkSentAt": datetime.utcnow().isoformat(),
+            "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
+        })
+        logger.info("[BILLING] Checkout link sent to %s for plan=%s biz=%s", phone, plan_key, biz_id)
+        return True
+
+    async def _verify_payment_from_db(
+        self,
+        phone: str,
+        biz: dict,
+        session: dict | None,
+    ) -> str:
+        """Check whether payment has been confirmed in Firestore.
+
+        ALWAYS re-fetches the business document from Firestore so we have the
+        latest data (the Stripe webhook may have updated it after the last
+        cached read).  Never trusts the user's own "I paid" message.
+
+        If payment is confirmed → returns a congratulations message and
+        schedules background clean-up of the pending checkout state.
+
+        If payment is not yet confirmed → returns a friendly waiting message
+        AND schedules a one-shot 60-second background re-check.  If the
+        re-check finds the payment, a WhatsApp confirmation is sent automatically.
+        """
+        from app.services.onboarding_plan_info import is_subscription_paid_in_db
+
+        biz_id = biz.get("id", "")
+
+        # Always re-fetch latest Firestore state.
+        fresh_biz = db.get_business_by_id(biz_id) if biz_id else None
+        fresh_biz = fresh_biz or biz
+
+        if is_subscription_paid_in_db(fresh_biz):
+            # Clear pending state immediately.
+            db.upsert_onboarding_session(phone, {
+                "pendingCheckoutPlan": None,
+                "checkoutLinkSentAt": None,
+                "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
+            })
+            logger.info("[BILLING] Payment confirmed for %s from DB", phone)
+            from app.services.onboarding_plan_info import format_payment_confirmed_reply
+            return format_payment_confirmed_reply(fresh_biz)
+
+        # Payment not yet confirmed — schedule a background re-check in 60 s.
+        asyncio.ensure_future(self._delayed_payment_recheck(phone, biz_id))
+        logger.info("[BILLING] Payment NOT yet confirmed for %s — scheduled 60s re-check", phone)
+
+        pending_plan = (session or {}).get("pendingCheckoutPlan") if session else None
+        if not pending_plan:
+            # Try to infer from biz data
+            raw = str(fresh_biz.get("plan") or "").lower()
+            if raw in ("starter", "pro"):
+                pending_plan = raw
+
+        from app.services.onboarding_plan_info import format_payment_pending_reply
+        return format_payment_pending_reply(pending_plan)
+
+    async def _delayed_payment_recheck(self, phone: str, biz_id: str) -> None:
+        """Background task: re-check payment status after 60 seconds.
+
+        If the Stripe webhook fires in the meantime (as expected), the business
+        doc will be updated and this check will confirm it and send the owner
+        a WhatsApp notification.
+        """
+        await asyncio.sleep(60)
+        try:
+            fresh_biz = db.get_business_by_id(biz_id) if biz_id else None
+            if not fresh_biz:
+                return
+
+            from app.services.onboarding_plan_info import (
+                is_subscription_paid_in_db,
+                format_payment_confirmed_reply,
+            )
+
+            if is_subscription_paid_in_db(fresh_biz):
+                reply = format_payment_confirmed_reply(fresh_biz)
+                await self._send(phone, reply)
+                db.upsert_onboarding_session(phone, {
+                    "pendingCheckoutPlan": None,
+                    "checkoutLinkSentAt": None,
+                    "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
+                })
+                logger.info(
+                    "[BILLING] 60s re-check: payment confirmed for %s — WhatsApp notification sent",
+                    phone,
+                )
+            else:
+                logger.info("[BILLING] 60s re-check: payment still not confirmed for %s", phone)
+        except Exception as exc:
+            logger.warning("[BILLING] 60s re-check failed for %s: %s", phone, exc)
+
+    async def _handle_post_onboarding_billing(
+        self,
+        session: dict | None,
+        biz: dict,
+        phone: str,
+        body: str,
+        push_name: str,
+        message_id: str,
+        lang: str = "en",
+    ) -> bool:
+        """Handle billing-related messages from post-onboarding owners.
+
+        Routes to the correct handler based on intent.  Returns True when the
+        message was handled (and the caller should return early), False otherwise.
+
+        Handled intents:
+          payment_check    — owner claims they paid → verify from DB
+          resend_checkout  — owner wants the link sent again
+          current_status   — which plan / renewal / expiry?
+          select_plan      — owner picks starter or pro
+          checkout_link    — "how do I pay?" / "send me the link"
+          catalog          — browsing available plans & pricing
+        """
+        from app.services.onboarding_plan_info import (
+            classify_billing_message,
+            parse_plan_selection,
+            is_subscription_paid_in_db,
+            format_current_plan_status_reply,
+            format_available_plans_catalog,
+            format_checkout_link_prompt,
+            has_pending_checkout,
+        )
+
+        billing_class = classify_billing_message(body, session)
+        if billing_class is None:
+            return False  # not a billing message
+
+        biz_id = biz.get("id", "")
+        logger.info(
+            "Post-onboarding billing action=%s for %s (body=%s)",
+            billing_class, phone, body[:60],
+        )
+
+        # ── Owner claims they paid ────────────────────────────────────────────
+        if billing_class == "payment_check":
+            # Re-fetch latest biz to avoid stale cache
+            fresh_biz = db.get_business_by_id(biz_id) or biz
+            reply = await self._verify_payment_from_db(phone, fresh_biz, session)
+            await self._send(phone, reply)
+            return True
+
+        # ── Resend existing checkout link ─────────────────────────────────────
+        if billing_class == "resend_checkout":
+            pending_plan = (session or {}).get("pendingCheckoutPlan") if session else None
+            if not pending_plan:
+                pending_plan = parse_plan_selection(body) or "starter"
+            fresh_biz = db.get_business_by_id(biz_id) or biz
+            await self._send_plan_checkout_link(phone, fresh_biz, pending_plan, session)
+            return True
+
+        # ── Current plan status ───────────────────────────────────────────────
+        if billing_class == "current_status":
+            fresh_biz = db.get_business_by_id(biz_id) or biz
+            reply = format_current_plan_status_reply(fresh_biz)
+            await self._send(phone, reply)
+            return True
+
+        # ── Owner selects a plan → send checkout link ─────────────────────────
+        if billing_class == "select_plan":
+            chosen = parse_plan_selection(body)
+            if not chosen:
+                # Ambiguous — ask to clarify
+                await self._send(
+                    phone,
+                    "Which plan would you like?\n\n"
+                    "Reply *starter* for the Starter plan or *pro* for the Pro plan.",
+                )
+                return True
+            fresh_biz = db.get_business_by_id(biz_id) or biz
+            await self._send_plan_checkout_link(phone, fresh_biz, chosen, session)
+            return True
+
+        # ── "Send me a payment link" ──────────────────────────────────────────
+        if billing_class == "checkout_link":
+            # If they haven't picked a plan yet, prompt them
+            pending = has_pending_checkout(session)
+            if pending:
+                pending_plan = (session or {}).get("pendingCheckoutPlan", "starter")
+                await self._send_plan_checkout_link(phone, biz, pending_plan, session)
+            else:
+                from app.services.onboarding_plan_info import format_checkout_link_prompt
+                reply = format_checkout_link_prompt(biz, session)
+                await self._send(phone, reply)
+            return True
+
+        # ── Plan catalog / pricing inquiry ────────────────────────────────────
+        if billing_class == "catalog":
+            fresh_biz = db.get_business_by_id(biz_id) or biz
+            reply = format_available_plans_catalog(fresh_biz)
+            await self._send(phone, reply)
+            return True
+
+        return False
+
+    async def _handle_pricing_question(
+        self,
+        session: dict,
+        phone: str,
+        body: str,
+    ) -> None:
+        """Handle a pricing/plan question that arrives during a setup step.
+
+        Sends a clean plan catalog without exiting the current setup step.
+        The owner can continue with setup after reading the pricing.
+        """
+        from app.services.onboarding_plan_info import (
+            classify_billing_message,
+            parse_plan_selection,
+            format_plan_pricing_reply,
+            format_plan_pricing_reply_for_phone,
+        )
+
+        billing_class = classify_billing_message(body, session)
+
+        # If they are selecting a specific plan during setup, note it in session
+        # but don't send a checkout link until onboarding is complete.
+        if billing_class == "select_plan":
+            chosen = parse_plan_selection(body)
+            if chosen:
+                db.upsert_onboarding_session(phone, {"intendedPlan": chosen})
+                await self._send(
+                    phone,
+                    f"Got it — I've noted your interest in the *{chosen.title()} Plan*! 👍\n\n"
+                    "Let's finish setting up your business first, then I'll send you the payment link right away.",
+                )
+                return
+
+        # Default: show plan pricing
+        biz_id = session.get("businessId") or ""
+        if biz_id:
+            biz = db.get_business_by_id(biz_id)
+            if biz:
+                reply = format_plan_pricing_reply(biz, include_current=True)
+                await self._send(phone, reply)
+                return
+
+        # No business yet (very early in onboarding)
+        reply = format_plan_pricing_reply_for_phone(phone)
+        await self._send(phone, reply)
+
     async def _send_plan_options(self, phone: str, biz: dict, lang: str = "en") -> None:
         """Send the expired-plan recovery message with Starter and Pro checkout links.
 
@@ -4351,6 +5237,7 @@ class OnboardingService:
         webhook which updates the business doc in Firestore.
         """
         from app.services.billing.stripe_service import create_checkout_session
+        from app.services.billing.checkout_urls import checkout_redirect_urls
         from app.services.billing.pricing import resolve_prices, DEFAULT_TIER
 
         biz_id = biz.get("id", "")
@@ -4360,8 +5247,8 @@ class OnboardingService:
         pro_price = biz.get("proPriceEur") or prices["pro"]
 
         base_url = settings.BASE_URL.rstrip("/")
-        success_url = f"{base_url}/billing/success?biz={biz_id}"
-        cancel_url = f"{base_url}/billing/cancel"
+        starter_success, cancel_url = checkout_redirect_urls(biz_id, "starter")
+        pro_success, _ = checkout_redirect_urls(biz_id, "pro")
 
         starter_url: str | None = None
         pro_url: str | None = None
@@ -4369,7 +5256,7 @@ class OnboardingService:
             starter_url = create_checkout_session(
                 business=biz,
                 plan="starter",
-                success_url=success_url,
+                success_url=starter_success,
                 cancel_url=cancel_url,
             )
         except Exception as exc:
@@ -4379,7 +5266,7 @@ class OnboardingService:
             pro_url = create_checkout_session(
                 business=biz,
                 plan="pro",
-                success_url=success_url,
+                success_url=pro_success,
                 cancel_url=cancel_url,
             )
         except Exception as exc:
@@ -4458,22 +5345,15 @@ class OnboardingService:
         # Plan still expired — handle the owner's response.
         normalized = body.strip().lower()
 
-        # Detect "I paid" / "done" / "payment done" claims — verify from DB only.
-        _paid_phrases = {
-            "paid", "i paid", "payment done", "done", "pronto", "feito",
-            "pagado", "payé", "bezahlt", "pagato", "paguei", "done paying",
-            "payment complete", "i have paid", "already paid",
-        }
-        if any(p in normalized for p in _paid_phrases):
-            # DB was re-read above and plan is still expired → payment not received.
-            await self._send(
-                phone,
-                "⏳ We haven't received your payment yet.\n\n"
-                "Please make sure you completed the payment at the link we sent. "
-                "Once confirmed by our payment provider, your service will resume "
-                "*automatically* — no need to message us again.\n\n"
-                "If you need a new payment link, reply *PLANS*.",
-            )
+        # Payment claims — verify from DB only; never assume success.
+        if is_payment_confirmation_attempt(body, session):
+            reply = await self._verify_payment_from_db(phone, fresh_biz, session)
+            await self._send(phone, reply)
+            if is_subscription_paid_in_db(db.get_business_by_id(biz_id) or fresh_biz):
+                db.upsert_onboarding_session(phone, {
+                    "pendingCheckoutPlan": None,
+                    "checkoutLinkSentAt": None,
+                })
             return
 
         # Detect plan choice — starter or pro
@@ -4487,41 +5367,7 @@ class OnboardingService:
             chosen_plan = "pro"
 
         if chosen_plan:
-            from app.services.billing.stripe_service import create_checkout_session
-            from app.services.billing.pricing import resolve_prices, DEFAULT_TIER
-
-            tier = fresh_biz.get("billingTier") or DEFAULT_TIER
-            prices = resolve_prices(tier)
-            price = fresh_biz.get(f"{chosen_plan}PriceEur") or prices[chosen_plan]
-
-            base_url = settings.BASE_URL.rstrip("/")
-            biz_name = fresh_biz.get("name", "your business")
-            checkout_url: str | None = None
-            try:
-                checkout_url = create_checkout_session(
-                    business=fresh_biz,
-                    plan=chosen_plan,
-                    success_url=f"{base_url}/billing/success?biz={biz_id}",
-                    cancel_url=f"{base_url}/billing/cancel",
-                )
-            except Exception as exc:
-                logger.warning("[BILLING-RECOVERY] Checkout generation failed for %s: %s", biz_id, exc)
-
-            if checkout_url:
-                await self._send(
-                    phone,
-                    f"💳 *{chosen_plan.title()} Plan — €{price}/month*\n\n"
-                    f"Complete your payment here:\n{checkout_url}\n\n"
-                    "Your service for *{biz_name}* will resume automatically once "
-                    "payment is confirmed. No need to message us afterwards!",
-                )
-            else:
-                fallback = f"{base_url}/pricing"
-                await self._send(
-                    phone,
-                    f"⚠️ Couldn't generate a payment link right now.\n"
-                    f"Please visit: {fallback}",
-                )
+            await self._send_plan_checkout_link(phone, fresh_biz, chosen_plan, session)
             return
 
         # "PLANS" keyword — resend the plan options
@@ -4658,7 +5504,26 @@ class OnboardingService:
         """
         biz_id = biz.get("id", "")
         biz_name = biz.get("name", "your business")
-        lang = (session.get("language") if session else None) or self.ai.detect_language(phone)
+        # Detect language from the CURRENT message body first — this is what the
+        # owner is writing RIGHT NOW and must take precedence over any stored value.
+        # `_language_key_from_text` checks non-Latin script patterns (Arabic, CJK…).
+        # For Latin-script messages we fall back to `langdetect` via ai.detect_language
+        # on the message text directly (not the phone prefix) to avoid the session
+        # language "pt" being inherited by English-speaking owners.
+        _msg_lang = _language_key_from_text(body)
+        if _msg_lang != "en" or not body.strip():
+            # Non-Latin script detected OR empty body — trust _language_key_from_text
+            lang = _msg_lang
+        else:
+            # Latin script: try langdetect on the message text, then phone prefix,
+            # then stored session language as last resort.
+            try:
+                from langdetect import detect as _ld_detect, LangDetectException as _LDE
+                _detected = _ld_detect(body)
+                # langdetect returns e.g. "pt", "en", "es", "fr", "de" — use as-is
+                lang = _detected[:2].lower()
+            except Exception:
+                lang = self.ai.detect_language(phone) or (session.get("language") if session else None) or "en"
         push = push_name or (session.get("pushName") if session else "") or ""
 
         # ── Billing recovery gate: check plan FIRST before anything else ──
@@ -4851,14 +5716,43 @@ class OnboardingService:
                 _dev_connected = True
 
             if not _dev_connected:
-                await self._send(
-                    phone,
-                    "⚠️ *Your WhatsApp is not connected to Recepte.*\n\n"
-                    "Owner commands are paused because your business number is offline "
-                    "— customers cannot receive replies right now.\n\n"
-                    "To reconnect, send:\n"
-                    "*reconnect my whatsapp*",
-                )
+                # Distinguish: was the device NEVER paired vs. previously paired
+                # but now offline?
+                # • paired=False  → owner never completed the pairing step.
+                #   Route back into the pairing flow so they can finish setup.
+                # • paired=True but status≠connected → was live before but
+                #   went offline.  Prompt them to reconnect.
+                _was_ever_paired = bool(_dev_status.get("paired"))
+                if not _was_ever_paired:
+                    logger.info(
+                        "[POST_ONBOARDING] Device %s for biz %s was never paired"
+                        " — resuming pairing flow for %s",
+                        _wa_session_id, biz_id, phone,
+                    )
+                    _pairing_session = {
+                        "ownerPhone": phone,
+                        "currentStep": "pairing_mode_choice",
+                        "businessId": biz_id,
+                        "pairingSessionId": _wa_session_id,
+                        "language": lang,
+                        "reconnectMode": False,
+                        "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
+                    }
+                    db.upsert_onboarding_session(phone, _pairing_session)
+                    _refreshed = db.get_onboarding_session(phone) or {}
+                    _refreshed["businessId"] = biz_id
+                    _refreshed["pairingSessionId"] = _wa_session_id
+                    _refreshed["language"] = lang
+                    await self._start_pairing_mode_choice(_refreshed, phone, biz_name)
+                else:
+                    await self._send(
+                        phone,
+                        "⚠️ *Your WhatsApp is not connected to Recepte.*\n\n"
+                        "Owner commands are paused because your business number is offline "
+                        "— customers cannot receive replies right now.\n\n"
+                        "To reconnect, send:\n"
+                        "*reconnect my whatsapp*",
+                    )
                 return
 
         # ── Owner commands (booking data / settings / etc.) ───────────────
@@ -4881,13 +5775,52 @@ class OnboardingService:
             except Exception as _cmd_err:
                 logger.warning("Owner command dispatch failed, falling back to AI: %s", _cmd_err)
 
-        # ── AI handles everything else ─────────────────────────────────
+        # ── Structured billing: checkout, status, catalog, payment verify ──
+        if await self._handle_post_onboarding_billing(
+            session, biz, phone, body, push, message_id, lang
+        ):
+            return
+
+        # After checkout link: "Done" must verify DB — never fall through to AI ack.
+        if has_pending_checkout(session) and is_payment_confirmation_attempt(
+            body, session
+        ):
+            reply = await self._verify_payment_from_db(phone, biz, session)
+            await self._send(phone, reply)
+            session_update = {
+                "ownerPhone": phone,
+                "pushName": push,
+                "currentStep": "post_onboarding",
+                "language": lang,
+                "businessId": biz_id,
+                "lastMessageId": message_id,
+                "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
+            }
+            if is_subscription_paid_in_db(db.get_business_by_id(biz_id) or biz):
+                session_update["pendingCheckoutPlan"] = None
+                session_update["checkoutLinkSentAt"] = None
+            db.upsert_onboarding_session(phone, session_update)
+            logger.info(
+                "Post-onboarding payment verify (pending checkout) for %s body=%s",
+                phone, body[:60],
+            )
+            return
+
+        # ── AI handles everything else (with billing tools) ─────────────
         history = (session.get("conversationHistory", []) if session else [])[-10:]
         history.append({"role": "user", "content": body})
 
         extra_context = (
-            f"The owner's business is '{biz_name}' and it is already live and fully set up.\n"
-            "Do NOT restart onboarding or ask for business name/services again.\n"
+            f"The owner's business '{biz_name}' is ALREADY LIVE AND FULLY SET UP.\n"
+            "CRITICAL RULES — NEVER BREAK THESE:\n"
+            "1. NEVER ask onboarding questions (business name, type, address, hours, services, etc.).\n"
+            "2. NEVER generate a step-by-step setup list, questionnaire, or anything labelled "
+            "'STEP 1', 'PASSO 1', 'ÉTAPE 1', or similar.\n"
+            "3. NEVER act as if you are conducting a first-time setup or onboarding flow.\n"
+            "4. If the owner says 'start onboarding', 'setup', 'configure', 'onboard again', or similar: "
+            "reply ONLY that their business is already configured and offer to help update a specific "
+            "detail or answer a question — do NOT start collecting business information.\n"
+            "5. Respond ONLY in the language of the owner's current message.\n"
             "For WhatsApp reconnect requests, the system handles them — tell the owner "
             "you are sending the pairing/reconnect details.\n"
             "For Google Calendar or call-forwarding, tell them you can help with that."
@@ -4934,9 +5867,41 @@ class OnboardingService:
             f"The owner's preferred language detected from phone/history: {language}. "
             "Always reply in the language of the owner's most recent message."
         )
-        system = f"{POST_ONBOARDING_SYSTEM_PROMPT}\n\n{name_note}\n{lang_note}"
+        try:
+            from app.services.global_kb import build_kb_prompt_section
+            kb_section = build_kb_prompt_section()
+        except Exception as exc:
+            kb_section = ""
+            logger.warning("[GLOBAL_KB] Failed to build KB section: %s", exc)
+
+        parts: list[str] = [POST_ONBOARDING_SYSTEM_PROMPT]
+        components = ["base_system"]
         if extra_context:
-            system = f"{system}\n\n{extra_context}"
+            parts.append(extra_context)
+            components.append("mode_context")
+        if kb_section:
+            parts.append(kb_section)
+            kb_len = len(kb_section)
+            kb_tokens = max(1, kb_len // 4)
+            logger.info(
+                "[GLOBAL_KB] Injected into post-onboarding prompt (chars=%d, approx_tokens=%d)",
+                kb_len, kb_tokens,
+            )
+            components.append("global_kb")
+        else:
+            logger.warning("[GLOBAL_KB] KB section empty for post-onboarding prompt")
+        if name_note:
+            parts.append(name_note)
+            components.append("owner_context")
+        if lang_note:
+            parts.append(lang_note)
+            components.append("language_hint")
+
+        system = "\n\n".join(parts)
+        logger.info(
+            "[PROMPT] post_onboarding components: %s + history + user_message",
+            " + ".join(components),
+        )
 
         try:
             response = await self.client.messages.create(
@@ -5008,80 +5973,22 @@ class OnboardingService:
         )
         try:
             if tool_name == "get_plan_info":
-                from app.services.billing.feature_gate import get_effective_plan
-                from app.services.billing.pricing import TIER_PRICES
+                return build_plan_info_for_tool(biz)
 
-                effective_plan = get_effective_plan(biz)
-                biz_name = biz.get("name", "your business")
-
-                # Try to get pricing from the biz doc tier
-                billing_tier = biz.get("billingTier", "T2")
-                tier_prices = TIER_PRICES.get(billing_tier, TIER_PRICES["T2"])
-                billing_period = biz.get("billingPeriod", "monthly")
-                plan_price = None
-                if effective_plan in ("starter", "pro", "active"):
-                    plan_key = "pro" if effective_plan in ("pro", "active") else "starter"
-                    monthly_price = tier_prices.get(plan_key)
-                    if monthly_price:
-                        if billing_period == "annual":
-                            plan_price = f"€{monthly_price * 10}/year (annual)"
-                        else:
-                            plan_price = f"€{monthly_price}/month"
-
-                trial_ends = biz.get("trialEndsAt", "")
-                billing_status = biz.get("billingStatus", "")
-                subscription_renewal_raw = biz.get("subscriptionRenewalDate", "")
-
-                features_map = {
-                    "trialing": "Full PRO access (trial period)",
-                    "trial": "Full PRO access (trial period)",
-                    "starter": "AI receptionist (WhatsApp + calls), Booking & calendar integration",
-                    "pro": "All Starter features + Win-back automation, Referrals, Reminders & more",
-                    "active": "All PRO features",
-                    "expired": "No active plan — service is paused",
-                    "past_due": "Payment overdue — service may be paused",
-                    "cancelled": "Plan cancelled",
-                }
-                features = features_map.get(effective_plan, "Unknown")
-
-                info_lines = [
-                    f"Business: {biz_name}",
-                    f"Current plan: {effective_plan.upper()}",
-                ]
-                if billing_status and billing_status != effective_plan:
-                    info_lines.append(f"Status: {billing_status}")
-                if plan_price:
-                    info_lines.append(f"Cost: {plan_price}")
-                if trial_ends and effective_plan in ("trialing", "trial"):
-                    info_lines.append(f"Trial ends: {str(trial_ends)[:10]}")
-
-                # Renewal / expiry date for paid plans
-                if subscription_renewal_raw and effective_plan in ("starter", "pro", "active"):
-                    from datetime import datetime as _dt2, timezone as _tz2
-                    try:
-                        _rd = _dt2.fromisoformat(
-                            str(subscription_renewal_raw).replace("Z", "+00:00")
-                        )
-                        if _rd.tzinfo is None:
-                            _rd = _rd.replace(tzinfo=_tz2.utc)
-                        info_lines.append(f"Next renewal: {_rd.strftime('%B %d, %Y')}")
-                    except (ValueError, TypeError):
-                        pass
-                elif subscription_renewal_raw and effective_plan == "past_due":
-                    from datetime import datetime as _dt2, timezone as _tz2
-                    try:
-                        _rd = _dt2.fromisoformat(
-                            str(subscription_renewal_raw).replace("Z", "+00:00")
-                        )
-                        if _rd.tzinfo is None:
-                            _rd = _rd.replace(tzinfo=_tz2.utc)
-                        info_lines.append(f"Payment overdue since: {_rd.strftime('%B %d, %Y')}")
-                    except (ValueError, TypeError):
-                        pass
-
-                info_lines.append(f"Features: {features}")
-
-                return "\n".join(info_lines)
+            elif tool_name == "send_checkout_link":
+                plan = (tool_input.get("plan") or "starter").lower()
+                if plan not in ("starter", "pro"):
+                    return "Invalid plan — must be 'starter' or 'pro'."
+                wa_session = db.get_onboarding_session(phone) or {}
+                sent = await self._send_plan_checkout_link(
+                    phone, biz, plan, wa_session
+                )
+                if sent:
+                    return (
+                        f"Checkout link sent for {plan} plan. "
+                        "Tell the owner to complete payment — activation is automatic."
+                    )
+                return "Failed to generate checkout link. Ask the owner to try again shortly."
 
             elif tool_name == "request_support":
                 reason = tool_input.get("reason", "owner request")
@@ -5120,6 +6027,17 @@ class OnboardingService:
             # Defensive normalization: keep only bare phone digits and drop any
             # accidental multi-device suffix (e.g. "351962461776:9").
             phone = (phone or "").split("@")[0].split(":")[0].strip()
+            if message:
+                try:
+                    session = db.get_onboarding_session(phone) or {}
+                except Exception:
+                    session = {}
+                history = session.get("conversationHistory", []) if session else []
+                user_message = _last_user_message(history)
+                language_hint = session.get("language", "en") if session else "en"
+                target_lang = _language_key_from_text(user_message, language_hint)
+                if target_lang != "en" and _looks_like_english(message):
+                    message = await self._localize_static(message, user_message, language_hint)
             try:
                 logger.debug("Onboarding AI -> %s: %s", phone, message)
             except Exception:
@@ -5149,9 +6067,41 @@ class OnboardingService:
             f"Their phone prefix suggests they speak: {language}. "
             "Respond in that language if they write in it, otherwise match their language."
         )
-        system = f"{ONBOARDING_SYSTEM_PROMPT}\n\n{context_note}\n{lang_note}"
+        try:
+            from app.services.global_kb import build_kb_prompt_section
+            kb_section = build_kb_prompt_section()
+        except Exception as exc:
+            kb_section = ""
+            logger.warning("[GLOBAL_KB] Failed to build KB section: %s", exc)
+
+        parts: list[str] = [ONBOARDING_SYSTEM_PROMPT]
+        components = ["base_system"]
         if extra_context:
-            system = f"{system}\n\n{extra_context}"
+            parts.append(extra_context)
+            components.append("mode_sales_context")
+        if kb_section:
+            parts.append(kb_section)
+            kb_len = len(kb_section)
+            kb_tokens = max(1, kb_len // 4)
+            logger.info(
+                "[GLOBAL_KB] Injected into onboarding tools prompt (chars=%d, approx_tokens=%d)",
+                kb_len, kb_tokens,
+            )
+            components.append("global_kb")
+        else:
+            logger.warning("[GLOBAL_KB] KB section empty for onboarding tools prompt")
+        if context_note:
+            parts.append(context_note)
+            components.append("owner_context")
+        if lang_note:
+            parts.append(lang_note)
+            components.append("language_hint")
+
+        system = "\n\n".join(parts)
+        logger.info(
+            "[PROMPT] onboarding_tools components: %s + history + user_message",
+            " + ".join(components),
+        )
 
         try:
             response = await self.client.messages.create(
@@ -5256,32 +6206,16 @@ class OnboardingService:
                 return f"OAuth link sent: {oauth_link}"
 
             elif tool_name == "send_stripe_link":
-                business_id = session.get("businessId")
                 plan = (tool_input.get("plan") or "starter").lower()
+                business_id = session.get("businessId")
                 if business_id:
-                    try:
-                        from app.services.billing.stripe_service import create_checkout_session
-                        checkout_url = create_checkout_session(
-                            business_id=business_id,
-                            plan_key=plan,
-                            billing_period="monthly",
-                        )
-                        if checkout_url:
-                            await self._send(
-                                phone,
-                                f"💳 Link de pagamento (plano {plan}):\n{checkout_url}\n\n"
-                                "Depois de pagar continua aqui para terminar a configuração.",
-                            )
-                            return f"Stripe checkout link sent for plan={plan}, business={business_id}"
-                        return "Stripe link generation failed — checkout URL was empty."
-                    except Exception as exc:
-                        logger.warning("[ONBOARDING_TOOL] Stripe checkout failed: %s", exc)
-                        return f"Stripe checkout failed: {exc}"
-                else:
-                    # Business not yet created — fall back to the pricing page
-                    pricing_url = f"{settings.BASE_URL.rstrip('/')}/pricing"
-                    await self._send(phone, f"💳 Vê os nossos preços aqui:\n{pricing_url}")
-                    return "Pricing page sent (business not yet created)."
+                    biz = db.get_business_by_id(business_id)
+                    if biz and await self._send_plan_checkout_link(phone, biz, plan, session):
+                        return f"Stripe checkout link sent for plan={plan}, business={business_id}"
+                    return "Stripe checkout link generation failed."
+                pricing_url = f"{settings.BASE_URL.rstrip('/')}/pricing"
+                await self._send(phone, f"💳 Vê os nossos preços aqui:\n{pricing_url}")
+                return "Pricing page sent (business not yet created)."
 
             elif tool_name == "alert_daniel":
                 reason = tool_input.get("reason", "owner request")

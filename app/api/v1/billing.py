@@ -244,9 +244,9 @@ async def subscribe_redirect(
             media_type="application/json",
         )
 
-    base_url = settings.BASE_URL.rstrip("/")
-    success_url = f"{base_url}/api/v1/billing/success?biz={businessId}&plan={plan}"
-    cancel_url = f"{base_url}/api/v1/billing/cancel"
+    from app.services.billing.checkout_urls import checkout_redirect_urls
+
+    success_url, cancel_url = checkout_redirect_urls(businessId, plan)
 
     checkout_url = create_checkout_session(
         business=business,
@@ -279,23 +279,71 @@ async def subscribe_redirect(
 async def billing_success(
     biz: str = Query("", description="Business ID from success redirect"),
     plan: str = Query("", description="Plan name from success redirect"),
+    session_id: str = Query("", description="Stripe Checkout Session ID"),
 ) -> HTMLResponse:
     """Landing page after successful Stripe payment.
 
-    Stripe redirects the owner here after a completed checkout.
-    Since the platform is WhatsApp-first, this page simply confirms payment
-    and tells the owner to return to WhatsApp.
+    Syncs payment from Stripe when ``session_id`` is present (fallback if the
+    webhook signature failed). DB is always the source of truth for WhatsApp replies.
     """
+    import asyncio
+
+    from app import firestore as db
+    from app.api.v1.webhooks import notify_owner_plan_activated_for_business
+    from app.services.billing.stripe_service import sync_checkout_session
+    from app.services.onboarding_plan_info import is_subscription_paid_in_db
+
     plan_label = plan.title() if plan else "Selected"
+    db_confirmed = False
+    biz_name = ""
+    sync_note = ""
+
+    # Fallback: activate from Stripe API when webhook did not run (wrong whsec, etc.)
+    if session_id:
+        sync_result = sync_checkout_session(session_id)
+        if sync_result == "activated":
+            sync_note = "synced_from_checkout_session"
+            if biz:
+                asyncio.create_task(
+                    notify_owner_plan_activated_for_business(biz, plan or "starter")
+                )
+        elif sync_result.startswith("unpaid:"):
+            logger.info("[BILLING] success page: session %s %s", session_id, sync_result)
+        elif sync_result not in ("stripe_not_configured", "retrieve_failed", "business_not_found"):
+            logger.info("[BILLING] success page sync %s → %s", session_id, sync_result)
+
+    if biz:
+        business = db.get_business_by_id(biz)
+        if business:
+            biz_name = business.get("name") or ""
+            db_confirmed = is_subscription_paid_in_db(business)
+            if not plan:
+                plan_label = str(business.get("plan") or plan_label).title()
+
+    if db_confirmed:
+        status_block = (
+            "<p>Your payment is <b>confirmed in our system</b>. ✅</p>"
+            "<p>Your AI receptionist is active.</p>"
+        )
+    else:
+        status_block = (
+            "<p>Stripe received your payment — we're activating your plan now.</p>"
+            "<p>This usually takes a few seconds. You'll get a <b>WhatsApp confirmation</b> "
+            "once it's ready.</p>"
+            "<p style='font-size:0.9em;color:#888;'>If WhatsApp doesn't update in 2 minutes, "
+            "reply <b>I paid</b> on WhatsApp and we'll check again.</p>"
+        )
+
+    name_line = f"<p>Business: <b>{biz_name}</b></p>" if biz_name else ""
     html = _page(
         title="Payment Successful",
         body=(
-            f"<h2>🎉 Payment confirmed!</h2>"
-            f"<p>Your <b>Recepte {plan_label}</b> subscription is now <b>active</b>.</p>"
-            f"<p>Your AI receptionist will resume automatically within a few seconds.</p>"
+            f"<h2>🎉 Thank you!</h2>"
+            f"{name_line}"
+            f"<p>Your <b>Recepte {plan_label}</b> subscription is being activated.</p>"
+            f"{status_block}"
             f"<hr>"
-            f"<p>📱 <b>Return to WhatsApp</b> — your assistant is ready.</p>"
-            f"<p style='font-size:0.85em;color:#888;'>Business ID: {biz}</p>"
+            f"<p>📱 <b>Return to WhatsApp</b> for your confirmation message.</p>"
         ),
         color="#27ae60",
     )

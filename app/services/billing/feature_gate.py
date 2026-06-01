@@ -21,14 +21,12 @@ STARTER_FEATURES: frozenset[str] = frozenset({
 
 PRO_FEATURES: frozenset[str] = STARTER_FEATURES | frozenset({
     "win_back_automation",       # Win-back automation
-    "reminders",                 # Vaccine / treatment / birthday reminders
+    "reminders",                 # Booking / appointment reminders
     "google_review_automation",  # Google Review automation
     "referral_system",           # Friend-brings-friend referral
-    "instagram_collabs",         # Instagram collaborations
     "tag_friend_autopost",       # Tag-a-friend auto-post
     "loyalty_stamp_card",        # Loyalty stamp card
-    "whatsapp_status_content",   # WhatsApp Status content generator
-    "customer_ltv_insights",     # Customer LTV insights
+    "customer_ltv_insights",     # Customer LTV insights dashboard
     "priority_support",
 })
 

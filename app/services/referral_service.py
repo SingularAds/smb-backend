@@ -37,6 +37,7 @@ from datetime import datetime, timedelta
 
 from app import firestore as db
 from app.services.automation.whatsapp_notifier import send_to_customer
+from app.services.i18n import t, get_customer_language
 
 logger = logging.getLogger(__name__)
 
@@ -149,22 +150,21 @@ async def handle_referral_message(
             "[Referral] Sender %s already has %d visits — referral not applicable",
             sender_phone, total_visits,
         )
+        lang = get_customer_language(business_id, sender_phone)
         await send_to_customer(
             business,
             sender_phone,
-            f"👋 Welcome back! You're already one of our valued customers at *{biz_name}*. "
-            f"We look forward to seeing you again! 😊",
+            t("referral_already_customer", lang, biz=biz_name),
         )
         return False  # Continue to AI so they can book normally
 
     # 4. Already referred — just re-acknowledge, don't create a second record
     if existing and existing.get("referredBy"):
+        lang = get_customer_language(business_id, sender_phone)
         await send_to_customer(
             business,
             sender_phone,
-            f"👋 Hi! You were referred by *{referrer_name}*. "
-            f"We already have your *{referee_pct}% discount* saved for your first visit. "
-            f"See you soon! 😊",
+            t("referral_already_referred", lang, referrer=referrer_name, pct=referee_pct),
         )
         return True  # No need to route to AI again
 
@@ -205,13 +205,11 @@ async def handle_referral_message(
     )
 
     # 6. Welcome message — SHORT so the AI can naturally continue the booking conversation
+    lang = get_customer_language(business_id, sender_phone_clean)
     await send_to_customer(
         business,
         sender_phone_clean,
-        f"👋 *Welcome to {biz_name}!*\n\n"
-        f"You were referred by *{referrer_name}* — thank you for coming! 🎉\n\n"
-        f"Your *{referee_pct}% discount* is saved for your first visit. "
-        f"The team will apply it at checkout.",
+        t("referral_welcome", lang, biz=biz_name, referrer=referrer_name, pct=referee_pct),
     )
     return False  # Let AI continue — it will ask "When would you like to come in?"
 
@@ -376,14 +374,12 @@ async def _reward_referrer(
         or "Your referred friend"
     )
     biz_name = business.get("name", "us")
+    lang = get_customer_language(business_id, referrer_phone)
 
     await send_to_customer(
         business,
         referrer_phone,
-        f"🎉 *Great news!*\n\n"
-        f"*{friend_name}* just completed their first visit at *{biz_name}*!\n\n"
-        f"As a thank-you, you've earned a *{referrer_pct}% discount* on your next visit. "
-        f"The team will apply it at checkout. 😊",
+        t("referral_reward", lang, friend=friend_name, biz=biz_name, pct=referrer_pct),
     )
     logger.info(
         "[Referral] Rewarded %s with %d%% discount (friend=%s)",
