@@ -114,7 +114,7 @@ def list_bookings_by_status(business_id: str, status: str, limit: int = 200) -> 
 def set_business(business_id: str, data: dict) -> dict:
     """Create or update a business document"""
     data["id"] = business_id
-    _db().collection("businesses").document(business_id).set(data)
+    _db().collection("businesses").document(business_id).set(data, merge=True)
     return data
 
 
@@ -369,6 +369,28 @@ def get_booking(booking_id: str, business_id: str) -> dict | None:
     data["id"] = doc.id
     data["businessId"] = business_id
     return data
+
+
+def get_booking_across_businesses(booking_id: str) -> dict | None:
+    """Fetch a booking by its ID across all businesses using a collection group query."""
+    try:
+        docs = (
+            _db().collection_group("bookings")
+            .where(filter=FieldFilter("id", "==", booking_id))
+            .limit(1)
+            .stream()
+        )
+        for doc in docs:
+            data = doc.to_dict()
+            data["id"] = doc.id
+            path_parts = doc.reference.path.split("/")
+            if len(path_parts) >= 2:
+                data["businessId"] = path_parts[1]
+            return data
+    except Exception as exc:
+        logger.error("get_booking_across_businesses: failed for booking_id=%s: %s", booking_id, exc, exc_info=True)
+    return None
+
 
 
 def update_booking(booking_id: str, updates: dict, business_id: str = "") -> dict | None:

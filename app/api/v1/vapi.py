@@ -49,6 +49,22 @@ def _to_int(value: object, default: int) -> int:
         return default
 
 
+def _party_size_from_body(body: dict, default: int = 1) -> int:
+    """Read party size from common VAPI/LLM parameter names."""
+    value = (
+        body.get("partySize")
+        or body.get("party_size")
+        or body.get("numberOfPeople")
+        or body.get("people")
+        or body.get("persons")
+        or body.get("guests")
+        or body.get("attendees")
+        or body.get("party")
+        or default
+    )
+    return max(_to_int(value, default), 1)
+
+
 def _resolve_date_from_hint(raw_datetime: str, raw_day: str) -> tuple[str, str] | tuple[None, str]:
     """Resolve date from datetime/day strings.
 
@@ -106,6 +122,7 @@ def _find_next_available_slots(
     business_id: str,
     call_info: dict,
     max_days: int = 30,
+    party_size: int = 1,
 ) -> dict:
     """Find the first next date with available slots within max_days."""
     try:
@@ -120,6 +137,7 @@ def _find_next_available_slots(
                 "date": candidate.isoformat(),
                 "durationMinutes": duration_minutes,
                 "businessId": business_id,
+                "partySize": party_size,
             },
             call_info,
         )
@@ -182,8 +200,9 @@ async def vapi_webhook(
             duration = _to_int(body.get("duration", 60), 60)
             business_id = body.get("businessId", "")
             phone_number_id = body.get("phoneNumberId", "")
+            party_size = _party_size_from_body(body)
 
-            print(f"[VAPI] Slot Input: datetime='{raw_dt}' day='{raw_day}' duration={duration}")
+            print(f"[VAPI] Slot Input: datetime='{raw_dt}' day='{raw_day}' duration={duration} partySize={party_size}")
 
             resolved_date, resolve_reason = _resolve_date_from_hint(raw_dt, raw_day)
             if resolved_date:
@@ -214,6 +233,7 @@ async def vapi_webhook(
                 "date": resolved_date,
                 "durationMinutes": duration,
                 "businessId": business_id,
+                "partySize": party_size,
             }
             # Use the corrected resolved_date for the earliest boundary, not
             # the raw (potentially wrong-year) datetime sent by the AI.
@@ -250,6 +270,7 @@ async def vapi_webhook(
                     business_id=business_id,
                     call_info=call_info,
                     max_days=30,
+                    party_size=party_size,
                 )
                 if payload.get("error"):
                     print(f"[VAPI] Slot Error: {payload['error']}")
