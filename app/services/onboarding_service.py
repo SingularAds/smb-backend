@@ -934,7 +934,37 @@ _LANG_SCRIPT_PATTERNS: dict[str, re.Pattern] = {
     "ko": re.compile(r"[\uAC00-\uD7AF]"),
 }
 
+_LANGUAGE_NAME_TO_CODE: dict[str, str] = {
+    "english": "en",
+    "portuguese": "pt",
+    "portugues": "pt",
+    "spanish": "es",
+    "espanol": "es",
+    "french": "fr",
+    "francais": "fr",
+    "german": "de",
+    "deutsch": "de",
+    "italian": "it",
+    "italiano": "it",
+    "hindi": "hi",
+    "arabic": "ar",
+    "russian": "ru",
+    "japanese": "ja",
+    "korean": "ko",
+    "chinese": "zh",
+    "mandarin": "zh",
+    "estonian": "et",
+}
+
+_LANGUAGE_OVERRIDE_EN_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:in\s+)?english\s*(?:please)?\s*$"
+    r"|(?:\benglish\b.*\b(change|switch|use|speak|reply|respond|answer|language)\b)"
+    r"|(?:\b(change|switch|use|speak|reply|respond|answer|language)\b.*\benglish\b)",
+    re.IGNORECASE,
+)
+
 _STATIC_TRANSLATION_CACHE: dict[tuple[str, str], str] = {}
+_LANGUAGE_DETECTION_CACHE: dict[str, tuple[str, float]] = {}
 
 
 def _language_key_from_text(text: str, fallback: str = "en") -> str:
@@ -943,6 +973,38 @@ def _language_key_from_text(text: str, fallback: str = "en") -> str:
             if pattern.search(text):
                 return lang
     return (fallback or "en")[:2].lower()
+
+
+def _extract_language_override(text: str) -> str | None:
+    if not text:
+        return None
+    if _LANGUAGE_OVERRIDE_EN_RE.search(text):
+        return "en"
+
+    normalized = re.sub(r"[^A-Za-z ]", " ", text).lower()
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return None
+
+    words = normalized.split()
+    if len(words) <= 2:
+        for name, code in _LANGUAGE_NAME_TO_CODE.items():
+            if name in words:
+                return code
+        return None
+
+    hint_words = (
+        "language", "lang", "speak", "reply", "respond", "answer",
+        "in", "use", "change", "switch",
+    )
+    padded = f" {normalized} "
+    if not any(f" {w} " in padded for w in hint_words):
+        return None
+
+    for name, code in _LANGUAGE_NAME_TO_CODE.items():
+        if f" {name} " in padded:
+            return code
+    return None
 
 
 def _detect_msg_language(text: str) -> str:
@@ -1597,6 +1659,69 @@ class OnboardingService:
         self.client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
         self.model = "claude-sonnet-4-20250514"
 
+    async def _detect_language_llm(self, text: str) -> tuple[str, float]:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return "", 0.0
+
+        cached = _LANGUAGE_DETECTION_CACHE.get(cleaned)
+        if cached:
+            return cached
+
+        prompt = (
+            "Detect the language of the message below. "
+            "Return JSON only: {\"lang\": \"xx\", \"confidence\": 0.0}. "
+            "Use ISO 639-1 two-letter codes. If unsure, use \"und\".\n\n"
+            f"Message:\n{cleaned}"
+        )
+
+        lang = ""
+        conf = 0.0
+        try:
+            response = await self.client.messages.create(
+                model=self.model,
+                max_tokens=60,
+                system="You are a language detector. Output only JSON.",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = _strip_code_fences(response.content[0].text or "")
+            data = json.loads(raw)
+            lang = str(data.get("lang", "")).strip().lower()
+            conf = float(data.get("confidence", 0.0) or 0.0)
+        except Exception as exc:
+            logger.warning("[LANG] LLM language detection failed: %s", exc)
+
+        if lang == "und":
+            lang = ""
+        if len(lang) > 2:
+            lang = lang[:2]
+        if not re.fullmatch(r"[a-z]{2}", lang):
+            lang = ""
+        conf = max(0.0, min(conf, 1.0))
+
+        _LANGUAGE_DETECTION_CACHE[cleaned] = (lang, conf)
+        return lang, conf
+
+    async def _resolve_message_language(
+        self,
+        body: str,
+        phone: str,
+        session: dict | None,
+    ) -> tuple[str, bool]:
+        override = _extract_language_override(body)
+        if override:
+            return override, True
+
+        detected, confidence = await self._detect_language_llm(body)
+        if detected and (confidence >= 0.6 or not session):
+            return detected, confidence >= 0.6
+
+        if session and session.get("language"):
+            return session["language"], False
+
+        fallback = self.ai.detect_language(phone) or "en"
+        return fallback, False
+
     async def _localize_static(
         self,
         text: str,
@@ -1661,6 +1786,14 @@ class OnboardingService:
         #    completed setup and later taps the recepte.co deep-link again.
         existing_biz = db.get_business_by_owner_phone(phone)
 
+        # Detect language for this specific message (LLM-based) and update session.
+        lang_for_message, should_update_lang = await self._resolve_message_language(
+            body, phone, session
+        )
+        if session and lang_for_message and (should_update_lang or not session.get("language")):
+            db.upsert_onboarding_session(phone, {"language": lang_for_message})
+            session["language"] = lang_for_message
+
         # ── recepte.co activation message: intercept EARLY ───────────────────
         # "I want to activate recepte for <BusinessName>" arrives when the owner
         # taps the WhatsApp deep-link on recepte.co.  We handle it before the
@@ -1678,7 +1811,12 @@ class OnboardingService:
             _act = _RECEPTE_ACTIVATION_RE.match(body.strip())
             if _act:
                 await self._start_recepte_onboarding(
-                    phone, body, push_name, message_id, _act.group(1).strip()
+                    phone,
+                    body,
+                    push_name,
+                    message_id,
+                    _act.group(1).strip(),
+                    lang_override=lang_for_message,
                 )
                 return
         # ─────────────────────────────────────────────────────────────────────
@@ -1875,23 +2013,34 @@ class OnboardingService:
                 "[LEAD-LOOKUP] Lead found in '%s' for %s: businessName=%r — showing confirmation card",
                 _col, phone, _biz,
             )
-            await self._show_lead_confirmation(phone, body, push_name, message_id, lead)
+            await self._show_lead_confirmation(
+                phone,
+                body,
+                push_name,
+                message_id,
+                lead,
+                lang_override=lang_for_message,
+            )
             return
 
         print(f"[LEAD-LOOKUP] No lead found for {phone} — starting normal cold-start onboarding")
         logger.info("[LEAD-LOOKUP] No lead found for %s — starting normal onboarding", phone)
-        await self._start_new(phone, body, push_name, message_id)
+        await self._start_new(phone, body, push_name, message_id, lang_override=lang_for_message)
 
     # ── new session ───────────────────────────────────────────────────────
 
     async def _start_new(
-        self, phone: str, body: str, push_name: str, message_id: str
+        self,
+        phone: str,
+        body: str,
+        push_name: str,
+        message_id: str,
+        *,
+        lang_override: str | None = None,
     ) -> None:
-        # Detect language from message content first (handles cases where the
-        # phone-number prefix doesn't match the user's actual language, e.g.
-        # a Portuguese speaker on an Indian number).
-        _msg_lang = _detect_msg_language(body)
-        lang = _msg_lang or self.ai.detect_language(phone)
+        lang = lang_override
+        if not lang:
+            lang, _ = await self._resolve_message_language(body, phone, None)
         now = datetime.utcnow().isoformat()
 
         # Build initial conversation with the user's first message
@@ -2032,6 +2181,8 @@ class OnboardingService:
         push_name: str,
         message_id: str,
         lead: dict,
+        *,
+        lang_override: str | None = None,
     ) -> None:
         """Create a ``recepte_confirm`` session and send the pre-filled data card.
 
@@ -2044,7 +2195,9 @@ class OnboardingService:
         owner_name = push_name or lead.get("name") or ""
         biz_type   = lead.get("type", "")
         city       = lead.get("city", "")
-        lang       = self.ai.detect_language(phone)
+        lang = lang_override
+        if not lang:
+            lang, _ = await self._resolve_message_language(body, phone, None)
         now        = datetime.utcnow().isoformat()
 
         logger.info("[RECEPTE] Showing lead confirmation for %s: businessName=%r", phone, biz_name)
@@ -2112,6 +2265,8 @@ class OnboardingService:
         push_name: str,
         message_id: str,
         business_name_hint: str,
+        *,
+        lang_override: str | None = None,
     ) -> None:
         """Start onboarding when the user sends the recepte.co WhatsApp activation message.
 
@@ -2133,7 +2288,13 @@ class OnboardingService:
                 "[RECEPTE] No lead found for %s — falling back to standard onboarding", phone
             )
             logger.info("[RECEPTE] No pre-saved lead for %s, starting normal onboarding", phone)
-            await self._start_new(phone, body, push_name, message_id)
+            await self._start_new(
+                phone,
+                body,
+                push_name,
+                message_id,
+                lang_override=lang_override,
+            )
             return
 
         # Merge business name hint from the activation message if lead lacks one
@@ -2142,7 +2303,14 @@ class OnboardingService:
             lead["businessName"] = business_name_hint
 
         logger.info("[RECEPTE] Lead found for %s: businessName=%r", phone, lead.get("businessName"))
-        await self._show_lead_confirmation(phone, body, push_name, message_id, lead)
+        await self._show_lead_confirmation(
+            phone,
+            body,
+            push_name,
+            message_id,
+            lead,
+            lang_override=lang_override,
+        )
 
     async def _handle_recepte_confirm(
         self,
@@ -5438,7 +5606,13 @@ class OnboardingService:
                 phone,
             )
             db.delete_onboarding_session(phone)
-            await self._start_new(phone, body, push_name, message_id)
+            await self._start_new(
+                phone,
+                body,
+                push_name,
+                message_id,
+                lang_override=lang,
+            )
             return
 
         # Not confirmed — restore post_onboarding and show available commands.
@@ -5535,26 +5709,11 @@ class OnboardingService:
         """
         biz_id = biz.get("id", "")
         biz_name = biz.get("name", "your business")
-        # Detect language from the CURRENT message body first — this is what the
-        # owner is writing RIGHT NOW and must take precedence over any stored value.
-        # `_language_key_from_text` checks non-Latin script patterns (Arabic, CJK…).
-        # For Latin-script messages we fall back to `langdetect` via ai.detect_language
-        # on the message text directly (not the phone prefix) to avoid the session
-        # language "pt" being inherited by English-speaking owners.
-        _msg_lang = _language_key_from_text(body)
-        if _msg_lang != "en" or not body.strip():
-            # Non-Latin script detected OR empty body — trust _language_key_from_text
-            lang = _msg_lang
-        else:
-            # Latin script: try langdetect on the message text, then phone prefix,
-            # then stored session language as last resort.
-            try:
-                from langdetect import detect as _ld_detect, LangDetectException as _LDE
-                _detected = _ld_detect(body)
-                # langdetect returns e.g. "pt", "en", "es", "fr", "de" — use as-is
-                lang = _detected[:2].lower()
-            except Exception:
-                lang = self.ai.detect_language(phone) or (session.get("language") if session else None) or "en"
+        # Detect language for this message so post-onboarding replies stay consistent.
+        lang, should_update_lang = await self._resolve_message_language(body, phone, session)
+        if session and lang and (should_update_lang or not session.get("language")):
+            db.upsert_onboarding_session(phone, {"language": lang})
+            session["language"] = lang
         push = push_name or (session.get("pushName") if session else "") or ""
 
         # ── Billing recovery gate: check plan FIRST before anything else ──
@@ -6065,24 +6224,19 @@ class OnboardingService:
                     session = {}
                 history = session.get("conversationHistory", []) if session else []
                 user_message = _last_user_message(history)
-                language_hint = session.get("language", "en") if session else "en"
-                target_lang = _language_key_from_text(user_message, language_hint)
-                # For Latin-script languages (Portuguese, Spanish, French, etc.),
-                # _language_key_from_text returns "en" when language_hint is "en"
-                # because it only detects non-Latin scripts via regex.  Use
-                # langdetect as a fallback to identify the actual language.
-                if target_lang == "en" and user_message:
-                    _dml = _detect_msg_language(user_message)
-                    if _dml and _dml != "en":
-                        target_lang = _dml
-                        # Persist the detected language so subsequent template
-                        # messages in this session are translated without
-                        # re-running langdetect every time.
-                        if session and session.get("language", "en") == "en":
+                target_lang = session.get("language", "en") if session else "en"
+                if user_message:
+                    detected_lang, should_update_lang = await self._resolve_message_language(
+                        user_message, phone, session if session else None
+                    )
+                    if detected_lang:
+                        target_lang = detected_lang
+                        if session and (should_update_lang or not session.get("language")):
                             try:
                                 db.upsert_onboarding_session(
-                                    phone, {"language": target_lang}
+                                    phone, {"language": detected_lang}
                                 )
+                                session["language"] = detected_lang
                             except Exception:
                                 pass
                 if target_lang != "en" and _looks_like_english(message):
