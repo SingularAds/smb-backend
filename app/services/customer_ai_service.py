@@ -18,7 +18,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from anthropic import AsyncAnthropic
+from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
 
 from app.config import settings
 from app import firestore as db
@@ -370,8 +370,8 @@ class CustomerAIService:
 
     def __init__(self):
         self.wa = WhatsmeowClient()
-        self.client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-        self.model = "claude-sonnet-4-20250514"
+        self.client = AsyncOpenAIAnthropicWrapper(api_key=settings.OPENAI_API_KEY)
+        self.model = "gpt-4o-mini"
 
     async def handle_customer_message(
         self,
@@ -572,31 +572,76 @@ class CustomerAIService:
 
             final_reply = "\n".join(final_text_parts).strip() or "I'm here to help! How can I assist you?"
             
-            # HALLUCINATION GUARD: If Claude generated a booking confirmation WITHOUT calling the tool, reject it
-            booking_keywords = [
-                "confirmed!", "confirmed for", "booking confirmed",
-                "reservation confirmed", "table for", "your booking",
-                "your reservation", "your table",
-                "booking id:", "booking id =", "booking id=",
-                "booking details", "booking details:",
+            # ── HALLUCINATION GUARD ──────────────────────────────────────────
+            # Only trigger if the AI *claims* a specific action was COMPLETED
+            # but the corresponding tool was NOT actually called this turn.
+            # Conversational gathering phrases (e.g. "What time?") must NEVER trigger.
+            
+            _reply_lower = final_reply.lower()
+
+            # Map: (action phrases) → (required tools)
+            _action_checks = [
+                (
+                    # Booking created / confirmed
+                    [
+                        "booking confirmed", "reservation confirmed",
+                        "your table has been booked", "your table is confirmed",
+                        "reservation successfully created", "booking successfully created",
+                        "booking is confirmed", "reservation is confirmed",
+                        "successfully booked", "i've booked", "i have booked",
+                        "your booking id", "booking id:", "booking id =",
+                    ],
+                    {"create_booking"},
+                ),
+                (
+                    # Booking cancelled
+                    [
+                        "booking has been cancelled", "reservation cancelled",
+                        "cancellation successful", "successfully cancelled",
+                        "your booking is cancelled", "booking is canceled",
+                        "reservation has been cancelled",
+                    ],
+                    {"cancel_booking"},
+                ),
+                (
+                    # Booking rescheduled / updated
+                    [
+                        "booking has been rescheduled", "reservation rescheduled",
+                        "appointment has been updated", "booking moved to",
+                        "reservation moved to", "successfully rescheduled",
+                        "rescheduled to", "updated your booking",
+                    ],
+                    {"reschedule_booking", "update_booking"},
+                ),
+                (
+                    # Booking lookup / retrieval presented as fact
+                    [
+                        "here are your booking details", "your reservation is scheduled for",
+                        "i found your booking", "found your reservation",
+                        "your booking is scheduled",
+                    ],
+                    {"get_booking", "list_bookings", "get_customer_bookings"},
+                ),
             ]
-            has_booking_language = any(keyword in final_reply.lower() for keyword in booking_keywords)
-            
-            # Did Claude call a booking-related tool in this turn?
-            called_booking_tool = any(
-                tr["name"] in ("create_booking", "reschedule_booking", "update_booking", "cancel_booking")
-                for tr in tool_results
-            )
-            
-            # BLOCK: Confirmation text without tool call = hallucination
-            if has_booking_language and not called_booking_tool:
-                logger.error(
-                    "[HALLUCINATION-DETECTED] Customer %s business %s: "
-                    "Claude generated booking confirmation without calling tool. "
-                    "Blocked response: %s", customer_phone, business["id"], final_reply[:200]
-                )
-                # Retry: force Claude to actually call the booking tool using conversation context.
-                # This preserves state (service, date, time, party) instead of asking all over again.
+
+            called_tools = {tr["name"] for tr in tool_results}
+            hallucination_detected = False
+            for claim_phrases, required_tools in _action_checks:
+                if any(phrase in _reply_lower for phrase in claim_phrases):
+                    if not called_tools & required_tools:
+                        hallucination_detected = True
+                        logger.error(
+                            "[HALLUCINATION-DETECTED] Customer %s business %s: "
+                            "AI claimed completed action without calling required tool(s) %s. "
+                            "Called tools: %s. Blocked response: %s",
+                            customer_phone, business["id"], required_tools, called_tools,
+                            final_reply[:200],
+                        )
+                        break
+
+            if hallucination_detected:
+                # Retry: force the AI to actually call the required tool using full conversation context.
+                # This preserves state (service, date, time, party) so the customer does not repeat themselves.
                 final_reply = await self._force_tool_retry(
                     system=system,
                     history=history,
@@ -813,8 +858,8 @@ class CustomerAIService:
                     from app.services.automation.booking_automation import send_cancellation_notice
                     from app.services.automation.whatsapp_notifier import send_to_owner
                     cancelled_booking = payload.get("booking") or {"customerPhone": customer_phone, "id": booking_id}
-                    _asyncio.get_event_loop().create_task(send_cancellation_notice(cancelled_booking, business))
-                    _asyncio.get_event_loop().create_task(send_to_owner(
+                    _asyncio.ensure_future(send_cancellation_notice(cancelled_booking, business))
+                    _asyncio.ensure_future(send_to_owner(
                         business,
                         f"❌ *Booking cancelled*\nCustomer: {cancelled_booking.get('customerName', push_name)}\n"
                         f"Phone: {customer_phone}\nService: {cancelled_booking.get('serviceName', '')}\n"
@@ -859,7 +904,7 @@ class CustomerAIService:
                         new_dt_fmt = datetime.fromisoformat(new_dt_str).strftime("%B %d, %Y at %I:%M %p") if new_dt_str else new_dt_str
                     except ValueError:
                         new_dt_fmt = new_dt_str
-                    _asyncio.get_event_loop().create_task(send_to_owner(
+                    _asyncio.ensure_future(send_to_owner(
                         business,
                         f"🔄 *Booking rescheduled*\nCustomer: {updated_bk.get('customerName', push_name)}\n"
                         f"Phone: {customer_phone}\nService: {updated_bk.get('serviceName', '')}\n"

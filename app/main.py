@@ -118,7 +118,17 @@ if settings.ENVIRONMENT.lower() == "production":
 _media_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "media")
 _os.makedirs(_media_dir, exist_ok=True)
 app.mount("/media", StaticFiles(directory=_media_dir), name="media")
+import time
+from fastapi import Request
+
 # ── Middleware ──
+@app.middleware("http")
+async def add_process_time_logger(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    logging.info(f"[LATENCY] Backend Request: {request.method} {request.url.path} took {process_time:.3f}s")
+    return response
 
 # CORS
 app.add_middleware(

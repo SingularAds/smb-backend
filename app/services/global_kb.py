@@ -93,8 +93,7 @@ Pro Plan — Everything in Starter, plus:
 PRICING
 Prices depend on country/region and are shown per business at checkout.
 Typical monthly pricing:
-  • Starter: starts from €15–€29/month
-  • Pro: starts from €29–€59/month
+  • Starter & Pro plans range from $7 to $149/month depending on region
 Annual billing is available at 2 months free (10 months charged for 12).
 
 FREE TRIAL

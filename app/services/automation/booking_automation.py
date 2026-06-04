@@ -180,8 +180,7 @@ async def run_reminder_sweep() -> None:
                     total_sent += 1
 
         except Exception as exc:
-            logger.exception("[Automation] Reminder sweep failed for business %s: %s", biz_id, exc)
-            logger.error("[AUTOMATION:REMINDER_SWEEP] error for biz %s: %s", biz_id, exc)
+            logger.exception("[AUTOMATION:REMINDER_SWEEP] error for biz %s", biz_id)
 
     logger.info("[AUTOMATION:REMINDER_SWEEP] done — %d reminders sent across %d businesses", total_sent, len(businesses))
 
@@ -376,8 +375,9 @@ async def _maybe_send_owner_referral_confirmation(business: dict, booking: dict)
     if not owner_phone:
         return
 
-    now_iso = datetime.utcnow().isoformat()
-    expires_iso = (datetime.utcnow() + timedelta(hours=24)).isoformat()
+    now_utc = datetime.now(timezone.utc)
+    now_iso = now_utc.isoformat()
+    expires_iso = (now_utc + timedelta(hours=24)).isoformat()
 
     db.create_referral_owner_confirmation(biz_id, {
         "businessId": biz_id,

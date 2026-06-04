@@ -35,7 +35,12 @@ def _in_range(raw, start: str, end: str) -> bool:
     dt = _parse_dt(raw)
     if not dt:
         return False
-    return start <= dt.isoformat() < end
+    try:
+        start_dt = datetime.fromisoformat(start)
+        end_dt = datetime.fromisoformat(end)
+        return start_dt <= dt < end_dt
+    except (ValueError, TypeError):
+        return False
 
 
 async def run_daily_summary_for_all_businesses() -> None:
@@ -91,7 +96,7 @@ async def _send_daily_summary(business: dict, today_start: str, today_end: str) 
     cancelled_today = [
         b for b in all_bookings
         if b.get("status") == "cancelled"
-        and _in_range(b.get("updatedAt") or b.get("cancelleddAt") or b.get("datetime"), today_start, today_end)
+        and _in_range(b.get("updatedAt") or b.get("cancelledAt") or b.get("datetime"), today_start, today_end)
     ]
 
     # New customers today (createdAt in today range)

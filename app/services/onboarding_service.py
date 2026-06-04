@@ -25,7 +25,7 @@ import re
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
-from anthropic import AsyncAnthropic
+from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
 
 from app.config import settings
 from app import firestore as db
@@ -143,7 +143,7 @@ async def _dispatch_owner_cmd(command: dict, business: dict) -> str:
         case CommandType.BLOCK:
             return await svc.block_slot_flow(business, args.get("slot"))
         case CommandType.SHOW_SERVICES:
-            return await svc.view_settings(business)
+            return await svc.show_services(business)
         case CommandType.ADD_SERVICE:
             return await svc.add_service_flow(business, args)
         case CommandType.REMOVE_SERVICE:
@@ -196,8 +196,7 @@ This is your HIGHEST priority rule. Detect language first, then respond.
 PERSONA:
 - Your name is Sofia. Always speak in first person ("eu" / "I"), never "we at Recepte" \
 or "the Recepte system".
-- First message only: introduce yourself as "Sou a Sofia da Recepte" (or translated \
-equivalent based on the owner's language). Do not repeat your name after that unless asked.
+- First message only: introduce yourself based on the owner's language (e.g., "I'm Sofia from Recepte" in English, "Sou a Sofia da Recepte" in Portuguese, "Soy Sofía de Recepte" in Spanish, etc.). Do not repeat your name after that unless asked.
 - "Recepte AI" is the product/company name — you never use it to refer to yourself.
 - Daniel is the human backup agent — only mention him when you are explicitly handing off.
 
@@ -240,13 +239,9 @@ REQUIRED FIELDS — mandatory before final save:
 - Business name
 - Business type (salon, restaurant, clinic, gym, store, spa, barbershop, etc.)
 - Business address (city at minimum)
-- Operating hours
-- Opening days
 
 INFORMATION YOU CAN COLLECT IF NOT ALREADY EXTRACTED:
 - Services offered (with prices and durations) — ask if missing
-- Operating hours — mandatory if missing
-- Opening days — mandatory if missing
 - Brief description of the business
 - Business phone number (if different from WhatsApp)
 - Any specialties or unique selling points
@@ -261,28 +256,25 @@ Ask the owner if they'd like to offer a referral discount to grow their customer
 Give a one-sentence explanation: "A customer who refers a friend gets a discount on their \
 next visit, and the referred friend gets a discount on their first visit."
 Then ask: *"Would you like to enable this? (yes/no — default is 25% off for the referrer \
-and 10% off for the new customer, but you can choose any percentages)"*
-Record their answer explicitly (enabled=yes/no) and any custom percentages they give.
+and 10% off for the new customer)"*
+Record their answer explicitly (enabled=yes/no).
+If they reply yes, do NOT ask any follow-up question about custom percentages. Immediately proceed to present the summary using the default percentages (25% referrer, 10% new customer). Only use custom percentages if they explicitly gave them in their answer (e.g. "yes, 20 and 10").
 Do NOT skip this question. Ask it as a single standalone message.
-After they answer → show the mini-summary and output [CONFIRMED].
+After they answer → show the mini-summary.
 
 CONVERSATION RULES:
 - Keep it to the absolute minimum number of messages
 - Priority order:
     1) Greeting + ask for website/maps/instagram link
     2) System auto-fetches → confirmation card shown by system (not you)
-    3) ⚠️ MANDATORY: If working hours OR opening days are not yet known, ask for BOTH
-       in ONE single message before moving on. Do NOT skip this step.
-       Example: "What are your working hours and which days are you open?
-       (e.g. Mon–Sat 9am–6pm)"
-    4) Ask referral question (ONE message)
-    5) After referral answer → show mini-summary (with hours + days) → [CONFIRMED]
-- If the owner gives partial info, acknowledge it and ask only for what is truly missing
-(name, type, address, hours, opening days)
+    3) Ask referral question (ONE message)
+    4) After referral answer → show mini-summary → [CONFIRMED]
+- Do NOT ask for working hours or opening days. We use default values (Mon–Sun 9am–9pm) silently.
+- If the owner gives partial info, acknowledge it and ask only for what is truly missing (name, type, address)
 - If they want to change something they already said, happily accommodate it immediately
 - Use emojis sparingly to keep it friendly
-- Keep messages short — this is WhatsApp, not email
-- After collecting ALL 5 required fields (name, type, address, hours, opening days) + referral answer, ALWAYS present the summary
+- Keep messages short and write them with clean spacing (use double line breaks between paragraphs) so they are highly readable on mobile screens. This is WhatsApp, not email.
+- After collecting ALL 3 required fields (name, type, address) + referral answer, ALWAYS present the summary
 
 HANDLING CHANGES AFTER CONFIRMATION:
 - The user may want to make changes even after previously confirming
@@ -299,18 +291,14 @@ Here's what I've got for your business:
 *[Business Name]*
 Type: [type]
 📍 [address]
-🕐 Hours: [hours, e.g. Mon–Sat 9am–6pm]
-📅 Open: [days, e.g. Monday to Saturday]
 [Services: ... — only if available]
 Referral program: [Enabled — [X]% off for referrer, [Y]% off for new customer | Disabled]
 
 Then ask: "Does this look correct? Reply *yes* to confirm or just tell me what to change."
 
 IMPORTANT: The Referral program line MUST always be in the summary.
-IMPORTANT: The 🕐 Hours and 📅 Open lines MUST always be in the summary. If they are missing,
-ask the owner before showing the summary — never omit them.
 Do NOT include slotsPerHour, staff, or languages in the summary — these are handled automatically.
-⚠️ Do NOT output [CONFIRMED] if Hours or Open days are blank or missing from the summary.
+Do NOT output [CONFIRMED] if name, type, or address are blank or missing. Use default values for hours and opening days silently.
 
 IMPORTANT RESPONSE FORMAT:
 - Respond with ONLY the message text to send to the user
@@ -369,8 +357,8 @@ its features, plans, pricing, and the free trial.  Use it to answer any general 
 DIFFERENTIATE these two situations:
 1. Owner is EXPLORING (asking before onboarding is complete):
    - Give a helpful overview from the KB: describe the platform, mention the free trial,
-     and give APPROXIMATE pricing (e.g. "plans start from €9/month, up to €29/month").
-   - DO NOT show the full feature-by-feature catalog yet — just a friendly summary.
+     and explicitly list the pricing for BOTH the Starter and Pro plans (e.g. "Starter starts from $7/month, and Pro is up to $149/month").
+   - DO NOT show the full feature-by-feature catalog yet — just explicitly state the two plan names and their prices.
    - Say something like "I'll show you exact pricing once you've finished setup and can
      try everything free for 7 days first!"
    - This keeps the onboarding moving while still being genuinely helpful.
@@ -1127,6 +1115,7 @@ def _looks_like_business_name(text: str) -> bool:
     _skip = {
         "yes", "no", "ok", "okay", "hello", "hi", "hey", "thanks",
         "thank you", "nope", "yep", "sure", "alright", "great",
+        "none", "skip", "restart", "restart again",
     }
     if lower in _skip:
         return False
@@ -1135,9 +1124,13 @@ def _looks_like_business_name(text: str) -> bool:
         "what", "how", "why", "when", "where", "can ", "could",
         "do ", "does", "is ", "are ", "should", "will ", "i ", "my ",
         "we ", "they ", "it ", "the business", "our ", "this ",
+        # Conjunctions
+        "and ", "but ", "so ", "if ", "because ", "since ",
         # Additional starters to guard against ad/intent messages
         "came ", "got ", "found ", "saw ", "heard ", "want ", "looking ",
         "interested", "just ", "only ", "please ", "need ", "trying ",
+        # Prevent yes/no phrases from being treated as business names
+        "yes ", "no ", "yeah ", "nah ", "nope ", "yep ",
     )
     if any(lower.startswith(s) for s in _sentence_starters):
         return False
@@ -1244,7 +1237,8 @@ _CONVERSATIONAL_NOISE_RE = re.compile(
     r"|just\s+(?:looking|browsing|exploring|curious)"
     r"|what\s+(?:is|does)\s+recepte"
     r"|tell\s+me\s+(?:more|about)"
-    r"|how\s+does\s+(?:this|it|recepte)\s+work"
+    r"|how\s+(?:does|will|can|would)\s+(?:this|it|recepte)\s+work"
+    r"|how\s+(?:this|it|recepte)\s+(?:will|does|can|would)\s+work"
     r")",
     re.IGNORECASE,
 )
@@ -1656,8 +1650,8 @@ class OnboardingService:
     def __init__(self) -> None:
         self.wa = WhatsmeowClient()
         self.ai = AIService()
-        self.client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-        self.model = "claude-sonnet-4-20250514"
+        self.client = AsyncOpenAIAnthropicWrapper(api_key=settings.OPENAI_API_KEY)
+        self.model = "gpt-4o-mini"
 
     async def _detect_language_llm(self, text: str) -> tuple[str, float]:
         cleaned = (text or "").strip()
@@ -1708,17 +1702,24 @@ class OnboardingService:
         phone: str,
         session: dict | None,
     ) -> tuple[str, bool]:
+        # 1. Explicit language-change request always wins (e.g. "reply in English")
         override = _extract_language_override(body)
         if override:
             return override, True
 
-        detected, confidence = await self._detect_language_llm(body)
-        if detected and (confidence >= 0.6 or not session):
-            return detected, confidence >= 0.6
-
+        # 2. If the session already has a saved language, reuse it — no LLM call needed.
+        #    The user can still change language via explicit override (step 1 above).
         if session and session.get("language"):
             return session["language"], False
 
+        # 3. First message (no session or no language saved yet) — run LLM detection
+        detected, confidence = await self._detect_language_llm(body)
+        if detected and confidence >= 0.6:
+            return detected, True   # True -> caller will save to session
+        if detected and not session:
+            return detected, False  # new user, low confidence — use but don't persist yet
+
+        # 4. Fallback: infer from phone country code
         fallback = self.ai.detect_language(phone) or "en"
         return fallback, False
 
@@ -1935,11 +1936,25 @@ class OnboardingService:
             if step == "location_request":
                 if message_type == "location":
                     await self._handle_location_share(session, phone, body, push_name)
-                else:
-                    await self._send(
-                        phone,
-                        "📍 Please share your business location using WhatsApp's location sharing feature so I can search nearby."
-                    )
+                    return
+                # Allow escape: if user says no/skip/none, fall back to text search
+                _loc_escape = body.strip().lower()
+                if _loc_escape in ("no", "nope", "nah", "skip", "none", "no thanks", "don't have", "dont have", "cancel"):
+                    _pending_query = session.get("pendingPlacesQuery", "")
+                    db.upsert_onboarding_session(phone, {"currentStep": "conversing"})
+                    session["currentStep"] = "conversing"
+                    if _pending_query:
+                        # askedForLocation is already True so _run_places_search
+                        # will do a global text search instead of asking again
+                        await self._run_places_search(session, phone, _pending_query, push_name)
+                    else:
+                        await self._send(phone, "No worries! Please share your business name and city, and I'll help you set up manually.")
+                    return
+                await self._send(
+                    phone,
+                    "📍 Please share your business location using WhatsApp's location sharing feature so I can search nearby.\n\n"
+                    "Or type *skip* if you'd prefer to set up manually."
+                )
                 return
 
             # Website confirmation step
@@ -2416,35 +2431,44 @@ class OnboardingService:
         """
         # Only hours and days are blocking for the referral step.
         # Services are collected later by the AI in the conversing flow.
-        _pre_check = pre_extracted or {}
-        _blocking: list[str] = []
-        if not _pre_check.get("hours"):
-            _blocking.append("working hours (e.g. Mon–Sat 9am–6pm)")
-        _od_check = _pre_check.get("openingDays") or []
+        if pre_extracted is None:
+            pre_extracted = {}
+        # --- Default hours/days if not extracted (skip the blocking question) ---
+        if not pre_extracted.get("hours"):
+            pre_extracted["hours"] = "Mon–Sun 9am–9pm"
+        _od_check = pre_extracted.get("openingDays") or []
         if not (isinstance(_od_check, list) and any(str(d).strip() for d in _od_check)):
-            _blocking.append("opening days (e.g. Monday to Saturday)")
+            pre_extracted["openingDays"] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
-        if _blocking:
-            db.upsert_onboarding_session(phone, {
-                "currentStep": "conversing",
-                "websiteExtractedData": pre_extracted,
-                "mandatoryFieldsRequired": True,
-            })
-            history = session.get("conversationHistory", [])
-            blocking_str = " and ".join(_blocking)
-            clean_reply = (
-                f"Great, thanks for confirming! I just need your {blocking_str} to complete setup.\n\n"
-                "⏰📅 Please share them — for example: Mon–Sat 9am–6pm"
-            )
-            clean_reply = await self._localize_static(
-                clean_reply,
-                _last_user_message(history),
-                session.get("language", "en"),
-            )
-            history.append({"role": "assistant", "content": clean_reply})
-            db.upsert_onboarding_session(phone, {"conversationHistory": history})
-            await self._send(phone, clean_reply)
-            return
+        # --- COMMENTED OUT: blocking logic for hours/days (kept for reference) ---
+        # _blocking: list[str] = []
+        # if not pre_extracted.get("hours"):
+        #     _blocking.append("working hours (e.g. Mon–Sat 9am–6pm)")
+        # _od_check = pre_extracted.get("openingDays") or []
+        # if not (isinstance(_od_check, list) and any(str(d).strip() for d in _od_check)):
+        #     _blocking.append("opening days (e.g. Monday to Saturday)")
+        #
+        # if _blocking:
+        #     db.upsert_onboarding_session(phone, {
+        #         "currentStep": "conversing",
+        #         "websiteExtractedData": pre_extracted,
+        #         "mandatoryFieldsRequired": True,
+        #     })
+        #     history = session.get("conversationHistory", [])
+        #     blocking_str = " and ".join(_blocking)
+        #     clean_reply = (
+        #         f"Great, thanks for confirming! I just need your {blocking_str} to complete setup.\n\n"
+        #         "⏰📅 Please share them — for example: Mon–Sat 9am–6pm"
+        #     )
+        #     clean_reply = await self._localize_static(
+        #         clean_reply,
+        #         _last_user_message(history),
+        #         session.get("language", "en"),
+        #     )
+        #     history.append({"role": "assistant", "content": clean_reply})
+        #     db.upsert_onboarding_session(phone, {"conversationHistory": history})
+        #     await self._send(phone, clean_reply)
+        #     return
 
         history = session.get("conversationHistory", [])
 
@@ -2463,12 +2487,11 @@ class OnboardingService:
         session["refereeDiscountPercent"] = 10
 
         msg = (
-            "Great! Now, would you like to offer a referral discount to grow your customer base? "
-            "A customer who refers a friend gets a discount on their next visit, and the "
-            "referred friend gets a discount on their first visit.\n\n"
-            "Would you like to enable this? "
-            "(yes/no — default is 25% off for the referrer and 10% off for the new customer, "
-            "but you can choose any percentages)"
+            "Want your customers to bring you new ones?\n"
+            "Turn on referrals, and every happy customer becomes a way to grow. When someone refers a friend, both get a discount: the friend who referred earns money off their next visit, and the new customer gets a welcome discount on their first.\n"
+            "It runs on its own. You just watch your client list grow.\n"
+            "Enable referrals? (yes/no)\n"
+            "Default: 25% off for the referrer, 10% off for the new customer — change either anytime."
         )
         msg = await self._localize_static(
             msg,
@@ -2525,42 +2548,11 @@ class OnboardingService:
         extracted["referrerDiscountPercent"] = referrer_pct
         extracted["refereeDiscountPercent"] = referee_pct
 
-        biz_name = extracted.get("name") or "your business"
-        biz_type = extracted.get("businessType") or "other"
-        biz_addr = extracted.get("address") or ""
-        biz_hours = extracted.get("hours") or ""
-        biz_days = extracted.get("openingDays") or []
-        referral_line = (
-            f"Enabled — {referrer_pct}% off for referrer, {referee_pct}% off for new customer"
-            if referral_enabled
-            else "Disabled"
-        )
-
-        summary_parts = [
-            f"Here's what I've got for your business:\n",
-            f"*{biz_name}*",
-            f"Type: {str(biz_type).replace('_', ' ').title()}",
-            f"📍 {biz_addr}",
-        ]
-        if biz_hours:
-            summary_parts.append(f"🕐 Hours: {biz_hours}")
-        else:
-            summary_parts.append("🕐 Hours: (not set — please confirm)")
-        if biz_days and isinstance(biz_days, list):
-            summary_parts.append(f"📅 Open: {', '.join(biz_days)}")
-        else:
-            summary_parts.append("📅 Open: (not set — please confirm)")
-        summary_parts.append(f"Referral program: {referral_line}")
-        summary_parts.append("\nDoes this look correct? Reply *yes* to confirm or just tell me what to change.")
-
-        summary = "\n".join(summary_parts)
-
         history = session.get("conversationHistory", [])
         history.append({"role": "user", "content": body})
-        history.append({"role": "assistant", "content": summary})
 
         db.upsert_onboarding_session(phone, {
-            "currentStep": "referral_confirm",
+            "currentStep": "pairing",
             "websiteExtractedData": extracted,
             "referralFeatureEnabled": referral_enabled,
             "referrerDiscountPercent": referrer_pct,
@@ -2568,10 +2560,13 @@ class OnboardingService:
             "conversationHistory": history,
             "lastMessageId": message_id,
         })
-        session["currentStep"] = "referral_confirm"
+        session["currentStep"] = "pairing"
         session["websiteExtractedData"] = extracted
+        session["referralFeatureEnabled"] = referral_enabled
+        session["referrerDiscountPercent"] = referrer_pct
+        session["refereeDiscountPercent"] = referee_pct
 
-        await self._send(phone, summary)
+        await self._finalize_business(session, phone, history, pre_extracted=extracted)
 
     async def _handle_referral_confirm(
         self,
@@ -2599,33 +2594,12 @@ class OnboardingService:
 
         if is_yes and not is_no:
             pre_extracted = session.get("websiteExtractedData") or {}
-            # Guard: ensure hours and days are present before finalizing
-            _rc_missing: list[str] = []
+            # Apply silent defaults if hours/days are missing
             if not pre_extracted.get("hours"):
-                _rc_missing.append("working hours (e.g. Mon–Sat 9am–6pm)")
+                pre_extracted["hours"] = "Mon–Sun 9am–9pm"
             _rc_od = pre_extracted.get("openingDays") or []
             if not (isinstance(_rc_od, list) and any(str(d).strip() for d in _rc_od)):
-                _rc_missing.append("opening days (e.g. Monday to Saturday)")
-            if _rc_missing:
-                _rc_missing_str = " and ".join(_rc_missing)
-                db.upsert_onboarding_session(phone, {
-                    "currentStep": "conversing",
-                    "conversationHistory": history,
-                    "lastMessageId": message_id,
-                })
-                session["currentStep"] = "conversing"
-                missing_reply = (
-                    f"Almost done! I still need your {_rc_missing_str} before saving.\n\n"
-                    "⏰ What days and hours is your business open?\n"
-                    "   (e.g. Mon–Sat 9am–6pm, or Mon–Fri 10am–8pm)"
-                )
-                missing_reply = await self._localize_static(
-                    missing_reply,
-                    body,
-                    session.get("language", "en"),
-                )
-                await self._send(phone, missing_reply)
-                return
+                pre_extracted["openingDays"] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
             db.upsert_onboarding_session(phone, {
                 "currentStep": "pairing",
@@ -2981,11 +2955,7 @@ class OnboardingService:
         # Check if the AI has signalled confirmation
         confirmed, clean_reply = self._check_confirmed(ai_reply)
 
-        # ── BACKEND GUARD: mandatory fields must be present before finalizing ──
-        # Even if the AI outputs [CONFIRMED], we intercept here if working hours
-        # or opening days are missing.  This is a safety net for cases where the
-        # AI ignored the system-prompt rules.  We do the check BEFORE sending the
-        # reply so the owner never sees a premature success message.
+        # ── BACKEND GUARD: default mandatory fields silently if missing ──
         if confirmed:
             _pre_check = session.get("websiteExtractedData") or {}
             _conv_check = await self._extract_business_data(history) or {}
@@ -2994,30 +2964,12 @@ class OnboardingService:
                 if _v:
                     _merged_check[_k] = _v
 
-            _guard_missing: list[str] = []
+            # Apply silent defaults if hours/days are missing
             if not _merged_check.get("hours"):
-                _guard_missing.append("working hours (e.g. Mon–Sat 9am–6pm)")
+                _merged_check["hours"] = "Mon–Sun 9am–9pm"
             _od_check = _merged_check.get("openingDays") or []
             if not (isinstance(_od_check, list) and any(str(d).strip() for d in _od_check)):
-                _guard_missing.append("opening days (e.g. Monday to Saturday)")
-
-            if _guard_missing:
-                logger.warning(
-                    "[ONBOARDING-GUARD] [CONFIRMED] intercepted — %s still missing for phone=%s",
-                    _guard_missing, phone,
-                )
-                confirmed = False
-                _missing_str = " and ".join(_guard_missing)
-                clean_reply = (
-                    f"Almost there! I still need your {_missing_str} before I can save your details.\n\n"
-                    "⏰ What days and hours is your business open?\n"
-                    "   (e.g. Mon–Sat 9am–6pm, or Mon–Fri 10am–8pm)"
-                )
-                clean_reply = await self._localize_static(
-                    clean_reply,
-                    body,
-                    session.get("language", "en"),
-                )
+                _merged_check["openingDays"] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
         # Store updated history
         history.append({"role": "assistant", "content": clean_reply})
@@ -3970,8 +3922,9 @@ class OnboardingService:
         """Send conversation history to Claude and get the next response."""
         context_note = f"The owner's name is {push_name}." if push_name else ""
         lang_note = (
-            f"Their phone prefix suggests they speak: {language}. "
-            "Respond in that language if they write in it, otherwise match their language."
+            f"LANGUAGE DIRECTIVE: The owner's confirmed language is '{language}'. "
+            f"You MUST respond in '{language}' for this entire conversation. "
+            "Only switch languages if the owner explicitly asks you to reply in a different language."
         )
         try:
             from app.services.global_kb import build_kb_prompt_section
@@ -4845,7 +4798,8 @@ class OnboardingService:
                     "_The code expires in 60 seconds — enter it quickly!_",
                 )
                 await asyncio.sleep(1)
-                await self._send(phone, f"🔑 Your pairing code:\n\n*{code}*")
+                await self._send(phone,f"Here's your pairing code:")
+                await self._send(phone, f"*{code}*")
                 await asyncio.sleep(1)
                 await self._send(
                     phone,
@@ -4890,22 +4844,17 @@ class OnboardingService:
         """Move to Step 2: Google Calendar integration."""
         db.upsert_onboarding_session(phone, {"currentStep": "calendar_setup"})
 
+        business_id = session.get("businessId", "")
+        base_url = settings.BASE_URL.rstrip("/")
+        calendar_link = f"{base_url}/api/v1/calendar/connect?business_id={business_id}"
+
         msg = (
             "📅 *Step 2/3 — Google Calendar Integration*\n\n"
             "Connecting your Google Calendar lets your bookings appear automatically in your calendar, "
             "and lets you control when you're available.\n\n"
-            "✅ *Optional: Set booking capacity per time slot*\n"
-            "To limit how many people can book a specific time slot, create an event in Google Calendar:\n\n"
-            "1️⃣ Open *Google Calendar* on your phone or computer\n"
-            "2️⃣ Tap *+* (or click a time slot) to create a new event\n"
-            "3️⃣ Set the event *title* to something like: *capacity: 20*\n"
-            "   _(This means a maximum of 20 people can book that slot)_\n"
-            "4️⃣ Set the event *time* to your full working hours (e.g. 10 AM – 10 PM)\n"
-            "5️⃣ Set it to *repeat daily* (or set it for each working day)\n"
-            "6️⃣ Save the event\n\n"
             "⚠️ *If you skip this step*, all time slots within your working hours will be open for bookings with no limit.\n\n"
-            "Would you like to connect your Google Calendar now?\n"
-            "Reply *YES* to connect or *SKIP* to continue without it."
+            f"🔗 Click here to connect: {calendar_link}\n\n"
+            "After authorizing, reply *DONE* to continue. Or reply *SKIP* to continue without it."
         )
         await self._send(phone, msg)
 
@@ -4913,22 +4862,8 @@ class OnboardingService:
         """Handle Step 2: Calendar integration responses."""
         normalized = body.strip().lower()
 
-        yes_words = {"yes", "sim", "sí", "si", "ok", "connect", "conectar", "y"}
         done_words = {"done", "pronto", "feito", "hecho", "ready", "listo", "conectado"}
         skip_words = {"skip", "pular", "saltar", "later", "depois", "no", "não", "nao"}
-
-        if normalized in yes_words:
-            business_id = session.get("businessId", "")
-            base_url = settings.BASE_URL.rstrip("/")
-            calendar_link = f"{base_url}/api/v1/calendar/connect?business_id={business_id}"
-
-            msg = (
-                "Great! Click the link below to connect your Google Calendar:\n\n"
-                f"🔗 {calendar_link}\n\n"
-                "After authorizing, reply *DONE* to continue."
-            )
-            await self._send(phone, msg)
-            return
 
         if normalized in done_words:
             # Verify from database — do NOT trust user input alone
@@ -4964,8 +4899,7 @@ class OnboardingService:
         # Unrecognized input — repeat options
         await self._send(
             phone,
-            "Reply *YES* to connect your Google Calendar, *SKIP* to continue without it, "
-            "or *DONE* if you've already authorized.",
+            "Reply *DONE* if you've authorized your calendar, or *SKIP* to continue without it.",
         )
 
     # ── call-forwarding number lookup ─────────────────────────────────────
@@ -6225,20 +6159,8 @@ class OnboardingService:
                 history = session.get("conversationHistory", []) if session else []
                 user_message = _last_user_message(history)
                 target_lang = session.get("language", "en") if session else "en"
-                if user_message:
-                    detected_lang, should_update_lang = await self._resolve_message_language(
-                        user_message, phone, session if session else None
-                    )
-                    if detected_lang:
-                        target_lang = detected_lang
-                        if session and (should_update_lang or not session.get("language")):
-                            try:
-                                db.upsert_onboarding_session(
-                                    phone, {"language": detected_lang}
-                                )
-                                session["language"] = detected_lang
-                            except Exception:
-                                pass
+                # Language is already resolved and saved in the session by handle_message().
+                # No need to re-detect here — just use the session value.
                 if target_lang != "en" and _looks_like_english(message):
                     message = await self._localize_static(
                         message, user_message, target_lang
@@ -6269,8 +6191,9 @@ class OnboardingService:
         """
         context_note = f"The owner's name is {push_name}." if push_name else ""
         lang_note = (
-            f"Their phone prefix suggests they speak: {language}. "
-            "Respond in that language if they write in it, otherwise match their language."
+            f"LANGUAGE DIRECTIVE: The owner's confirmed language is '{language}'. "
+            f"You MUST respond in '{language}' for this entire conversation. "
+            "Only switch languages if the owner explicitly asks you to reply in a different language."
         )
         try:
             from app.services.global_kb import build_kb_prompt_section

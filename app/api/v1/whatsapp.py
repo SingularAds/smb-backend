@@ -608,7 +608,11 @@ async def whatsmeow_webhook(
         logger.warning("Webhook secret mismatch (got %s)", x_webhook_secret)
         return Response(status_code=401, content="Unauthorized")
 
-    payload: dict = await request.json()
+    try:
+        payload: dict = await request.json()
+    except Exception as e:
+        logger.warning("[Webhook] Failed to parse JSON: %s", e)
+        return Response(status_code=400, content="Invalid JSON")
 
     # ── REQUEST LOG ─────────────────────────────────────────────────────
     _data = payload.get("payload", {})

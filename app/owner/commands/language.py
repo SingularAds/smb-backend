@@ -79,10 +79,10 @@ async def translate_reply(raw_message: str, reply: str) -> str:
     lang_name = lang_names.get(lang, lang.upper())
 
     try:
-        from anthropic import AsyncAnthropic
+        from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
         from app.config import settings
-
-        client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+        
+        client = AsyncOpenAIAnthropicWrapper(api_key=settings.OPENAI_API_KEY)
 
         system = (
             f"You are a professional translator. "
@@ -92,7 +92,7 @@ async def translate_reply(raw_message: str, reply: str) -> str:
         )
 
         message = await client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-haiku-4-5-20251001",
             max_tokens=1024,
             system=system,
             messages=[{"role": "user", "content": reply}],

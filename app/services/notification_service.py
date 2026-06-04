@@ -57,12 +57,12 @@ class NotificationService:
             phone = "+" + phone
         return phone
 
-    async def _send_via_port_3002(self, to: str, body: str) -> bool:
+    def _send_via_port_3002(self, to: str, body: str) -> bool:
         """Temporary: Send SMS via port 3002 endpoint (testing only)."""
         to = self._ensure_e164(to)
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(
                     "http://localhost:3002/send/sms",
                     json={"phone": to, "message": body},
                     headers={"Content-Type": "application/json"},
@@ -86,10 +86,7 @@ class NotificationService:
         # Check if we should use port 3002 for testing
         if settings.SMS_GATEWAY_PORT_3002:
             try:
-                # Run async function in sync context
-                loop = asyncio.new_event_loop()
-                result = loop.run_until_complete(self._send_via_port_3002(to, body))
-                loop.close()
+                result = self._send_via_port_3002(to, body)
                 return result
             except Exception as e:
                 print(f"[Notifications] Port 3002 fallback error: {e}")
