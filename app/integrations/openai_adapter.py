@@ -143,7 +143,11 @@ class MessagesResource:
             else:
                 call_kwargs["tool_choice"] = tc
         # Call OpenAI
+        import time
+        start_time = time.time()
         resp = await self.client.chat.completions.create(**call_kwargs)
+        duration = time.time() - start_time
+        logger.info("[LATENCY] OpenAI model completion (%s) took %.3fs", actual_model, duration)
         choice = resp.choices[0]
         msg = choice.message
         

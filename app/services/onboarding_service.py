@@ -1189,7 +1189,7 @@ _DEMO_REQUEST_RE = re.compile(
     r"|show\s+me"
     r"|how\s+(?:does\s+)?(?:it\s+)?works?"
     r"|como\s+funciona"
-    r"|try\s+(?:it\s+)?(?:out)?"
+    r"|try\s+it\s+out|try\s+out|try\s+it"
     r"|see\s+(?:it\s+)?in\s+action"
     r"|preview"
     r"|test\s+(?:it|this|recepte)"
@@ -1777,6 +1777,8 @@ class OnboardingService:
         message_id: str,
         message_type: str = "text",
     ) -> None:
+        import time
+        db_lookup_start = time.time()
         phone = db._clean_phone(phone)
 
         # 1. Check for existing session
@@ -1786,13 +1788,21 @@ class OnboardingService:
         #    EC10: prevents re-triggering onboarding for an owner who already
         #    completed setup and later taps the recepte.co deep-link again.
         existing_biz = db.get_business_by_owner_phone(phone)
+        db_lookup_duration = time.time() - db_lookup_start
+        logger.info("[LATENCY] Onboarding Firestore lookup took %.3fs for phone=%s", db_lookup_duration, phone)
 
         # Detect language for this specific message (LLM-based) and update session.
+        lang_start = time.time()
         lang_for_message, should_update_lang = await self._resolve_message_language(
             body, phone, session
         )
+        lang_duration = time.time() - lang_start
+        logger.info("[LATENCY] Onboarding language resolution took %.3fs (lang=%s)", lang_duration, lang_for_message)
+
         if session and lang_for_message and (should_update_lang or not session.get("language")):
+            db_upsert_start = time.time()
             db.upsert_onboarding_session(phone, {"language": lang_for_message})
+            logger.info("[LATENCY] Onboarding language upsert took %.3fs", time.time() - db_upsert_start)
             session["language"] = lang_for_message
 
         # ── recepte.co activation message: intercept EARLY ───────────────────
@@ -3118,6 +3128,11 @@ class OnboardingService:
         Returns an empty list if the key is missing, the call fails, or no matches.
         """
         import httpx
+        import re
+
+        # Strip Google Plus Codes from search query to prevent Google Places API from returning incorrect businesses
+        if query:
+            query = re.sub(r"^[A-Z0-9]{4,8}\+[A-Z0-9]{2,4}\b\s*", "", query, flags=re.IGNORECASE).strip()
 
         key = settings.GOOGLE_PLACES_API_KEY
         if not key:
@@ -3415,6 +3430,7 @@ class OnboardingService:
         - Everything else → website HTML scrape via Claude
         """
         import httpx
+        import time
 
         lang = session.get("language", "en")
 
@@ -3446,25 +3462,36 @@ class OnboardingService:
             return json.loads(raw)
 
         # ── Google Maps flow ──────────────────────────────────────────────────
-        # Follow the short link redirect, extract place name from the canonical
-        # URL path (/maps/place/Name), then use Places API for full details.
-        # Avoids JS-rendered HTML scraping which always fails for Google Maps pages.
         if _is_google_maps_url(url):
             await self._send(phone, _t("looking_up_maps", lang))
-            resolved_maps_url = url
             try:
                 import urllib.parse as _urlparse
-                # Follow redirects: maps.app.goo.gl / share.google → canonical Maps URL
-                async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
-                    _redir = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                    final_url = str(_redir.url)
-                    resolved_maps_url = final_url
+                # Follow redirects manually with follow_redirects=False to break early
+                # when the canonical path containing the place name is found.
+                # This avoids loading Google's cookie consent pages which adds 15s latency.
+                redirects_start = time.time()
+                final_url = url
+                async with httpx.AsyncClient(timeout=12, follow_redirects=False) as client:
+                    current_url = url
+                    for _ in range(5):
+                        resp = await client.get(current_url, headers={"User-Agent": "Mozilla/5.0"})
+                        if resp.status_code in (301, 302, 303, 307, 308):
+                            loc = resp.headers.get("location")
+                            if loc:
+                                current_url = _urlparse.urljoin(current_url, loc)
+                                final_url = current_url
+                                # Break early if the URL contains the place name pattern or search patterns
+                                if any(x in current_url for x in ("/maps/place/", "/maps/dir/", "/maps/search/", "/search?", "kgmid=")):
+                                    break
+                                continue
+                        break
+                resolved_maps_url = final_url
+                redirects_duration = time.time() - redirects_start
+                logger.info("[LATENCY] Google Maps redirects resolution took %.3fs. final_url=%s", redirects_duration, final_url)
 
                 # Debug: log what URL was resolved to
                 logger.info("[ONBOARDING-DEBUG][MAPS] original_url=%s", url)
                 logger.info("[ONBOARDING-DEBUG][MAPS] final_url=%s", final_url)
-                print(f"[DEBUG-MAPS] original_url={url}")
-                print(f"[DEBUG-MAPS] final_url={final_url}")
 
                 # Extract place name from canonical path.
                 # Handles two common redirect targets:
@@ -3488,28 +3515,45 @@ class OnboardingService:
                         ):
                             place_name = _candidate
                             logger.info("[ONBOARDING-DEBUG][MAPS] extracted from /maps/dir/ path: %s", place_name)
-                            print(f"[DEBUG-MAPS] extracted from /maps/dir/ path: {place_name}")
+
+                # Fallback: query parameter q or query (e.g. share.google -> google.com/search?q=...)
+                if not place_name:
+                    try:
+                        _parsed = _urlparse.urlparse(final_url)
+                        _query = _urlparse.parse_qs(_parsed.query)
+                        for _key in ("q", "query"):
+                            _val = (_query.get(_key) or [""])[0].strip()
+                            if _val:
+                                place_name = _val
+                                logger.info("[ONBOARDING-DEBUG][MAPS] extracted from URL query parameter: %s", place_name)
+                                break
+                    except Exception as e:
+                        logger.warning("[ONBOARDING-DEBUG][MAPS] failed to parse URL query parameters: %s", e)
 
                 logger.info("[ONBOARDING-DEBUG][MAPS] place_name=%s", place_name)
-                print(f"[DEBUG-MAPS] place_name={place_name}")
 
                 if not place_name:
                     raise ValueError("No place name found in redirected Maps URL")
 
                 # Use Places API for full business details when key is available
+                places_start = time.time()
                 if settings.GOOGLE_PLACES_API_KEY:
                     extracted = await self._search_google_places(place_name) or {}
                 else:
                     extracted = {}
+                places_duration = time.time() - places_start
+                logger.info("[LATENCY] Google Places API lookup took %.3fs for place=%s", places_duration, place_name)
 
                 extracted.setdefault("name", place_name)
                 extracted["mapsUrl"] = url
                 extracted.setdefault("website", url)
 
+                db_start = time.time()
                 db.upsert_onboarding_session(phone, {
                     "currentStep": "website_confirm",
                     "websiteExtractedData": extracted,
                 })
+                logger.info("[LATENCY] Onboarding Firestore update (website_confirm) took %.3fs", time.time() - db_start)
 
                 lines = [_t("maps_found_header", lang)]
                 lines.append(f"*{extracted['name']}*")
@@ -3527,8 +3571,15 @@ class OnboardingService:
                 # was shown when the owner replies yes/no.
                 _h = session.get("conversationHistory", [])
                 _h.append({"role": "assistant", "content": summary})
+                
+                db_hist_start = time.time()
                 db.upsert_onboarding_session(phone, {"conversationHistory": _h})
+                logger.info("[LATENCY] Onboarding Firestore history update took %.3fs", time.time() - db_hist_start)
+                
+                wa_send_start = time.time()
                 await self._send(phone, summary)
+                logger.info("[LATENCY] Onboarding WhatsApp send took %.3fs", time.time() - wa_send_start)
+                
                 logger.info("[ONBOARDING] Maps extracted for %s: %s", phone, extracted["name"])
                 return
 
@@ -3539,12 +3590,15 @@ class OnboardingService:
                 if settings.APIFY_API_KEY:
                     logger.info("[ONBOARDING] Trying Apify Google Places fallback — passing url=%s", resolved_maps_url)
                     print(f"[DEBUG-MAPS-APIFY-FALLBACK] url_passed_to_apify={resolved_maps_url}")
+                    apify_start = time.time()
                     try:
                         from app.integrations.apify_client import ApifyClient
                         apify_results = await asyncio.wait_for(
                             ApifyClient().scrape_google_places_candidates(resolved_maps_url, max_results=6),
-                            timeout=130,
+                            timeout=40,
                         )
+                        apify_duration = time.time() - apify_start
+                        logger.info("[LATENCY] Apify scraper fallback took %.3fs", apify_duration)
 
                         valid_results = [r for r in (apify_results or []) if r and r.get("name")]
                         if len(valid_results) == 1:
@@ -3635,10 +3689,13 @@ class OnboardingService:
 
         # Fetch the page
         try:
+            fetch_start = time.time()
             async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
                 resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
                 resp.raise_for_status()
                 html = resp.text
+            fetch_duration = time.time() - fetch_start
+            logger.info("[LATENCY] Regular website fetch took %.3fs for url=%s", fetch_duration, url)
         except Exception as exc:
             logger.warning("[ONBOARDING] Failed to fetch website %s: %s", url, exc)
             await self._send(phone, _t("website_unreachable", lang))
@@ -3662,6 +3719,7 @@ class OnboardingService:
 
         # Extract business data from website content
         try:
+            llm_start = time.time()
             resp_ai = await self.client.messages.create(
                 model=self.model,
                 max_tokens=1500,
@@ -3671,6 +3729,8 @@ class OnboardingService:
                     "content": f"Extract business info from this website text:\n\n{snippet}",
                 }],
             )
+            llm_duration = time.time() - llm_start
+            logger.info("[LATENCY] Website Claude JSON extraction took %.3fs for model %s", llm_duration, self.model)
             raw = _strip_code_fences(resp_ai.content[0].text)
             extracted = json.loads(raw)
         except Exception as exc:

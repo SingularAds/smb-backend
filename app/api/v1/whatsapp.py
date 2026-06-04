@@ -509,6 +509,8 @@ async def _process_webhook(payload: dict) -> None:
                             # Code not found — fall through to normal AI routing
 
                         # Route through AI for dynamic, intent-aware responses
+                        import time
+                        customer_ai_start = time.time()
                         if is_audio:
                             logger.info(
                                 "[AUDIO] Routing audio message from %s (device=%r, mime=%r)",
@@ -524,6 +526,8 @@ async def _process_webhook(payload: dict) -> None:
                                 push_name=push_name,
                                 device_id=device_id,
                             )
+                            duration = time.time() - customer_ai_start
+                            logger.info("[LATENCY] Customer AI Audio processing for phone=%s msg_id=%s took %.3fs", phone, message_id, duration)
                             _log_event(
                                 "processed",
                                 phone=phone,
@@ -538,6 +542,8 @@ async def _process_webhook(payload: dict) -> None:
                                 push_name=push_name,
                                 device_id=device_id,
                             )
+                            duration = time.time() - customer_ai_start
+                            logger.info("[LATENCY] Customer AI Text processing for phone=%s msg_id=%s took %.3fs", phone, message_id, duration)
                             _log_event(
                                 "processed",
                                 phone=phone,
@@ -570,14 +576,20 @@ async def _process_webhook(payload: dict) -> None:
             return
 
         logger.info("[ONBOARDING-PROCESS] phone=%s push_name=%r msg_id=%r body=%r", phone, push_name, message_id, body[:100])
+        import time
+        onboarding_start = time.time()
 
         try:
             await _onboarding.handle_message(phone, body, push_name, message_id, message_type=message_type)
+            duration = time.time() - onboarding_start
+            logger.info("[LATENCY] Onboarding processing for phone=%s msg_id=%s took %.3fs", phone, message_id, duration)
             logger.info("[ONBOARDING-RESPONSE] Sent reply for phone=%s msg_id=%r", phone, message_id)
         except TypeError:
             # Backward compatibility for monkeypatched/test doubles that still
             # implement the older 4-argument signature.
             await _onboarding.handle_message(phone, body, push_name, message_id)
+            duration = time.time() - onboarding_start
+            logger.info("[LATENCY] Onboarding processing (legacy) for phone=%s msg_id=%s took %.3fs", phone, message_id, duration)
             logger.info("[ONBOARDING-RESPONSE] Sent reply (legacy) for phone=%s msg_id=%r", phone, message_id)
         
         _log_event("processed", phone=phone, message_id=message_id, detail=f"body={body[:80]!r}")
