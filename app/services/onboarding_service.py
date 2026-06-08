@@ -4666,7 +4666,11 @@ class OnboardingService:
 
         if any(normalized == w or normalized.startswith(w) for w in _code_words):
             # User wants pairing code.
-            await self._start_scam_warning(session, phone)
+            if session.get("reconnectMode"):
+                db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
+                await self._send_pairing_code(session, phone)
+            else:
+                await self._start_scam_warning(session, phone)
             return
 
         # Unclear — gently re-prompt.
@@ -4767,7 +4771,11 @@ class OnboardingService:
 
         if any(w in normalized for w in _switch_to_code_words):
             # Owner wants to switch to the pairing-code flow.
-            await self._start_scam_warning(session, phone)
+            if session.get("reconnectMode"):
+                db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
+                await self._send_pairing_code(session, phone)
+            else:
+                await self._start_scam_warning(session, phone)
             return
 
         # Anything else — remind them of their options.
