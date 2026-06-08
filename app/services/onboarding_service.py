@@ -4251,6 +4251,29 @@ class OnboardingService:
         pair_required = session_state.get("pairing_required", not already_paired)
         bridge_status = session_state.get("status", "disconnected")
 
+        # Verify the session is paired to the correct phone number
+        if already_paired:
+            paired_phone = session_state.get("phone")
+            clean_paired = "".join(c for c in str(paired_phone) if c.isdigit()) if paired_phone else ""
+            clean_user = "".join(c for c in str(phone) if c.isdigit())
+            matches = False
+            if clean_paired == clean_user:
+                matches = True
+            elif len(clean_paired) >= 10 and len(clean_user) >= 10:
+                matches = clean_paired[-10:] == clean_user[-10:]
+            
+            if not matches:
+                logger.info(
+                    "[PAIRING] Session %s is paired to a different phone %s (expected %s). Forcing logout/re-pair.",
+                    pairing_session_id, paired_phone, phone
+                )
+                try:
+                    await self.wa.logout_session(pairing_session_id)
+                except Exception as _log_exc:
+                    logger.warning("[PAIRING] Force logout failed for %s: %s", pairing_session_id, _log_exc)
+                already_paired = False
+                pair_required = True
+
         refreshed = db.get_onboarding_session(phone) or session
         refreshed["businessId"] = business_id
         refreshed["pairingSessionId"] = pairing_session_id
@@ -4259,17 +4282,40 @@ class OnboardingService:
             if bridge_status == "connected":
                 await self._send(
                     phone,
-                    f"🎉 *{biz_name}* is ready!\n\n"
-                    "✅ Your WhatsApp is already linked and active on this account. "
-                    "Reply *done* to continue.",
-                )
-            else:
-                await self._send(
-                    phone,
                     f"🎉 *{biz_name}* is now live!\n\n"
-                    "⏳ Reconnecting your already-linked WhatsApp — this only takes a moment.\n"
-                    "Reply *done* once messages start coming through.",
+                    "✅ Your WhatsApp is already linked and connected — setting everything up now...",
                 )
+                
+                # Perform the same database updates and trial activation as _handle_pairing:
+                if business_id and pairing_session_id:
+                    try:
+                        db.update_business_doc(business_id, {
+                            "waSessionId": pairing_session_id,
+                            "waPhoneNumber": phone,
+                        })
+                    except Exception as exc:
+                        logger.error("Failed to update business WA info: %s", exc)
+
+                if business_id:
+                    try:
+                        _biz_snap = db.get_business_by_id(business_id)
+                        _plan_now = str((_biz_snap or {}).get("plan") or "").lower()
+                        if _biz_snap and _plan_now in ("", "onboarding") and not _biz_snap.get("trialStartedAt"):
+                            from datetime import timezone as _tz
+                            from app.services.billing.trial_manager import build_trial_fields
+                            _trial_fields = build_trial_fields(datetime.now(_tz.utc))
+                            db.update_business_doc(business_id, _trial_fields)
+                            logger.info(
+                                "[TRIAL] 7-day PRO trial activated for business=%s at WhatsApp Done",
+                                business_id,
+                            )
+                    except Exception as _trial_exc:
+                        logger.error("[TRIAL] Failed to activate trial for business=%s: %s", business_id, _trial_exc)
+
+                await asyncio.sleep(1)
+                await self._transition_to_calendar_setup(refreshed, phone)
+            else:
+                # Let _send_pairing_code handle reconnecting the existing device
                 await self._send_pairing_code(refreshed, phone)
         else:
             await self._start_pairing_mode_choice(refreshed, phone, biz_name)
@@ -4390,7 +4436,7 @@ class OnboardingService:
                         phone, _status_exc,
                     )
 
-            await self._send(phone, "✅ WhatsApp connected!")
+            await self._send(phone, "🎉 WhatsApp is successfully linked!")
             await asyncio.sleep(1)
             await self._transition_to_calendar_setup(session, phone)
             return
@@ -4817,6 +4863,28 @@ class OnboardingService:
         pair_required = session_state.get("pairing_required", not already_paired)
         bridge_status = session_state.get("status", "disconnected")
 
+        if already_paired:
+            paired_phone = session_state.get("phone")
+            clean_paired = "".join(c for c in str(paired_phone) if c.isdigit()) if paired_phone else ""
+            clean_user = "".join(c for c in str(phone) if c.isdigit())
+            matches = False
+            if clean_paired == clean_user:
+                matches = True
+            elif len(clean_paired) >= 10 and len(clean_user) >= 10:
+                matches = clean_paired[-10:] == clean_user[-10:]
+            
+            if not matches:
+                logger.info(
+                    "[PAIRING] Session %s is paired to a different phone %s (expected %s). Forcing logout/re-pair.",
+                    pairing_sid, paired_phone, phone
+                )
+                try:
+                    await self.wa.logout_session(pairing_sid)
+                except Exception as _log_exc:
+                    logger.warning("[PAIRING] Force logout failed for %s: %s", pairing_sid, _log_exc)
+                already_paired = False
+                pair_required = True
+
         if already_paired and not pair_required:
             if bridge_status == "connected":
                 await self._send(
@@ -4865,7 +4933,16 @@ class OnboardingService:
                     phone,
                     "Copy the code above ☝🏼 and paste it on the screen you opened.\n"
                     "⏱ 60 seconds\n\n"
-                    "Reply *done* when linked, *new code* for a fresh code, or *skip* to do it later.",
+                    "We'll automatically detect once it's linked! 🔄\n"
+                    "Reply *new code* for a fresh code, or *skip* to do it later.",
+                )
+                # Generate a unique attempt ID so stale poll tasks can self-cancel
+                # when the user requests a fresh code before the old one is used.
+                attempt_id = datetime.utcnow().isoformat()
+                db.upsert_onboarding_session(phone, {"pairingAttemptId": attempt_id})
+                session["pairingAttemptId"] = attempt_id
+                asyncio.ensure_future(
+                    self._poll_pairing_status(phone, pairing_sid, session, attempt_id)
                 )
                 return
             except PairingStateConflict as exc:
@@ -4897,6 +4974,103 @@ class OnboardingService:
         )
         # Ensure session remains in pairing so they can retry
         db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
+
+    # ── background pairing status poller ─────────────────────────────────
+
+    async def _poll_pairing_status(
+        self,
+        phone: str,
+        pairing_sid: str,
+        initial_session: dict,
+        attempt_id: str,
+    ) -> None:
+        """Background task: poll the bridge every 3 s for up to 60 s.
+
+        Automatically completes the pairing step when the device becomes
+        linked (simulates the user typing "done").  If no link is detected
+        within 60 seconds, sends the owner a timeout message offering to
+        generate a new code or skip.
+
+        Self-cancels when:
+        - The session step is no longer ``"pairing"`` (e.g. user skipped or
+          a concurrent message already completed the step).
+        - ``pairingAttemptId`` in Firestore no longer matches ``attempt_id``
+          (a newer pairing code was issued, so this poll loop is stale).
+        """
+        logger.info(
+            "[PAIRING-POLL] Started for phone=%s session=%s attempt=%s",
+            phone, pairing_sid, attempt_id,
+        )
+
+        poll_interval = 3.0   # seconds between each bridge check
+        timeout_s     = 60.0  # total window before giving up
+        elapsed       = 0.0
+
+        while elapsed < timeout_s:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+            # ── Fetch the latest session state from Firestore ─────────────
+            session = db.get_onboarding_session(phone)
+            if not session:
+                logger.info(
+                    "[PAIRING-POLL] Session gone for %s — exiting poll.", phone
+                )
+                return
+
+            current_step = session.get("currentStep")
+            if current_step != "pairing":
+                logger.info(
+                    "[PAIRING-POLL] Step changed to %r for %s — exiting poll.",
+                    current_step, phone,
+                )
+                return
+
+            if session.get("pairingAttemptId") != attempt_id:
+                logger.info(
+                    "[PAIRING-POLL] Attempt ID superseded for %s — exiting poll.", phone
+                )
+                return
+
+            # ── Query the bridge for session status ───────────────────────
+            try:
+                status_data = await self.wa.get_session_status(pairing_sid)
+                is_paired = (
+                    status_data.get("paired")
+                    or status_data.get("status") == "connected"
+                )
+                if is_paired:
+                    logger.info(
+                        "[PAIRING-POLL] Auto-detected link for phone=%s session=%s",
+                        phone, pairing_sid,
+                    )
+                    # Re-read a fresh copy so _handle_pairing has up-to-date fields
+                    fresh = db.get_onboarding_session(phone) or session
+                    await self._handle_pairing(fresh, phone, "done")
+                    return
+            except Exception as exc:
+                logger.warning(
+                    "[PAIRING-POLL] Bridge status check failed for %s: %s", pairing_sid, exc
+                )
+
+        # ── Timeout reached ───────────────────────────────────────────────
+        # One final guard: only send the message if the session is still
+        # sitting in the pairing step with the same attempt ID.
+        session = db.get_onboarding_session(phone)
+        if (
+            session
+            and session.get("currentStep") == "pairing"
+            and session.get("pairingAttemptId") == attempt_id
+        ):
+            logger.info(
+                "[PAIRING-POLL] 60 s timeout for %s — sending retry prompt.", phone
+            )
+            await self._send(
+                phone,
+                "⏱ *Pairing code expired.*\n\n"
+                "Reply *new code* to generate a fresh pairing code, "
+                "or *skip* to connect WhatsApp later.",
+            )
 
     # ── step transition helpers ──────────────────────────────────────────
 
@@ -5018,17 +5192,21 @@ class OnboardingService:
         # USSD code: **61* = forward on no-answer, *11 = voice calls, *15 = 15-second ring time
         ussd_code = f"**61*{fwd_number}*11*15#"
 
-        msg = (
+        await self._send(
+            phone,
             "📞 *Step 3/3 — Missed Calls*\n\n"
             "When someone calls you and you don't answer within 15 seconds, "
             "your AI receptionist will pick up and handle the call for you.\n\n"
-            "To activate, *open your Phone app, go to the dialler, and type*:\n\n"
-            f"📲  `{ussd_code}`\n\n"
-            "Then press the *call button* ☎️ — you'll get a confirmation.\n\n"
+            "Copy the code in the next message, paste it into your Phone/Dialler app, and call ☎️:"
+        )
+        await asyncio.sleep(0.5)
+        await self._send(phone, f"`{ussd_code}`")
+        await asyncio.sleep(0.5)
+        await self._send(
+            phone,
             "Reply *DONE* once activated, *HELP* for step-by-step instructions, "
             "or *SKIP* to finish without it."
         )
-        await self._send(phone, msg)
 
     async def _handle_call_forwarding(self, session: dict, phone: str, body: str) -> None:
         """Handle Step 3: Call forwarding responses."""
@@ -5059,11 +5237,18 @@ class OnboardingService:
         if normalized in help_words:
             fwd_number = self._get_call_forwarding_number(phone) or "<forwarding-number>"
             ussd_code = f"**61*{fwd_number}*11*15#"
-            msg = (
+            await self._send(
+                phone,
                 "📱 *How to activate call forwarding — step by step:*\n\n"
                 "*Android (most phones):*\n"
                 "1️⃣ Open your Phone app and tap the *dialler*\n"
-                f"2️⃣ Type exactly: `{ussd_code}`\n"
+                "2️⃣ Copy the code in the next message, paste it, and call ☎️:"
+            )
+            await asyncio.sleep(0.5)
+            await self._send(phone, f"`{ussd_code}`")
+            await asyncio.sleep(0.5)
+            await self._send(
+                phone,
                 "3️⃣ Press the *call button* ☎️\n"
                 "4️⃣ You'll see a confirmation on screen\n\n"
                 "*iPhone:*\n"
@@ -5074,7 +5259,6 @@ class OnboardingService:
                 f"*To turn it off later, dial:* `##61#`\n\n"
                 "Reply *DONE* when activated, or *SKIP* to do it later."
             )
-            await self._send(phone, msg)
             return
 
         # Any other message — re-show the USSD code and options
@@ -5082,7 +5266,13 @@ class OnboardingService:
         ussd_code = f"**61*{fwd_number}*11*15#"
         await self._send(
             phone,
-            f"Dial `{ussd_code}` on your phone's dialler and press call ☎️\n\n"
+            "Copy the code in the next message, paste it into your Phone/Dialler app, and press call ☎️:"
+        )
+        await asyncio.sleep(0.5)
+        await self._send(phone, f"`{ussd_code}`")
+        await asyncio.sleep(0.5)
+        await self._send(
+            phone,
             "Reply *DONE* once activated, *HELP* for step-by-step instructions, "
             "or *SKIP* to finish without it.",
         )
@@ -5805,6 +5995,28 @@ class OnboardingService:
             already_paired = session_state.get("paired", False)
             pair_required = session_state.get("pairing_required", not already_paired)
             bridge_status = session_state.get("status", "disconnected")
+
+            if already_paired:
+                paired_phone = session_state.get("phone")
+                clean_paired = "".join(c for c in str(paired_phone) if c.isdigit()) if paired_phone else ""
+                clean_user = "".join(c for c in str(phone) if c.isdigit())
+                matches = False
+                if clean_paired == clean_user:
+                    matches = True
+                elif len(clean_paired) >= 10 and len(clean_user) >= 10:
+                    matches = clean_paired[-10:] == clean_user[-10:]
+                
+                if not matches:
+                    logger.info(
+                        "[POST_ONBOARDING] Session %s is paired to a different phone %s (expected %s). Forcing logout/re-pair.",
+                        pairing_sid, paired_phone, phone
+                    )
+                    try:
+                        await self.wa.logout_session(pairing_sid)
+                    except Exception as _log_exc:
+                        logger.warning("[POST_ONBOARDING] Force logout failed for %s: %s", pairing_sid, _log_exc)
+                    already_paired = False
+                    pair_required = True
 
             if already_paired and not pair_required:
                 if bridge_status == "connected":

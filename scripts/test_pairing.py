@@ -1,5 +1,6 @@
 import asyncio
 from app.services.onboarding_service import OnboardingService
+from app import firestore as db
 
 async def main():
     svc = OnboardingService()
@@ -9,10 +10,22 @@ async def main():
         return {"code": "1234-5678"}
 
     async def stub_send(phone, message):
-        print(f"[stub send] to={phone} msg={message[:120]}")
+        # Replace emojis and non-ascii characters to avoid CP1252 print errors on Windows console
+        safe_msg = message[:120].encode('ascii', 'replace').decode('ascii')
+        print(f"[stub send] to={phone} msg={safe_msg}")
+
+    def stub_upsert_onboarding_session(phone, data):
+        print(f"[stub db] upsert_onboarding_session phone={phone} data={data}")
+        return None
+
+    def stub_get_onboarding_session(phone):
+        print(f"[stub db] get_onboarding_session phone={phone}")
+        return {"currentStep": "pairing", "pairingAttemptId": "mock-attempt-id"}
 
     svc.wa.generate_pair_code = stub_generate_pair_code
     svc._send = stub_send
+    db.upsert_onboarding_session = stub_upsert_onboarding_session
+    db.get_onboarding_session = stub_get_onboarding_session
 
     session = {"pairingSessionId": "biz-test", "businessId": "BIZ-TEST"}
     print("Calling _send_pairing_code (should send code)")
