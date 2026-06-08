@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     # Anthropic
     ANTHROPIC_API_KEY: str = ""
     
+    # OpenAI
+    OPENAI_API_KEY: str = ""
+    
     # ElevenLabs
     ELEVENLABS_API_KEY: str = ""
     

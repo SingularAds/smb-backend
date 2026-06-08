@@ -48,18 +48,13 @@ def _get_calendar_service():
     return build('calendar', 'v3', credentials=credentials)
 
 
-def _cal_create_both(booking_data: dict, business: dict) -> tuple[str | None, str | None]:
-    """Create calendar event for a booking.
+def _cal_create_oauth(booking_data: dict, business: dict) -> str | None:
+    """Create calendar event in the owner's personal Google Calendar via OAuth.
 
-    Tries owner OAuth credentials first (written to the owner's personal calendar),
-    then falls back to the service account (written to the global service calendar).
-
-    Returns ``(oauth_event_id, service_event_id)``.
+    Returns the created event ID, or None on failure.
     """
     booking_id = booking_data.get("id", "?")
     biz_id = business.get("id", "?")
-    oauth_event_id = None
-    service_event_id = None
 
     # Parse start datetime
     try:
@@ -70,7 +65,7 @@ def _cal_create_both(booking_data: dict, business: dict) -> tuple[str | None, st
             start_dt = start_dt_raw
     except Exception as exc:
         logger.error("[Calendar] Failed to parse datetime for booking %s: %s", booking_id, exc)
-        return None, None
+        return None
 
     # Build common event fields
     customer_name = booking_data.get("customerName", "")
@@ -79,89 +74,44 @@ def _cal_create_both(booking_data: dict, business: dict) -> tuple[str | None, st
     duration_minutes = int(booking_data.get("serviceDuration") or 60)
     notes = booking_data.get("notes", "")
     party_size = int(booking_data.get("partySize") or 1)
-
-    end_dt = start_dt + timedelta(minutes=duration_minutes)
     business_name = business.get("name", "Business")
     tz_str = business.get("timezone") or settings.GOOGLE_CALENDAR_TIMEZONE or "UTC"
 
-    # Clear, human-readable event format so the owner recognises bookings made by the AI.
-    # "Reservation - Name - Party of N" is the title; full details go in the description.
-    _party_suffix = f" - Party of {party_size}" if party_size > 1 else ""
-    _title = (
-        f"Reservation - {customer_name}{_party_suffix}"
-        if customer_name
-        else f"Reservation{_party_suffix} - {service_name}"
-    )
-    _description_parts = [
-        f"Booking ID: {booking_id}",
-        f"Phone: {customer_phone}" if customer_phone else None,
-        f"Service: {service_name}" if service_name else None,
-        f"Duration: {duration_minutes}min",
-        f"Business: {business_name}",
-        f"BusinessID: {biz_id}",
-        f"Notes: {notes}" if notes else None,
-    ]
-    _description = "\n".join(p for p in _description_parts if p)
-
-    event = {
-        'summary': _title,
-        'description': _description,
-        'start': {'dateTime': start_dt.isoformat(), 'timeZone': tz_str},
-        'end': {'dateTime': end_dt.isoformat(), 'timeZone': tz_str},
-        'extendedProperties': {
-            'private': {'businessId': biz_id, 'bookingId': booking_id}
-        },
-    }
-
-    # ── Path 1: Owner OAuth (preferred) ──────────────────────────────────────
+    # ── Owner OAuth calendar ──────────────────────────────────────────────────
     refresh_token = business.get("calendarRefreshToken", "")
     owner_calendar_id = business.get("ownerCalendarId") or "primary"
-    if refresh_token and business.get("calendarConnected"):
-        print(f"[Calendar] CREATE (OAuth) booking={booking_id} biz={biz_id} calendar={owner_calendar_id}")
-        try:
-            from app.integrations.google_calendar import GoogleCalendarClient
-            cal = GoogleCalendarClient()
-            oauth_event_id = cal.create_event(
-                customer_name=customer_name,
-                customer_phone=customer_phone,
-                service_name=service_name,
-                start_dt=start_dt,
-                duration_minutes=duration_minutes,
-                notes=notes,
-                booking_id=booking_id,
-                party_size=party_size,
-                business_name=business_name,
-                timezone=tz_str,
-                calendar_id=owner_calendar_id,
-                refresh_token=refresh_token,
-            )
-            if oauth_event_id:
-                print(f"[Calendar] CREATE (OAuth) SUCCESS booking={booking_id} event={oauth_event_id}")
-            else:
-                print(f"[Calendar] CREATE (OAuth) FAILED (no event ID) booking={booking_id}")
-        except Exception as exc:
-            print(f"[Calendar] CREATE (OAuth) EXCEPTION booking={booking_id}: {exc}")
-            logger.error("[Calendar] CREATE (OAuth) EXCEPTION booking=%s: %s", booking_id, exc, exc_info=True)
+    if not (refresh_token and business.get("calendarConnected")):
+        logger.debug("[Calendar] No OAuth credentials for business %s — skipping calendar event", biz_id)
+        return None
 
-    # ── Path 2: Service Account (fallback / backup) ──────────────────────────
-    service_calendar_id = settings.GOOGLE_CALENDAR_ID or "primary"
-    print(f"[Calendar] CREATE (ServiceAccount) booking={booking_id} biz={biz_id} calendar={service_calendar_id}")
+    print(f"[Calendar] CREATE (OAuth) booking={booking_id} biz={biz_id} calendar={owner_calendar_id}")
     try:
-        service = _get_calendar_service()
-        created_event = service.events().insert(
-            calendarId=service_calendar_id,
-            body=event
-        ).execute()
-        service_event_id = created_event.get('id')
-        if service_event_id:
-            print(f"[Calendar] CREATE (ServiceAccount) SUCCESS booking={booking_id} event={service_event_id}")
+        from app.integrations.google_calendar import GoogleCalendarClient
+        cal = GoogleCalendarClient()
+        oauth_event_id = cal.create_event(
+            customer_name=customer_name,
+            customer_phone=customer_phone,
+            service_name=service_name,
+            start_dt=start_dt,
+            duration_minutes=duration_minutes,
+            notes=notes,
+            booking_id=booking_id,
+            party_size=party_size,
+            business_name=business_name,
+            timezone=tz_str,
+            calendar_id=owner_calendar_id,
+            refresh_token=refresh_token,
+        )
+        if oauth_event_id:
+            print(f"[Calendar] CREATE (OAuth) SUCCESS booking={booking_id} event={oauth_event_id}")
+            return oauth_event_id
         else:
-            print(f"[Calendar] CREATE (ServiceAccount) FAILED (no event ID) booking={booking_id}")
+            print(f"[Calendar] CREATE (OAuth) FAILED (no event ID) booking={booking_id}")
+            return None
     except Exception as exc:
-        print(f"[Calendar] CREATE (ServiceAccount) EXCEPTION booking={booking_id}: {exc}")
-        logger.error("[Calendar] CREATE (ServiceAccount) EXCEPTION booking=%s: %s", booking_id, exc, exc_info=True)
-
-    return oauth_event_id, service_event_id
+        print(f"[Calendar] CREATE (OAuth) EXCEPTION booking={booking_id}: {exc}")
+        logger.error("[Calendar] CREATE (OAuth) EXCEPTION booking=%s: %s", booking_id, exc, exc_info=True)
+        return None
 
 
 def _cal_update_both(
@@ -828,32 +778,15 @@ def tool_create_booking(args: dict[str, Any], call_info: dict) -> str:
             f"(maximum {slots_per_hour} booking(s) per hour).{next_hint}"
         )
     print(f"[BOOKING CREATED] {booking_id} for business={business['id']} customer={customer_phone} at {booking_dt_utc.isoformat()} (local {booking_dt_local.isoformat()})")
-    # Sync to Google Calendar (BOTH OAuth + Service Account) AFTER DB save — prevents orphan calendar events
-    oauth_event_id, service_event_id = _cal_create_both(booking_data, business)
-    
-    # Store both event IDs in the booking for future updates/deletes
-    if oauth_event_id or service_event_id:
-        try:
-            updates = {}
-            if oauth_event_id:
-                updates["calendarEventId"] = oauth_event_id
-            if service_event_id:
-                updates["calendarEventIdBackup"] = service_event_id
-            fs.update_booking(booking_id, updates, business["id"])
-        except Exception as exc:
-            logger.warning("[CalendarDual] Could not store event IDs in booking %s: %s", booking_id, exc)
+    # ── Sync to Google Calendar (OAuth only — blocks until event is created) ───
+    oauth_event_id = _cal_create_oauth(booking_data, business)
 
-    # Fire-and-forget WhatsApp confirmation to customer.
-    # Skip when source is "whatsapp" — the customer_ai_service already sends
-    # Claude's natural-language reply as the confirmation, so firing this
-    # automated template as well would cause the customer to receive two
-    # confirmation messages for the same booking.
-    if source != "whatsapp":
+    # Store OAuth event ID in Firestore for future updates/deletes
+    if oauth_event_id:
         try:
-            from app.services.automation.booking_automation import send_booking_confirmation
-            asyncio.get_event_loop().create_task(send_booking_confirmation(booking_data, business))
-        except Exception as _auto_err:
-            logger.warning("[Automation] booking confirmation skipped: %s", _auto_err)
+            fs.update_booking(booking_id, {"calendarEventId": oauth_event_id}, business["id"])
+        except Exception as exc:
+            logger.warning("[Calendar] Could not store event ID in booking %s: %s", booking_id, exc)
 
     # Log booking confirmation
     logger.info(
@@ -867,91 +800,84 @@ def tool_create_booking(args: dict[str, Any], call_info: dict) -> str:
     )
 
     formatted_dt = booking_dt_local.strftime("%B %d, %Y at %I:%M %p")
-
-    # ── SMS Notifications ────────────────────────────────────────────────────
-    # Send SMS confirmation to customer
-    try:
-        business_name = business.get("name", "our business")
-        business_phone = business.get("phoneNumber", "") or business.get("ownerPhone", "")
-        logger.info(
-            "[TWILIO-SMS] CREATE-BOOKING: Attempting to send confirmation SMS to customer=%s, "
-            "booking_id=%s, business=%s, service=%s, datetime=%s, language=%s",
-            customer_phone, booking_id, business_name, service_name, formatted_dt, language
-        )
-        notifications.confirm_booking_to_customer(
-            customer_phone=customer_phone,
-            customer_name=customer_name or "there",
-            business_name=business_name,
-            service_name=service_name,
-            booking_datetime=formatted_dt,
-            language=language,
-            business_phone=business_phone,
-        )
-        logger.info(
-            "[TWILIO-SMS] CREATE-BOOKING SUCCESS: Customer confirmation sent to %s for booking %s",
-            customer_phone, booking_id
-        )
-        print(f"[SMS] Booking confirmation sent to {customer_phone}")
-    except Exception as _sms_err:
-        logger.error(
-            "[TWILIO-SMS] CREATE-BOOKING FAILED: Customer confirmation to %s failed for booking %s. Error: %s",
-            customer_phone, booking_id, _sms_err, exc_info=True
-        )
-
-    # Send SMS notification to owner
-    try:
-        owner_phone = business.get("ownerPhone", "")
-        if owner_phone:
-            logger.info(
-                "[TWILIO-SMS] CREATE-BOOKING: Attempting to send notification to owner=%s, "
-                "booking_id=%s, customer=%s (%s), service=%s, new_customer=%s",
-                owner_phone, booking_id, customer_name, customer_phone, service_name, is_new
-            )
-            notifications.notify_owner_new_booking(
-                owner_phone=owner_phone,
-                customer_name=customer_name or "Customer",
-                customer_phone=customer_phone,
-                service_name=service_name,
-                booking_datetime=formatted_dt,
-                is_new_customer=is_new,
-            )
-            logger.info(
-                "[TWILIO-SMS] CREATE-BOOKING SUCCESS: Owner notification sent to %s for booking %s",
-                owner_phone, booking_id
-            )
-            print(f"[SMS] Booking notification sent to owner {owner_phone}")
-        else:
-            logger.warning("[TWILIO-SMS] CREATE-BOOKING: No owner phone configured for business %s", business.get("id"))
-    except Exception as _sms_owner_err:
-        logger.error(
-            "[TWILIO-SMS] CREATE-BOOKING FAILED: Owner notification to %s failed for booking %s. Error: %s",
-            owner_phone, booking_id, _sms_owner_err, exc_info=True
-        )
-
-    # Owner WhatsApp notification — always sent regardless of source so the
-    # owner knows when a customer books via voice (VAPI) or any other channel.
-    try:
-        from app.services.automation.whatsapp_notifier import send_to_owner
-        new_tag = "🆕 New customer" if is_new else "🔄 Returning customer"
-        owner_msg = (
-            f"📅 *New booking!*\n"
-            f"{new_tag}\n"
-            f"Name: {customer_name}\n"
-            f"Phone: {customer_phone}\n"
-            f"Service: {service_name}\n"
-            f"When: {formatted_dt}\n"
-            f"Booking ID: {booking_id}"
-        )
-        asyncio.get_event_loop().create_task(send_to_owner(business, owner_msg))
-    except Exception as _notify_err:
-        logger.warning("[Booking] Owner notification skipped: %s", _notify_err)
-
-    cal_note = " Calendar event created." if (oauth_event_id or service_event_id) else ""
+    cal_note = " Calendar event created." if oauth_event_id else ""
     spoken_id = _speak_booking_id(booking_id)
-    return _ok(
+    confirmation_result = _ok(
         f"Booking confirmed for {customer_name} on {formatted_dt} for {service_name}. "
         f"Your booking ID is {spoken_id}.{cal_note}"
     )
+
+    # ── Background: SMS + Owner WhatsApp (must NOT block customer reply) ──────
+    def _send_notifications_background() -> None:
+        business_name_notif = business.get("name", "our business")
+        business_phone_notif = business.get("phoneNumber", "") or business.get("ownerPhone", "")
+        owner_phone = business.get("ownerPhone", "")
+
+        # Customer SMS
+        try:
+            notifications.confirm_booking_to_customer(
+                customer_phone=customer_phone,
+                customer_name=customer_name or "there",
+                business_name=business_name_notif,
+                service_name=service_name,
+                booking_datetime=formatted_dt,
+                language=language,
+                business_phone=business_phone_notif,
+            )
+            logger.info("[SMS] Booking confirmation sent to customer %s for booking %s", customer_phone, booking_id)
+        except Exception as _sms_err:
+            logger.error("[SMS] Customer confirmation failed for booking %s: %s", booking_id, _sms_err)
+
+        # Owner SMS
+        if owner_phone:
+            try:
+                notifications.notify_owner_new_booking(
+                    owner_phone=owner_phone,
+                    customer_name=customer_name or "Customer",
+                    customer_phone=customer_phone,
+                    service_name=service_name,
+                    booking_datetime=formatted_dt,
+                    is_new_customer=is_new,
+                )
+                logger.info("[SMS] Owner notification sent to %s for booking %s", owner_phone, booking_id)
+            except Exception as _sms_owner_err:
+                logger.error("[SMS] Owner notification failed for booking %s: %s", booking_id, _sms_owner_err)
+
+        # Owner WhatsApp
+        try:
+            from app.services.automation.whatsapp_notifier import send_to_owner
+            new_tag = "🆕 New customer" if is_new else "🔄 Returning customer"
+            owner_msg = (
+                f"📅 *New booking!*\n"
+                f"{new_tag}\n"
+                f"Name: {customer_name}\n"
+                f"Phone: {customer_phone}\n"
+                f"Service: {service_name}\n"
+                f"When: {formatted_dt}\n"
+                f"Booking ID: {booking_id}"
+            )
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(lambda: asyncio.run(send_to_owner(business, owner_msg)))
+        except Exception as _notify_err:
+            logger.warning("[Booking] Owner WhatsApp notification skipped: %s", _notify_err)
+
+    # Fire notifications in a background thread — customer gets confirmation immediately
+    try:
+        import threading
+        threading.Thread(target=_send_notifications_background, daemon=True).start()
+    except Exception as _bg_err:
+        logger.warning("[Booking] Background notification thread failed to start: %s", _bg_err)
+
+    # Fire-and-forget WhatsApp confirmation to customer (non-whatsapp source only)
+    if source != "whatsapp":
+        try:
+            from app.services.automation.booking_automation import send_booking_confirmation
+            asyncio.get_event_loop().create_task(send_booking_confirmation(booking_data, business))
+        except Exception as _auto_err:
+            logger.warning("[Automation] booking confirmation skipped: %s", _auto_err)
+
+    return confirmation_result
 
 
 def check_booking_payload(args: dict[str, Any], call_info: dict) -> dict[str, Any]:
@@ -1865,7 +1791,7 @@ def _llm_interpret_calendar_events(event_summaries: "list[str]") -> "dict[str, A
         return {"is_blocking": False, "block_reason": "", "block_message": "", "capacity": None}
 
     try:
-        from anthropic import Anthropic
+        from openai import OpenAI
         from app.config import settings
 
         summaries_text = "\n".join(f"- {s}" for s in event_summaries[:8])
@@ -1888,13 +1814,13 @@ def _llm_interpret_calendar_events(event_summaries: "list[str]") -> "dict[str, A
             "- If neither blocking nor capacity applies, return is_blocking=false, capacity=null"
         )
 
-        client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model="claude-haiku-4-20250514",
+        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
         )
-        raw = (response.content[0].text or "").strip()
+        raw = (response.choices[0].message.content or "").strip()
         # Extract JSON even if there is extra whitespace or code fences
         m = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
         if m:
@@ -2930,8 +2856,8 @@ def build_assistant_config(call_info: dict) -> dict:
         "assistant": {
             "name": f"{business.get('name', 'Business')} Receptionist",
             "model": {
-                "provider": "anthropic",
-                "model": "claude-sonnet-4-20250514",
+                "provider": "openai",
+                "model": "gpt-4o-mini",
                 "systemPrompt": system_prompt,
                 "temperature": 0.4,
             },
@@ -2973,8 +2899,8 @@ def build_assistant_config(call_info: dict) -> dict:
         "assistant": {
             "name": f"{business.name} Receptionist",
             "model": {
-                "provider": "anthropic",
-                "model": "claude-sonnet-4-20250514",
+                "provider": "openai",
+                "model": "gpt-4o-mini",
                 "systemPrompt": system_prompt,
                 "temperature": 0.4,
             },

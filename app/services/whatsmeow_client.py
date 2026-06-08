@@ -118,11 +118,15 @@ class WhatsmeowClient:
 
         async with self._client() as client:
             try:
+                import time
+                start_time = time.time()
                 resp = await client.post(
                     "/send/message",
                     json={"phone": jid, "message": message},
                     headers={"X-Device-Id": device},
                 )
+                process_time = time.time() - start_time
+                logging.info(f"[LATENCY] WhatsApp OUT (whatsmeow) to {jid} took {process_time:.3f}s")
                 print("message is this: ", message)
                 logger.debug("WhatsApp bridge response status: %s", resp.status_code)
                 logger.debug("WhatsApp bridge response text: %s", (resp.text or '')[:200])

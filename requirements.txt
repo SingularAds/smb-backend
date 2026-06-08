@@ -34,6 +34,7 @@ requests==2.32.3
 # ── External Integrations ──
 twilio==9.3.7
 anthropic==0.40.0
+openai==2.40.0
 google-api-python-client==2.154.0
 google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.1

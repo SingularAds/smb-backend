@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from anthropic import AsyncAnthropic
+from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
 
 from app.config import settings
 
@@ -748,8 +748,8 @@ class PromptService:
     """Generates business-specific VAPI agent prompts via Claude Sonnet."""
 
     def __init__(self) -> None:
-        self.client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-        self.model = "claude-sonnet-4-20250514"
+        self.client = AsyncOpenAIAnthropicWrapper(api_key=settings.OPENAI_API_KEY)
+        self.model = "gpt-4o-mini"
 
     async def generate(
         self,
