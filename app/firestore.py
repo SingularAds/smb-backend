@@ -10,7 +10,7 @@ Call app.firebase.init_firebase() at startup (already done in main.py).
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from firebase_admin import firestore as fb_firestore
@@ -924,6 +924,108 @@ def merge_business_doc(business_id: str, updates: dict) -> dict:
     data = doc.to_dict() or {}
     data["id"] = doc.id
     return data
+
+
+# ── call counters ─────────────────────────────────────────────────────────────
+
+def _today_in_tz(tz: str | None):
+    """Return today's date in the given IANA timezone, falling back to the
+    server's local date if the timezone is missing or invalid."""
+    if tz:
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.now(ZoneInfo(tz)).date()
+        except Exception:
+            logger.warning("increment_call_counters: invalid timezone %r, using local date", tz)
+    return datetime.now().date()
+
+
+def increment_call_counters(business_id: str, tz: str | None = None) -> dict:
+    """Atomically increment the per-business daily and weekly call counters.
+
+    Maintains four fields on the business document:
+      - daily_counter (int, default 0)
+      - daily_counter_date (str, ISO date "YYYY-MM-DD")
+      - weekly_counter (int, default 0)
+      - weekly_counter_date_range (dict {"start": ISO date, "end": ISO date})
+
+    Timezone:
+      "Today" is resolved per business. Resolution order is:
+        1. the explicit *tz* argument (if provided),
+        2. the business document's `timezone` field (e.g. "Asia/Kolkata"),
+        3. settings.BUSINESS_TIMEZONE (the env default).
+      An invalid/unknown timezone falls back to the server's local date.
+
+    Behaviour:
+      Daily — if daily_counter_date is today, increment daily_counter; otherwise
+      (different day or missing) reset daily_counter to 0 and set the date to today
+      before incrementing (so it becomes 1).
+
+      Weekly — if today falls within weekly_counter_date_range [start, end] inclusive,
+      increment weekly_counter; otherwise (out of range or missing) start a fresh
+      7-day range beginning today and reset weekly_counter to 0 before incrementing.
+
+    Missing counter fields are created with their default/initial values. The whole
+    read-modify-write runs inside a Firestore transaction so simultaneous calls for
+    the same business don't lose counts.
+    """
+    from app.config import settings
+
+    db = _db()
+    ref = db.collection("businesses").document(business_id)
+    transaction = db.transaction()
+
+    @fb_firestore.transactional
+    def _apply(txn) -> dict:
+        snapshot = ref.get(transaction=txn)
+        data = (snapshot.to_dict() or {}) if getattr(snapshot, "exists", False) else {}
+
+        # Resolve the timezone for this business and compute "today" within it,
+        # using the doc snapshot we already read (no extra read, no race).
+        resolved_tz = tz or data.get("timezone") or settings.BUSINESS_TIMEZONE
+        today = _today_in_tz(resolved_tz)
+        today_iso = today.isoformat()
+        week_end_iso = (today + timedelta(days=6)).isoformat()
+        logger.info(
+            "increment_call_counters: business=%s tz=%s today=%s",
+            business_id, resolved_tz, today_iso,
+        )
+
+        # ── daily counter ──
+        daily_counter = int(data.get("daily_counter", 0) or 0)
+        daily_date = data.get("daily_counter_date") or ""
+        if daily_date == today_iso:
+            daily_counter += 1
+        else:
+            # New day or missing → reset to 0, then increment to 1.
+            daily_counter = 1
+            daily_date = today_iso
+
+        # ── weekly counter ──
+        weekly_counter = int(data.get("weekly_counter", 0) or 0)
+        week_range = data.get("weekly_counter_date_range")
+        start = week_range.get("start") if isinstance(week_range, dict) else None
+        end = week_range.get("end") if isinstance(week_range, dict) else None
+        in_range = bool(start and end and start <= today_iso <= end)
+        if in_range:
+            weekly_counter += 1
+        else:
+            # Today is outside the range or it is missing → start a fresh
+            # 7-day window beginning today and reset the weekly counter.
+            week_range = {"start": today_iso, "end": week_end_iso}
+            weekly_counter = 1
+
+        updates = {
+            "daily_counter": daily_counter,
+            "daily_counter_date": daily_date,
+            "weekly_counter": weekly_counter,
+            "weekly_counter_date_range": week_range,
+            "updatedAt": _now_iso(),
+        }
+        txn.set(ref, updates, merge=True)
+        return updates
+
+    return _apply(transaction)
 
 
 # ── owners ────────────────────────────────────────────────────────────────────

@@ -24,7 +24,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from app.config import settings
 from app.services import vapi_service
-from app.services.prompt_service import build_default_prompt, _OUT_OF_SCOPE_RULE
+from app.services.prompt_service import build_default_prompt, _OUT_OF_SCOPE_RULE, ensure_call_counter
 from app import firestore as fs
 
 logger = logging.getLogger(__name__)
@@ -388,7 +388,48 @@ async def vapi_webhook(
                 return {"status": "error", "error": payload["error"]}
             print(f"[VAPI] cancel success: {payload.get('booking', {}).get('id')}")
             return {"status": "ok", "payload": payload}
-        
+
+        # ── counter (per-call counter — daily & weekly) ──────────────────────
+        if msg_type == "counter":
+            business_id = (
+                body.get("BusinessId")
+                or body.get("businessId")
+                or body.get("businessID")
+                or ""
+            )
+            count_flag = body.get("count", False)
+            # The AI may send the flag as a string ("true"/"1") instead of a bool.
+            if isinstance(count_flag, str):
+                count_flag = count_flag.strip().lower() in {"true", "1", "yes"}
+            print(f"[VAPI] counter → businessId={business_id!r} count={count_flag}")
+
+            if not business_id:
+                print("[VAPI] counter: missing BusinessId")
+                return {"status": "error", "error": "BusinessId is required"}
+            if not count_flag:
+                # Nothing to count — acknowledge without touching the counters.
+                return {"status": "ok", "counted": False}
+
+            try:
+                result = fs.increment_call_counters(business_id)
+                print(
+                    f"[VAPI] counter updated: daily={result.get('daily_counter')} "
+                    f"(date={result.get('daily_counter_date')}) "
+                    f"weekly={result.get('weekly_counter')} "
+                    f"range={result.get('weekly_counter_date_range')}"
+                )
+                return {
+                    "status": "ok",
+                    "counted": True,
+                    "payload": {
+                        "daily_counter": result.get("daily_counter"),
+                        "weekly_counter": result.get("weekly_counter"),
+                    },
+                }
+            except Exception as exc:
+                logger.warning(f"[VAPI] counter error: {type(exc).__name__}: {exc}")
+                return {"status": "error", "error": str(exc)}
+
         # ── search_business ──────────────────────────────────────────────────
         if msg_type == "search_business":
             print(f"[VAPI] search_business → resolving business prompt")
@@ -482,6 +523,9 @@ async def vapi_webhook(
                 # even for prompts saved before the rule was introduced.
                 if "[Out-of-Scope Service Rule]" not in saved_prompt:
                     saved_prompt = saved_prompt.rstrip() + "\n\n" + _OUT_OF_SCOPE_RULE.strip()
+                # Always ensure the call_counter block is present, even for prompts
+                # saved before the call counter feature was introduced.
+                saved_prompt = ensure_call_counter(saved_prompt, business.get("id", ""))
                 saved_prompt = _inject_date(saved_prompt, biz_tz)
                 print(f"[VAPI] search_business: using saved prompt ({len(saved_prompt)} chars)")
                 return {

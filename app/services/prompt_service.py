@@ -150,6 +150,15 @@ ensuring every task is completed accurately using the required system tools.
 
  
 [Call Initialization]
+⚠️ CRITICAL — At the very start of the call, BEFORE anything else, silently call
+call_counter EXACTLY ONCE with:
+  - count: true
+  - BusinessId: {{businessId}}
+This is a call counter. Call call_counter ONE single time per call and NEVER again for
+the rest of the conversation — not on retries, not for new requests, under no
+circumstance. Do NOT mention it to the caller, do NOT wait on its response, and ignore
+whatever it returns. Counting the same call more than once is strictly forbidden.
+
 ⚠️ CRITICAL — Before saying ANYTHING to the caller, silently call Testing with:
   - businessId: {{businessId}}
   - customerNumber: {{customer.number}}
@@ -617,6 +626,22 @@ _CUSTOMER_NUMBER_RULES = """\
   You are always permitted to share this with the caller when they ask.
 """
 
+# ── Call counter block (injected at the very top of [Call Initialization]) ──
+# call_counter fires exactly once per call so we can track call volume per business.
+# The AI rewriter sometimes keeps the [Call Initialization] header but drops this
+# block, so it is re-injected post-generation via _ensure_call_counter().
+
+_CALL_COUNTER_BLOCK = """\
+⚠️ CRITICAL — At the very start of the call, BEFORE anything else, silently call
+call_counter EXACTLY ONCE with:
+  - count: true
+  - BusinessId: {{businessId}}
+This is a call counter. Call call_counter ONE single time per call and NEVER again for
+the rest of the conversation — not on retries, not for new requests, under no
+circumstance. Do NOT mention it to the caller, do NOT wait on its response, and ignore
+whatever it returns. Counting the same call more than once is strictly forbidden."""
+
+
 # ── Call initialization section (always injected so Claude cannot omit it) ──
 # The Testing tool is called at call-start by VAPI. Its customerNumber parameter
 # is pre-resolved by VAPI to {{customer.number}} before reaching the backend.
@@ -624,6 +649,8 @@ _CUSTOMER_NUMBER_RULES = """\
 
 _CALL_INIT_SECTION = """\
 [Call Initialization]
+""" + _CALL_COUNTER_BLOCK + """
+
 ⚠️ CRITICAL — Before saying ANYTHING to the caller, silently call Testing with:
   - businessId: {{businessId}}
   - customerNumber: {{customer.number}}
@@ -639,6 +666,28 @@ then call checkPhone with that number.
 # Resolve placeholders in the static prompt
 _STATIC_PROMPT = _STATIC_PROMPT.replace("{{OUT_OF_SCOPE_RULE}}", _OUT_OF_SCOPE_RULE.strip())
 _STATIC_PROMPT = _STATIC_PROMPT.replace("{{CUSTOMER_NUMBER_RULES}}", _CUSTOMER_NUMBER_RULES.strip())
+
+
+def ensure_call_counter(prompt: str, business_id: str = "") -> str:
+    """Guarantee the call_counter instruction sits at the top of [Call Initialization].
+
+    The AI rewriter sometimes preserves the [Call Initialization] header but drops the
+    call_counter block, and prompts saved before call_counter existed won't have it at
+    all. This re-injects the block whenever 'call_counter' is missing, and substitutes
+    the real businessId so the agent sends it correctly. Idempotent — does nothing if
+    call_counter is already present.
+    """
+    if "call_counter" not in prompt:
+        block = _CALL_COUNTER_BLOCK
+        header = "[Call Initialization]\n"
+        if header in prompt:
+            prompt = prompt.replace(header, header + block.strip() + "\n\n", 1)
+        else:
+            # No [Call Initialization] section at all — prepend a minimal one.
+            prompt = "[Call Initialization]\n" + block.strip() + "\n\n" + prompt
+    if business_id:
+        prompt = prompt.replace("{{businessId}}", business_id)
+    return prompt
 
 # ── System instruction for Claude ────────────────────────────────────────────
 
@@ -658,7 +707,7 @@ STRICT RULES:
 1. Keep ALL VAPI template variables exactly as-is: {{businessId}}, {{businessName}},
    {{date}}, {{time}}, {{customer.number}}, {{businessPhone}}
 2. Keep ALL tool names exactly as-is: checkAvailableSlots, createBooking,
-   rescheduleBooking, cancelBooking, checkBooking, createComplaint, Testing
+   rescheduleBooking, cancelBooking, checkBooking, createComplaint, Testing, call_counter
 3. Keep every tool parameter and its format exactly as defined in the reference.
    CRITICAL distinction for createBooking:
    - callerPhone = CALLER_PHONE (the person who actually called, always from Testing result)
@@ -697,8 +746,9 @@ STRICT RULES:
     NEVER replace these with "escalate to staff", "write down details", or
     "someone will call you back" — these are false promises when the system is down.
 13. CRITICAL — Preserve the [Call Initialization] section WORD-FOR-WORD near the top
-    of [Task & Goals] (before step 1). It defines the Testing tool call that must fire
-    silently before every greeting. Do NOT rewrite, summarise, or omit it.
+    of [Task & Goals] (before step 1). It defines the call_counter and Testing tool calls
+    that must fire silently before every greeting. call_counter must be called EXACTLY
+    ONCE per call and never again. Do NOT rewrite, summarise, or omit this section.
 14. CRITICAL — Preserve the [Customer Number Detection] section WORD-FOR-WORD at the
     end of the generated prompt. Do NOT rewrite, summarise, or omit it.
 15. CRITICAL — NEVER use {{customer.number}} as a tool parameter value anywhere in the
@@ -832,6 +882,11 @@ class PromptService:
                 )
             else:
                 generated = generated.rstrip() + "\n\n" + _CALL_INIT_SECTION.strip()
+
+        # Always ensure the call_counter block is present at the top of
+        # [Call Initialization] — the rewriter often keeps the section but drops it.
+        # Pass business_id so any re-introduced {{businessId}} placeholder is resolved.
+        generated = ensure_call_counter(generated, business_id)
 
         logger.info("[PromptService] Prompt generated (%d chars)", len(generated))
         return generated
