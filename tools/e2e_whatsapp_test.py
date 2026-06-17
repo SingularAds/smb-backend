@@ -23,6 +23,12 @@ import traceback
 from datetime import datetime, timezone, timedelta
 from typing import Callable, Any
 
+import app.firebase as fb
+try:
+    fb.init_firebase()
+except Exception:
+    pass
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(errors="backslashreplace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -272,13 +278,39 @@ _ds.send_to_owner = stub_send_to_owner
 
 async def test_daily_summary():
     sent_msgs.clear()
-    await _ds.run_daily_summary_for_all_businesses()
+    # Mock now to a non-Sunday 8:00 AM UTC (since fake_biz timezone defaults to UTC)
+    # 2026-06-16 is a Tuesday.
+    sim_now = datetime(2026, 6, 16, 8, 0, 0, tzinfo=timezone.utc)
+    await _ds.run_daily_summary_for_all_businesses(now=sim_now)
     chk("daily summary sent", len(sent_msgs) >= 1)
     if sent_msgs:
         chk("daily summary to owner", sent_msgs[0]["to"] == "owner")
         chk("daily summary contains count", any(c.isdigit() for c in sent_msgs[0]["msg"]))
 
 asyncio.run(test_daily_summary())
+
+# ── 9.5 WEEKLY SUMMARY ────────────────────────────────────────────────────────
+print("\n── 9.5 WEEKLY SUMMARY ──")
+import app.services.automation.weekly_summary as _ws
+_ws.db.list_active_businesses = lambda: [fake_biz]
+mock_weekly_booking = dict(fake_booking)
+mock_weekly_booking["datetime"] = "2026-06-10T12:00:00+00:00"
+_ws.db.list_bookings = lambda biz_id, limit=1000: [mock_weekly_booking]
+_ws.db.list_customers = lambda biz_id, limit=1000: []
+_ws.send_to_owner = stub_send_to_owner
+
+async def test_weekly_summary():
+    sent_msgs.clear()
+    # Mock now to a Sunday 7:00 PM UTC (since fake_biz timezone defaults to UTC)
+    # 2026-06-14 was a Sunday.
+    sim_now = datetime(2026, 6, 14, 19, 0, 0, tzinfo=timezone.utc)
+    await _ws.run_weekly_summary_for_all_businesses(now=sim_now)
+    chk("weekly summary sent", len(sent_msgs) >= 1)
+    if sent_msgs:
+        chk("weekly summary to owner", sent_msgs[0]["to"] == "owner")
+        chk("weekly summary contains count", any(c.isdigit() for c in sent_msgs[0]["msg"]))
+
+asyncio.run(test_weekly_summary())
 
 # Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 # 10. CUSTOMER INTELLIGENCE
@@ -380,6 +412,12 @@ async def mock_wa_send(phone, message, device_id=None):
 # Patch bridge send
 wh_mod._wa.send_message = mock_wa_send
 handler_mod._wa.send_message = mock_wa_send
+
+async def mock_get_session_status(session_id):
+    return {"paired": True, "status": "connected"}
+
+wh_mod._wa.get_session_status = mock_get_session_status
+handler_mod._wa.get_session_status = mock_get_session_status
 
 # Patch Firestore lookup to return our fake biz
 wh_mod.db.get_business_by_wa_session_id = lambda sid: fake_biz if sid == "biz-919905252720" else None

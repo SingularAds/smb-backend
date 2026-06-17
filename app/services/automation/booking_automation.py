@@ -94,14 +94,26 @@ async def send_booking_confirmation(booking: dict, business: dict) -> None:
     biz_name = business.get("name") or "us"
     booking_dt = _parse_dt_tz(booking.get("datetime") or booking.get("date"))
     time_str = _fmt_datetime_tz(booking_dt, business) if booking_dt else "the scheduled time"
+    booking_id = booking.get("id", "")
+
+    try:
+        party_size = int(booking.get("partySize") or 1)
+    except (TypeError, ValueError):
+        party_size = 1
+    party_line = f"👥 *Party:* {party_size} {'person' if party_size == 1 else 'people'}\n"
+
+    maps_url = (business.get("mapsUrl") or "").strip()
+    location_line = f"📍 *Location:* {maps_url}\n" if maps_url else ""
 
     msg = (
         f"✅ *Booking confirmed!*\n\n"
-        f"Hi {customer_name}! Your booking is confirmed with *{biz_name}*.\n\n"
+        f"Hi {customer_name}! Your booking at *{biz_name}* is all set. 🎉\n\n"
         f"📋 *Service:* {service}\n"
         f"📅 *When:* {time_str}\n"
-        f"🆔 *Reference:* {booking.get('id', '')}\n\n"
-        f"See you soon! 😊"
+        f"{party_line}"
+        f"🆔 *Booking ID:* {booking_id}\n"
+        f"{location_line}\n"
+        f"We look forward to seeing you! 😊"
     )
 
     # If this customer is a referred friend with an active first-visit discount,

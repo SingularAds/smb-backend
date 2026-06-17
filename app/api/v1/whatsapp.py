@@ -19,6 +19,8 @@ from fastapi import APIRouter, BackgroundTasks, Header, Request, Response
 from app.config import settings
 from app.services.onboarding_service import OnboardingService
 from app.services.customer_ai_service import CustomerAIService
+from app.services.owner_takeover_service import handle_owner_message
+from app.services import ai_pause_service
 from app.services.whatsmeow_client import WhatsmeowClient, is_our_outbound_echo
 from app.owner.commands.handlers import handle_owner_command, is_owner_message
 from app import firestore as db
@@ -92,6 +94,28 @@ def _is_duplicate_call(call_id: str) -> bool:
     if call_id in _seen_call_ids:
         return True
     _seen_call_ids[call_id] = now + _CALL_DEDUP_TTL_S
+    return False
+
+
+def _is_owner_own_phone(chat_phone: str, business: dict) -> bool:
+    """True when chat_phone is specifically the business owner's own personal phone.
+
+    Used to detect the owner's self-chat on the biz device (a natural command
+    channel). Intentionally does NOT match Recepte / admin phones — those are
+    handled by is_protected_number and must stay blocked.
+    """
+    from app.services.ai_pause_service import _digits
+    target = _digits(chat_phone)
+    if not target:
+        return False
+    for key in ("ownerPhone", "owner_phone"):
+        cand = _digits(business.get(key) or "")
+        if not cand:
+            continue
+        if cand == target:
+            return True
+        if len(cand) >= 10 and len(target) >= 10 and cand[-10:] == target[-10:]:
+            return True
     return False
 
 
@@ -259,6 +283,175 @@ async def _process_webhook(payload: dict) -> None:
         if event == "call_missed":
             logger.info("[CALL_MISSED] call_id=%r caller=%r", data.get("call_id"), data.get("caller_phone"))
             await _handle_missed_call(payload)
+            return
+
+        # ── Owner takeover: outbound message in a customer chat ───────────
+        # The bridge forwards messages with IsFromMe=true (the owner manually
+        # replied from their phone) as event=owner_message. We must filter out
+        # our OWN API-sent replies (AI responses, owner-command replies,
+        # automation notifications) since those also produce outbound echoes.
+        if event == "owner_message":
+            owner_msg_id = data.get("message_id", "")
+            if is_our_outbound_echo(owner_msg_id):
+                logger.debug(
+                    "[OWNER-TAKEOVER] skipping API-sent echo msg_id=%r device=%r",
+                    owner_msg_id, device_id,
+                )
+                return
+
+            owner_chat = (data.get("chat_id") or "").strip()
+            owner_body = (data.get("body") or "").strip()
+            if not owner_chat or not owner_body:
+                logger.info("[OWNER-TAKEOVER] skipping — empty chat_id or body")
+                return
+
+            business = db.get_business_by_wa_session_id(device_id)
+            if not business:
+                logger.warning(
+                    "[OWNER-TAKEOVER] no business for device=%r — ignoring takeover",
+                    device_id,
+                )
+                return
+
+            # ── Owner self-chat command channel ──────────────────────────────
+            # When the owner types a recognized command in their OWN personal
+            # number's chat on the biz device (i.e. the self-chat that appears
+            # after a command reply is sent there), execute the command and
+            # reply back to that same self-chat.
+            # This check runs BEFORE the protected-number guard because the
+            # owner's phone IS in the protected list — but for commands from
+            # the self-chat we want to process them, not drop them.
+            # Non-command text in self-chat (e.g. notes) is still dropped by
+            # the protected-number guard below, preventing false takeovers.
+            from app.owner.commands.parser import parse_command as _pc_sc, CommandType as _CT_sc
+            _sc_cmd = _pc_sc(owner_body)
+            if (
+                _sc_cmd["type"] not in (_CT_sc.UNKNOWN, _CT_sc.RESUME_AI)
+                and _is_owner_own_phone(owner_chat, business)
+            ):
+                _is_duplicate(owner_msg_id)
+                _sc_owner_phone = (
+                    business.get("ownerPhone")
+                    or business.get("owner_phone")
+                    or device_id.replace("biz-", "", 1)
+                )
+                logger.info(
+                    "[OWNER-CMD-SELF] business=%s cmd=%s body=%r",
+                    business.get("id"), _sc_cmd["type"], owner_body[:80],
+                )
+                try:
+                    await handle_owner_command(
+                        business=business,
+                        message=owner_body,
+                        device_id=device_id,
+                        owner_phone=_sc_owner_phone,
+                        reply_jid=owner_chat,  # reply back into the self-chat
+                    )
+                    _log_event(
+                        "processed",
+                        phone=owner_chat,
+                        message_id=owner_msg_id,
+                        detail=f"owner cmd {_sc_cmd['type']} in self-chat",
+                    )
+                except Exception:
+                    logger.exception(
+                        "[OWNER-CMD-SELF] dispatch failed biz=%s cmd=%s",
+                        business.get("id"), _sc_cmd["type"],
+                    )
+                return
+
+            # ── Protected-chat guard ─────────────────────────────────────────
+            # If the owner is replying *inside their chat with Recepte itself*
+            # (the global onboarding number, the owner's own phone, or any
+            # admin), this is not a customer takeover — it's the owner
+            # talking to us / themselves. Pausing AI for that "customer" would
+            # corrupt the global support thread.
+            if ai_pause_service.is_protected_number(owner_chat, business):
+                logger.info(
+                    "[OWNER-TAKEOVER] skipping — chat=%r is a protected number "
+                    "(global/owner/admin); business=%s",
+                    owner_chat, business.get("id"),
+                )
+                _log_event(
+                    "skipped",
+                    phone=owner_chat,
+                    message_id=owner_msg_id,
+                    detail="owner_message in protected (global/owner/admin) chat",
+                )
+                return
+
+            # Register this message_id so the onboarding device doesn't
+            # re-process the same message when it arrives as a regular echo.
+            _is_duplicate(owner_msg_id)
+
+            # If the owner typed a reporting/config command while viewing a
+            # customer chat (e.g. "Today", "Summary"), execute it as an owner
+            # command and do NOT trigger a customer AI-pause / takeover.
+            # RESUME_AI is handled by handle_owner_message (it needs the
+            # customer's phone to know which pause to clear).
+            from app.owner.commands.parser import parse_command as _parse_cmd, CommandType as _CT
+            _ocmd = _parse_cmd(owner_body)
+            if _ocmd["type"] not in (_CT.UNKNOWN, _CT.RESUME_AI):
+                logger.info(
+                    "[OWNER-CMD-IN-CHAT] business=%s cmd=%s body=%r",
+                    business.get("id"), _ocmd["type"], owner_body[:80],
+                )
+                _owner_jid = data.get("from", "")
+                _owner_phone = (
+                    business.get("ownerPhone")
+                    or business.get("owner_phone")
+                    or device_id.replace("biz-", "", 1)
+                )
+                try:
+                    await handle_owner_command(
+                        business=business,
+                        message=owner_body,
+                        device_id=device_id,
+                        owner_phone=_owner_phone,
+                        reply_jid=_owner_jid or _owner_phone,
+                    )
+                    _log_event(
+                        "processed",
+                        phone=owner_chat,
+                        message_id=owner_msg_id,
+                        detail=f"owner cmd {_ocmd['type']} in customer chat",
+                    )
+                except Exception:
+                    logger.exception(
+                        "[OWNER-CMD-IN-CHAT] dispatch failed biz=%s cmd=%s",
+                        business.get("id"), _ocmd["type"],
+                    )
+                return
+
+            # Not a recognized command — genuine reply in a customer chat
+            # (owner takeover) or a resume command for this customer.
+            logger.info(
+                "[OWNER-TAKEOVER] business=%s chat=%s body=%r",
+                business.get("id"), owner_chat, owner_body[:80],
+            )
+            try:
+                await handle_owner_message(
+                    business=business,
+                    customer_phone=owner_chat,
+                    body=owner_body,
+                )
+                _log_event(
+                    "owner_takeover",
+                    phone=owner_chat,
+                    message_id=owner_msg_id,
+                    detail=f"owner replied: {owner_body[:60]!r}",
+                )
+            except Exception as exc:
+                logger.exception(
+                    "[OWNER-TAKEOVER] handler failed business=%s chat=%s",
+                    business.get("id"), owner_chat,
+                )
+                _log_event(
+                    "error",
+                    phone=owner_chat,
+                    message_id=owner_msg_id,
+                    error=str(exc),
+                )
             return
 
         # Only process incoming text messages

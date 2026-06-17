@@ -64,6 +64,8 @@ async def _dispatch(command: dict, business: dict) -> str:
             return await svc.auto_reply_flow(business, {"enabled": False})
         case CommandType.AUTO_REPLY_ON:
             return await svc.auto_reply_flow(business, {"enabled": True})
+        case CommandType.RESUME_AI:
+            return await svc.resume_ai_flow(business, args)
         case CommandType.HELP | CommandType.UNKNOWN:
             return await svc.help_command(business)
         case _:

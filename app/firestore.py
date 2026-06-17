@@ -1056,6 +1056,25 @@ def get_business_by_wa_session_id(session_id: str) -> dict | None:
 
 # ── customer conversations (WhatsApp AI) ──────────────────────────────────────
 
+def list_paused_conversations(business_id: str) -> list[dict]:
+    """Return all customer conversations where AI is currently paused, most-recent first."""
+    from google.cloud.firestore_v1.base_query import FieldFilter
+    docs = (
+        _db().collection("businesses")
+        .document(business_id)
+        .collection("customer_conversations")
+        .where(filter=FieldFilter("aiPaused", "==", True))
+        .stream()
+    )
+    result = []
+    for doc in docs:
+        data = doc.to_dict()
+        data["id"] = doc.id
+        result.append(data)
+    result.sort(key=lambda d: d.get("aiPausedAt") or "", reverse=True)
+    return result
+
+
 def get_customer_conversation(business_id: str, customer_phone: str) -> dict | None:
     """Get conversation history for a customer chatting with a business."""
     phone_clean = _clean_phone(customer_phone)

@@ -31,9 +31,3 @@ services:
 
 volumes:
   media_data:
-
-    volumes:
-      - ./app:/app/app
-
-volumes:
-  postgres_data:

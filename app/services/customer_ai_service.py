@@ -23,7 +23,10 @@ from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
 from app.config import settings
 from app import firestore as db
 from app.integrations import deepgram_client, cartesia_client
-from app.services import vapi_service
+from app.services import ai_pause_service, vapi_service
+from app.services.ai_pause_service import DEFAULT_PAUSE_MINUTES, PauseReason
+from app.services.automation import whatsapp_notifier
+from app.services.intent_classifier import Intent, classify_intent
 from app.services.whatsmeow_client import WhatsmeowClient
 
 logger = logging.getLogger(__name__)
@@ -224,6 +227,43 @@ CUSTOMER_TOOLS = [
 ]
 
 
+_BUSINESS_KEYWORDS = re.compile(
+    r"\b(book|booking|reserv|appointment|appoint|cancel|reschedule|availab|slot|"
+    r"service|price|cost|hour|open|time|today|tomorrow|tonight|monday|tuesday|"
+    r"wednesday|thursday|friday|saturday|sunday|am|pm|people|person|table|seat|"
+    r"party|guest|haircut|massage|trim|colour|color|treatment|consult)\b",
+    re.IGNORECASE,
+)
+
+# Words that signal a personal/romantic relationship rather than a customer interaction.
+# If ANY prior message contains these, the conversation is personal — never override
+# [SILENT_IGNORE] regardless of business intent score.
+_PERSONAL_RELATIONSHIP_MARKERS = re.compile(
+    r"\b(baby|babe|babu|honey|sweetheart|darling|dear|hun|hubby|wifey|"
+    r"love you|miss you|kiss|xoxo|cutie|jaan|jaanu|shona)\b"
+    r"|[❤💕💋😘😍🥰💑👫]",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_business_message(text: str) -> bool:
+    """True if the message text looks like a business/booking inquiry."""
+    return bool(_BUSINESS_KEYWORDS.search(text or ""))
+
+
+def _has_personal_relationship_markers(history: list[dict]) -> bool:
+    """True if any prior message contains romantic/personal relationship terms.
+
+    Used to guard the [SILENT_IGNORE] override: a husband saying 'I want to
+    book a table for 3' to his wife's business number must not trigger the AI,
+    even if the intent classifier scores it BUSINESS with high confidence.
+    """
+    for msg in history:
+        if _PERSONAL_RELATIONSHIP_MARKERS.search(msg.get("content") or ""):
+            return True
+    return False
+
+
 def _build_system_prompt(business: dict) -> str:
     """Build a system prompt tailored to the business."""
     name = business.get("name", "the business")
@@ -274,6 +314,25 @@ internal keyword:
 - If a customer sends a simple or ambiguous greeting WITHOUT any business context (e.g., "Hi", "Hello", "Hey") — you MUST reply with EXACTLY this internal keyword:
   [SILENT_IGNORE]
 - Do NOT engage with off-topic or personal messages in any way. Do NOT answer them even partially.
+
+PERSONAL-CHAT DETECTION FROM HISTORY — CRITICAL:
+Many business owners share ONE WhatsApp number for personal AND business use.
+You receive the recent conversation history. Use it to detect when the sender
+is a friend / family member continuing a SOCIAL conversation rather than a
+real customer:
+- If the prior turns are clearly personal (e.g. "let's grab dinner today bro",
+  "love you", "miss you", emojis-only banter, family/relationship words,
+  no service / time / party size / booking ID ever mentioned), even a
+  business-looking follow-up ("should I book?", "can I book the table
+  today?", "shall we?") is the SAME personal thread continuing — NOT a
+  customer transaction.
+- In that case you MUST reply with exactly:
+  [SILENT_IGNORE]
+- Only treat the conversation as BUSINESS when the prior turns themselves
+  read like a customer interaction (asking about hours, services, prices,
+  or making concrete booking requests with details).
+- When in doubt between "social continuation" and "real customer", choose
+  [SILENT_IGNORE]. The owner will step in manually if needed.
 - Examples of messages you MUST silently ignore:
   • "Tell me a joke" → [SILENT_IGNORE]
   • "What's the weather?" → [SILENT_IGNORE]
@@ -377,7 +436,7 @@ BOOKING OPERATIONS — ZERO TOLERANCE RULES (no exceptions, ever):
   • Date: Must be a specific day (today, tomorrow, a specific date), NOT vague ("sometime next week")
   • Time: MUST be explicit (2pm, 14:00, 2:30pm) — NEVER assume if the customer says only a time without AM/PM
   • Party size: Ask if not provided; default to 1 if customer doesn't specify
-- CONFIRMATION MESSAGE FORMAT: After successful booking tool call, include: party size, date, time, service name, and the booking ID from the tool result. Example: "Perfect! 2 people on May 27 at 2pm for Table Booking. Booking ID: BK515E53"
+- CONFIRMATION MESSAGE FORMAT: After a successful booking tool call, confirm with a warm, structured message that includes: service name, date & time, party size, and booking ID from the tool result. Keep it concise and friendly — this is WhatsApp. Example: "✅ All set! Here are your booking details:\n📋 *Service:* Table Booking\n📅 *When:* May 27 at 2:00 PM\n👥 *Party:* 2 people\n🆔 *Booking ID:* BK515E53\n\nSee you then! 😊"
 
 BOOKING ID RULES — MANDATORY ZERO-TOLERANCE:
 - ⚠️ CRITICAL: When the customer sends or mentions ANY booking ID (pattern: BK + alphanumeric, e.g. BKD68B36, BK515E53), you MUST call check_booking FIRST — before ANY other action.
@@ -445,6 +504,12 @@ class CustomerAIService:
         else:
             history = []
 
+        # Snapshot history BEFORE appending the new turn so the classifier
+        # sees the prior context exactly as the customer's reply lands on it
+        # (e.g. assistant asked "what time?" → user says "12pm" → classifier
+        # judges "12pm" as a BUSINESS continuation, not a stray personal msg).
+        prior_history = list(history)
+
         # Add the new user message
         history.append({"role": "user", "content": body})
 
@@ -457,6 +522,135 @@ class CustomerAIService:
             "name": push_name or "",
             "lastMessageAt": datetime.utcnow().isoformat(),
         })
+
+        # ── Pause gate ───────────────────────────────────────────────────────
+        # Check whether AI is currently paused for this customer. Pauses
+        # auto-expire after DEFAULT_PAUSE_MINUTES; an expired pause is cleared
+        # lazily here so the next message goes straight to AI.
+        pause_state = ai_pause_service.read_state(convo)
+        if pause_state.paused:
+            if pause_state.expired:
+                ai_pause_service.resume(business_id, phone_clean)
+                logger.info(
+                    "[AI-PAUSE] auto-resumed business=%s phone=%s (previous reason=%s)",
+                    business_id, phone_clean, pause_state.reason,
+                )
+            else:
+                # Still paused — persist the customer's message in history
+                # (so when AI does resume it has full context) but do not
+                # reply and do not classify (no need to spend tokens).
+                db.upsert_customer_conversation(business_id, phone_clean, {
+                    "messages":      history,
+                    "customerPhone": phone_clean,
+                    "customerName":  push_name or "",
+                    "businessId":    business_id,
+                    "lastMessageAt": datetime.utcnow().isoformat(),
+                })
+                logger.info(
+                    "[AI-PAUSE] skipping reply business=%s phone=%s reason=%s",
+                    business_id, phone_clean, pause_state.reason,
+                )
+                return
+
+        # ── Intent gate ──────────────────────────────────────────────────────
+        # An LLM-with-history classifier decides whether this message is part
+        # of a business conversation. Personal / bare-greeting messages are
+        # dropped here so the booking AI never sees them. Continuation messages
+        # ("12pm", "yes", "ok") are kept as BUSINESS because prior_history makes
+        # the context visible to the classifier.
+        biz_name = business.get("name", "us")
+        biz_type = business.get("businessType", "business")
+        classification = await classify_intent(
+            message=body,
+            business_name=biz_name,
+            business_type=biz_type,
+            recent_history=prior_history,
+        )
+        logger.info(
+            "[INTENT] business=%s phone=%s intent=%s score=%d frustrated=%s abusive=%s "
+            "out_of_scope=%s reason=%s",
+            business_id, phone_clean,
+            classification.intent.value, classification.score,
+            classification.frustrated, classification.abusive,
+            classification.out_of_scope, classification.reason,
+        )
+
+        # ── Safety flags: abuse / frustration → pause + notify owner ─────────
+        # Abuse takes precedence (it is a strict superset of frustration in
+        # impact). Both auto-pause for the standard window so the owner can
+        # step in. The customer's message stays in history so the owner has
+        # full context when they look at the chat.
+        triggered_pause_reason: PauseReason | None = None
+        if classification.abusive:
+            triggered_pause_reason = PauseReason.ABUSE
+        elif classification.frustrated:
+            triggered_pause_reason = PauseReason.FRUSTRATION
+
+        if triggered_pause_reason is not None:
+            await self._pause_and_notify(
+                business=business,
+                business_id=business_id,
+                phone_clean=phone_clean,
+                push_name=push_name,
+                history=history,
+                reason=triggered_pause_reason,
+                snippet=body,
+            )
+            return
+
+        # ── Out-of-scope: silent skip + notify owner (no pause) ──────────────
+        # "Yesterday I dyed my hair…" — business-related but the AI must not
+        # answer. We don't pause because the customer's NEXT message about a
+        # booking should still work; we just notify the owner so they can step
+        # in for this one question.
+        if classification.out_of_scope:
+            db.upsert_customer_conversation(business_id, phone_clean, {
+                "messages":      history,
+                "customerPhone": phone_clean,
+                "customerName":  push_name or "",
+                "businessId":    business_id,
+                "lastMessageAt": datetime.utcnow().isoformat(),
+            })
+            label = f"{push_name} (+{phone_clean.lstrip('+')})" if push_name else f"+{phone_clean.lstrip('+')}"
+            try:
+                await whatsapp_notifier.send_to_owner(
+                    business,
+                    (
+                        f"📋 *Out-of-scope message* from {label}:\n\n"
+                        f"> {body[:200]}\n\n"
+                        f"Please respond manually — AI did not reply.\n"
+                        f"_(AI is still active for their next booking message)_"
+                    ),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[AI-PAUSE] could not notify owner of out_of_scope business=%s: %s",
+                    business_id, exc,
+                )
+            return
+
+        if classification.intent in (Intent.PERSONAL, Intent.GREETING, Intent.MIXED):
+            # PERSONAL / GREETING / MIXED → stay silent. Many SMB owners use
+            # ONE WhatsApp number for both personal and business chats; a
+            # message that mixes "let's grab dinner" with a casual "should we
+            # book?" must not be answered by the receptionist AI. The owner
+            # can intervene manually, and the next clearly-business turn
+            # ("Table for 4 at 8pm tonight please") will still wake the AI.
+            #
+            # We persist the user's message so future classifications see it
+            # as history, but do NOT invoke the booking AI and do NOT reply.
+            logger.info(
+                "[INTENT-SILENT] business=%s phone=%s intent=%s — staying silent",
+                business_id, phone_clean, classification.intent.value,
+            )
+            db.upsert_customer_conversation(business_id, phone_clean, {
+                "messages": history,
+                "customerPhone": phone_clean,
+                "customerName": push_name or "",
+                "businessId": business_id,
+                "lastMessageAt": datetime.utcnow().isoformat(),
+            })
+            return
 
         # Generate AI response (with potential tool calls)
         system_prompt = _build_system_prompt(business)
@@ -473,16 +667,53 @@ class CustomerAIService:
         )
 
         if reply.strip() == "[SILENT_IGNORE]":
-            logger.info("Silently ignoring message from %s for business %s (msg=%s)", phone_clean, business_id, body[:60])
-            # Save the user's message to history but don't send a reply or save an assistant message
-            db.upsert_customer_conversation(business_id, phone_clean, {
-                "messages": history,
-                "customerPhone": phone_clean,
-                "customerName": push_name or "",
-                "businessId": business_id,
-                "lastMessageAt": datetime.utcnow().isoformat(),
-            })
-            return
+            # High-confidence BUSINESS intent: the intent classifier is more
+            # reliable than the AI's history-based personal-chat heuristic here.
+            # The customer may have started with personal chat but their latest
+            # message is a clear booking request. Strip the personal noise from
+            # history and retry so the AI responds to the actual request.
+            if (
+                classification.intent == Intent.BUSINESS
+                and classification.score >= 80
+                and not _has_personal_relationship_markers(history[:-1])
+            ):
+                logger.info(
+                    "[SILENT_IGNORE-OVERRIDE] business=%s phone=%s score=%d — retrying "
+                    "without personal history context",
+                    business_id, phone_clean, classification.score,
+                )
+                business_history = [
+                    m for m in history[:-1]  # exclude current user turn (re-added below)
+                    if m.get("role") == "assistant"  # keep AI turns (they're business replies)
+                    or _looks_like_business_message(m.get("content", ""))
+                ]
+                business_history.append({"role": "user", "content": body})
+                override_system = (
+                    f"{system_prompt}\n\n{context_note}\n\n"
+                    "IMPORTANT OVERRIDE: The intent classifier has determined with HIGH "
+                    "CONFIDENCE that the customer's latest message is a genuine business "
+                    "request. Respond to it as a real customer inquiry — do NOT return "
+                    "[SILENT_IGNORE] for this message."
+                )
+                reply = await self._get_ai_response(
+                    system=override_system,
+                    history=business_history,
+                    business=business,
+                    customer_phone=phone_clean,
+                    push_name=push_name,
+                )
+
+            if reply.strip() == "[SILENT_IGNORE]":
+                logger.info("Silently ignoring message from %s for business %s (msg=%s)", phone_clean, business_id, body[:60])
+                # Save the user's message to history but don't send a reply or save an assistant message
+                db.upsert_customer_conversation(business_id, phone_clean, {
+                    "messages": history,
+                    "customerPhone": phone_clean,
+                    "customerName": push_name or "",
+                    "businessId": business_id,
+                    "lastMessageAt": datetime.utcnow().isoformat(),
+                })
+                return
 
         # Log AI reply for visibility
         try:
@@ -510,6 +741,66 @@ class CustomerAIService:
             "Customer AI reply sent to %s for business %s (msg=%s)",
             phone_clean, business_id, body[:60],
         )
+
+    async def _pause_and_notify(
+        self,
+        *,
+        business: dict,
+        business_id: str,
+        phone_clean: str,
+        push_name: str,
+        history: list[dict],
+        reason: PauseReason,
+        snippet: str,
+    ) -> None:
+        """Pause AI for a customer, persist the trigger message, and notify owner.
+
+        Used for safety triggers (frustration, abuse). For owner takeover this
+        same pause is performed by owner_takeover_service so we don't duplicate
+        notification logic here.
+        """
+        ai_pause_service.pause(
+            business_id=business_id,
+            customer_phone=phone_clean,
+            reason=reason,
+            snippet=snippet,
+            business=business,
+        )
+        db.upsert_customer_conversation(business_id, phone_clean, {
+            "messages":      history,
+            "customerPhone": phone_clean,
+            "customerName":  push_name or "",
+            "businessId":    business_id,
+            "lastMessageAt": datetime.utcnow().isoformat(),
+        })
+
+        label = (
+            f"{push_name} (+{phone_clean.lstrip('+')})"
+            if push_name else f"+{phone_clean.lstrip('+')}"
+        )
+        reason_text = {
+            PauseReason.ABUSE:       "🚫 The customer used inappropriate language.",
+            PauseReason.FRUSTRATION: "⚠️ The customer seems frustrated.",
+        }.get(reason, "AI paused.")
+
+        try:
+            await whatsapp_notifier.send_to_owner(
+                business,
+                (
+                    f"{reason_text}\n"
+                    f"*AI paused* for {label}.\n\n"
+                    f"> {snippet[:200]}\n\n"
+                    f"Please respond manually. AI resumes automatically in "
+                    f"{DEFAULT_PAUSE_MINUTES} minutes.\n\n"
+                    f"To resume early, send this to your business WhatsApp number:\n"
+                    f"*resume {phone_clean}*"
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[AI-PAUSE] could not notify owner of %s business=%s: %s",
+                reason.value, business_id, exc,
+            )
 
     async def _get_ai_response(
         self,
@@ -896,13 +1187,21 @@ class CustomerAIService:
                     from app.services.automation.booking_automation import send_cancellation_notice
                     from app.services.automation.whatsapp_notifier import send_to_owner
                     cancelled_booking = payload.get("booking") or {"customerPhone": customer_phone, "id": booking_id}
+                    _cust_name = cancelled_booking.get("customerName") or push_name or "Unknown"
+                    _party = cancelled_booking.get("partySize") or 1
+                    try:
+                        _party = int(_party)
+                    except (TypeError, ValueError):
+                        _party = 1
                     _asyncio.ensure_future(send_cancellation_notice(cancelled_booking, business))
                     _asyncio.ensure_future(send_to_owner(
                         business,
-                        f"❌ *Booking cancelled*\nCustomer: {cancelled_booking.get('customerName', push_name)}\n"
-                        f"Phone: {customer_phone}\nService: {cancelled_booking.get('serviceName', '')}\n"
-                        f"Party Size: {cancelled_booking.get('partySize', '')}\n"
-                        f"Booking ID: {booking_id}",
+                        f"❌ *Booking cancelled*\n\n"
+                        f"👤 {_cust_name}\n"
+                        f"📞 +{str(customer_phone).lstrip('+')}\n"
+                        f"✂️ {cancelled_booking.get('serviceName', '')}\n"
+                        f"👥 {_party} {'person' if _party == 1 else 'people'}\n"
+                        f"🆔 {booking_id}",
                     ))
                 except Exception as _auto_err:
                     logger.warning("Cancellation notification skipped: %s", _auto_err)
@@ -942,12 +1241,21 @@ class CustomerAIService:
                         new_dt_fmt = datetime.fromisoformat(new_dt_str).strftime("%B %d, %Y at %I:%M %p") if new_dt_str else new_dt_str
                     except ValueError:
                         new_dt_fmt = new_dt_str
+                    _rs_name = updated_bk.get("customerName") or push_name or "Unknown"
+                    _rs_party = updated_bk.get("partySize") or 1
+                    try:
+                        _rs_party = int(_rs_party)
+                    except (TypeError, ValueError):
+                        _rs_party = 1
                     _asyncio.ensure_future(send_to_owner(
                         business,
-                        f"🔄 *Booking rescheduled*\nCustomer: {updated_bk.get('customerName', push_name)}\n"
-                        f"Phone: {customer_phone}\nService: {updated_bk.get('serviceName', '')}\n"
-                        f"Party Size: {updated_bk.get('partySize', '')}\n"
-                        f"New time: {new_dt_fmt}\nBooking ID: {booking_id}",
+                        f"🔄 *Booking rescheduled*\n\n"
+                        f"👤 {_rs_name}\n"
+                        f"📞 +{str(customer_phone).lstrip('+')}\n"
+                        f"✂️ {updated_bk.get('serviceName', '')}\n"
+                        f"👥 {_rs_party} {'person' if _rs_party == 1 else 'people'}\n"
+                        f"🗓 New time: {new_dt_fmt}\n"
+                        f"🆔 {booking_id}",
                     ))
                 except Exception as _notify_err:
                     logger.warning("Reschedule owner notification skipped: %s", _notify_err)

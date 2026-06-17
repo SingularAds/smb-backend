@@ -82,9 +82,7 @@ def fmt_datetime_long(dt: datetime, business: dict) -> str:
     return to_local(dt, business).strftime("%B %d, %Y at %I:%M %p")
 
 
-# ── Day boundary calculation ──────────────────────────────────────────────────
-
-def local_day_range(business: dict, offset_days: int = 0) -> tuple[str, str]:
+def local_day_range(business: dict, offset_days: int = 0, now: datetime | None = None) -> tuple[str, str]:
     """Return (start_utc_iso, end_utc_iso) for the business-local calendar day.
 
     offset_days=0  → today in business-local time
@@ -95,7 +93,12 @@ def local_day_range(business: dict, offset_days: int = 0) -> tuple[str, str]:
     the UTC datetimes stored in Firestore booking documents.
     """
     tz = biz_tz(business)
-    now_local = datetime.now(tz)
+    if now is None:
+        now_local = datetime.now(tz)
+    else:
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        now_local = now.astimezone(tz)
     # Midnight of the target local day
     local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     local_start = local_midnight + timedelta(days=offset_days)

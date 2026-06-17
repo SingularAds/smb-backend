@@ -846,15 +846,17 @@ def tool_create_booking(args: dict[str, Any], call_info: dict) -> str:
         # Owner WhatsApp
         try:
             from app.services.automation.whatsapp_notifier import send_to_owner
-            new_tag = "🆕 New customer" if is_new else "🔄 Returning customer"
+            new_tag = "🆕 *New customer*" if is_new else "🔄 *Returning customer*"
+            _party = max(int(party_size_raw), 1) if party_size_raw else 1
+            _party_str = f"{_party} {'person' if _party == 1 else 'people'}"
             owner_msg = (
-                f"📅 *New booking!*\n"
-                f"{new_tag}\n"
-                f"Name: {customer_name}\n"
-                f"Phone: {customer_phone}\n"
-                f"Service: {service_name}\n"
-                f"When: {formatted_dt}\n"
-                f"Booking ID: {booking_id}"
+                f"📅 *New booking!* {new_tag}\n\n"
+                f"👤 {customer_name or 'Unknown'}\n"
+                f"📞 +{str(customer_phone).lstrip('+')}\n"
+                f"✂️ {service_name}\n"
+                f"👥 {_party_str}\n"
+                f"🗓 {formatted_dt}\n"
+                f"🆔 {booking_id}"
             )
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:

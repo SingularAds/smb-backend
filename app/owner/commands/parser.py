@@ -41,6 +41,9 @@ class CommandType(str, Enum):
     INACTIVE_CLIENTS = "inactive_clients"
     SEND_OUTREACH = "send_outreach"
 
+    # AI pause/resume
+    RESUME_AI = "resume_ai"
+
     # System
     AUTO_REPLY_OFF = "auto_reply_off"
     AUTO_REPLY_ON = "auto_reply_on"
@@ -75,6 +78,7 @@ _PATTERNS: list[tuple[CommandType, list[str]]] = [
     (CommandType.SEND_OUTREACH,    ["send outreach", "outreach", "contact inactive", "message inactive", "enviar mensagem", "contactar inativos"]),
     (CommandType.AUTO_REPLY_OFF,   ["turn off auto reply", "disable auto reply", "stop auto reply", "desativar resposta", "parar resposta automática", "auto reply off"]),
     (CommandType.AUTO_REPLY_ON,    ["turn on auto reply", "enable auto reply", "start auto reply", "ativar resposta", "auto reply on"]),
+    (CommandType.RESUME_AI,        ["resume ai", "resume bot", "resume"]),
     (CommandType.HELP,             ["ajuda", "help", "comandos", "commands", "menu", "opções", "opcoes"]),
 ]
 # fmt: on
@@ -215,5 +219,12 @@ def _extract_args(cmd_type: CommandType, message: str) -> dict:
         # "send outreach Hi come back!"  — everything after the keyword
         m = re.search(r"(?:send outreach|outreach|contact inactive|message inactive|enviar mensagem|contactar inativos)[:\s]+(.+)", message, re.IGNORECASE | re.DOTALL)
         return {"message": m.group(1).strip() if m else None}
+
+    if cmd_type == CommandType.RESUME_AI:
+        # "resume ai 919905252720" or "resume 919905252720" — optional trailing phone digits
+        # Normalize spaces between digit groups so "9190683 19516" → "919068319516"
+        normalized = re.sub(r'(?<=\d)\s+(?=\d)', '', message)
+        m = re.search(r"(?:resume ai|resume bot|resume)\s+(\d{7,15})", normalized, re.IGNORECASE)
+        return {"phone": m.group(1).strip() if m else None}
 
     return {}

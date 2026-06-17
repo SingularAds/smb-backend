@@ -791,6 +791,70 @@ async def scan_website_flow(business: dict, args: dict | None = None) -> str:
     )
 
 
+async def resume_ai_flow(business: dict, args: dict | None = None) -> str:
+    """Resume AI for a specific customer (or the most-recently paused one).
+
+    Usage:
+      "
+        ai 919905252720"  — resume a specific customer by phone
+      "resume ai"               — resume the customer whose AI was paused most recently
+    """
+    from app.services import ai_pause_service
+    from app import firestore as db
+
+    biz_id = business.get("id") or business.get("businessId")
+    if not biz_id:
+        return "❌ Could not identify your business."
+
+    phone_arg: str | None = (args or {}).get("phone")
+
+    if phone_arg:
+        # Resume the explicitly named customer
+        phone_clean = db._clean_phone(phone_arg)
+        convo = db.get_customer_conversation(biz_id, phone_clean)
+        if not convo or not convo.get("aiPaused"):
+            return f"ℹ️ AI is not paused for +{phone_clean}."
+        ai_pause_service.resume(biz_id, phone_clean)
+        name = (convo.get("customerName") or "").strip()
+        label = f"{name} (+{phone_clean})" if name else f"+{phone_clean}"
+        logger.info("[RESUME_AI_CMD] business=%s phone=%s (explicit)", biz_id, phone_clean)
+        return f"✅ AI resumed for {label}. The bot is handling their chat again."
+
+    # No phone given — resume the most-recently-paused customer
+    paused = db.list_paused_conversations(biz_id)
+    if not paused:
+        return "ℹ️ No customers currently have AI paused."
+
+    if len(paused) == 1:
+        convo = paused[0]
+        phone_clean = convo.get("id") or convo.get("customerPhone", "")
+        ai_pause_service.resume(biz_id, phone_clean)
+        name = (convo.get("customerName") or "").strip()
+        label = f"{name} (+{phone_clean})" if name else f"+{phone_clean}"
+        logger.info("[RESUME_AI_CMD] business=%s phone=%s (auto-single)", biz_id, phone_clean)
+        return f"✅ AI resumed for {label}. The bot is handling their chat again."
+
+    # Multiple paused customers — resume the most recent one and list the rest
+    convo = paused[0]
+    phone_clean = convo.get("id") or convo.get("customerPhone", "")
+    ai_pause_service.resume(biz_id, phone_clean)
+    name = (convo.get("customerName") or "").strip()
+    label = f"{name} (+{phone_clean})" if name else f"+{phone_clean}"
+    logger.info("[RESUME_AI_CMD] business=%s phone=%s (auto-latest of %d)", biz_id, phone_clean, len(paused))
+
+    still_paused = paused[1:]
+    others = "\n".join(
+        f"  • +{c.get('id') or c.get('customerPhone', '?')}"
+        + (f" ({c.get('customerName', '').strip()})" if c.get("customerName") else "")
+        for c in still_paused[:5]
+    )
+    return (
+        f"✅ AI resumed for {label}.\n\n"
+        f"⚠️ {len(still_paused)} other chat(s) still paused:\n{others}\n\n"
+        f"Send *resume ai <phone>* to resume a specific one."
+    )
+
+
 async def auto_reply_flow(business: dict, args: dict | None = None) -> str:
     """Enable or disable the customer AI auto-reply."""
     biz_id = business.get("id") or business.get("businessId")
@@ -846,5 +910,7 @@ async def help_command(business: dict) -> str:
         "  • `settings` — view config\n"
         "  • `turn off auto reply` — disable AI responses\n"
         "  • `turn on auto reply` — enable AI responses\n"
+        "  • `resume ai` — resume AI for the most-recently paused customer\n"
+        "  • `resume ai 919905252720` — resume a specific customer\n"
         "  • `help` — show this menu"
     )

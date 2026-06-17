@@ -50,13 +50,19 @@ def _detect_language(text: str) -> str:
         return "en"
 
 
-async def translate_reply(raw_message: str, reply: str) -> str:
+async def translate_reply(raw_message: str, reply: str, lang: str | None = None) -> str:
     """Translate *reply* into the same language as *raw_message*.
 
     If the detected language is already Portuguese (the template default) or
     detection fails, the reply is returned unchanged.
+
+    Pass *lang* directly when the caller has already resolved the session
+    language (e.g. from onboarding_service) to avoid re-detecting from a
+    short or ambiguous command body like "resume ai" which langdetect may
+    misclassify as Portuguese.
     """
-    lang = _detect_language(raw_message)
+    if lang is None:
+        lang = _detect_language(raw_message)
     if not lang or lang == _TEMPLATE_LANG:
         return reply
 

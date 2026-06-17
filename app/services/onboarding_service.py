@@ -168,6 +168,8 @@ async def _dispatch_owner_cmd(command: dict, business: dict) -> str:
             return await svc.auto_reply_flow(business, {"enabled": False})
         case CommandType.AUTO_REPLY_ON:
             return await svc.auto_reply_flow(business, {"enabled": True})
+        case CommandType.RESUME_AI:
+            return await svc.resume_ai_flow(business, args)
         case CommandType.HELP:
             return await svc.help_command(business)
         case _:
@@ -196,7 +198,9 @@ This is your HIGHEST priority rule. Detect language first, then respond.
 PERSONA:
 - Your name is Sofia. Always speak in first person ("eu" / "I"), never "we at Recepte" \
 or "the Recepte system".
-- First message only: introduce yourself based on the owner's language (e.g., "I'm Sofia from Recepte" in English, "Sou a Sofia da Recepte" in Portuguese, "Soy Sofía de Recepte" in Spanish, etc.). Do not repeat your name after that unless asked.
+- First message only: greet them warmly exactly as follows (adjusting name if known, and translating to their language if not English):
+  "Hi [name]! I’m Sofia 👋 I’m about to become your business’s new best friend. Got a website, Google Maps, or Instagram? Drop it here and I’ll set everything up for you ✨ No link? Just tell me your business name 😊"
+  (If name is not known, say "Hi!" instead of "Hi [name]!"). Do not repeat your name after that unless asked.
 - "Recepte AI" is the product/company name — you never use it to refer to yourself.
 - Daniel is the human backup agent — only mention him when you are explicitly handing off.
 
@@ -217,10 +221,9 @@ background — you do NOT need to react to them
 - If extra context tells you a URL, Maps link, or Instagram link was already tried \
 (success or failure), NEVER ask for another link
 - FIRST assistant message rule: when the owner starts with a greeting/small talk \
-("hi", "hello", "hey", etc.), ask this question directly:
-    "Do you have a business website, Google Maps link, or Instagram profile? \
-If yes, share it here and I can pull your details automatically."
-    You may add a short fallback in the same message: "If not, just send your business name."
+("hi", "hello", "hey", etc.), use this exact phrasing (translating to their language if not English):
+    "Hi [name]! I’m Sofia 👋 I’m about to become your business’s new best friend. Got a website, Google Maps, or Instagram? Drop it here and I’ll set everything up for you ✨ No link? Just tell me your business name 😊"
+    (If name is not known, say "Hi!" instead of "Hi [name]!").
 - Ask this website/maps/instagram question only once unless the owner brings it up again.
 - If they say they don't have a website/link: reply \
 "No worries! Please share your business name and I'll try to find it automatically on Google." \
@@ -1053,9 +1056,9 @@ def _looks_like_english(text: str) -> bool:
 
 _LINK_REQUEST_MESSAGES: dict[str, str] = {
     "en": (
-        "Great — to start, please share your business website, Google Maps link, "
-        "or Instagram profile. If you don't have a link, just send your business "
-        "name and I'll search it for you."
+        "Hi{name}! I’m Sofia 👋 I’m about to become your business’s new best friend. "
+        "Got a website, Google Maps, or Instagram? Drop it here and I’ll set everything up for you ✨ "
+        "No link? Just tell me your business name 😊"
     ),
     "pt": (
         "Perfeito — para começar, partilha o site do teu negócio, um link do Google Maps "
@@ -1082,9 +1085,14 @@ _LINK_REQUEST_MESSAGES: dict[str, str] = {
 }
 
 
-def _link_request_message(lang: str) -> str:
+def _link_request_message(lang: str, name: str = None) -> str:
     lang2 = (lang or "en")[:2].lower()
-    return _LINK_REQUEST_MESSAGES.get(lang2, _LINK_REQUEST_MESSAGES["en"])
+    name_str = f" {name}" if name else ""
+    msg = _LINK_REQUEST_MESSAGES.get(lang2, _LINK_REQUEST_MESSAGES["en"])
+    try:
+        return msg.format(name=name_str).replace("Hi !", "Hi!")
+    except KeyError:
+        return msg
 
 
 def _infer_timezone_from_phone(phone: str) -> str:
@@ -1206,6 +1214,37 @@ _DEMO_REQUEST_RE = re.compile(
 def _is_demo_request(text: str) -> bool:
     """Return True when the owner's message is clearly asking for a demo."""
     return bool(_DEMO_REQUEST_RE.search(text.strip()))
+
+
+# Tighter regex for the post-onboarding TEST command. Unlike _DEMO_REQUEST_RE
+# (which is generous to catch demo discovery-phase phrases like "show me how
+# it works"), this one only fires on UNAMBIGUOUS test/demo requests so it
+# never accidentally swallows a legitimate command like "show me today's
+# bookings" or "preview tomorrow".
+_POST_ONBOARDING_DEMO_RE = re.compile(
+    r"^\s*(?:"
+    r"test"
+    r"|test\s+(?:it|this|recepte|onboarding|the\s+ai|the\s+bot|the\s+demo)"
+    r"|(?:i\s+)?(?:wanna|want\s+to|let\s+me|let[’‘']?s|lets|can\s+i|may\s+i|please)\s+test(?:\s+(?:it|this|onboarding|the\s+ai|the\s+bot))?"
+    r"|demo|d[eé]mo|show\s+(?:me\s+)?(?:a\s+|the\s+)?demo"
+    r"|run\s+(?:a\s+|the\s+)?demo"
+    r"|see\s+(?:a\s+|the\s+)?demo"
+    r"|quero\s+(?:ver\s+(?:um\s+)?demo|testar)"
+    r"|mostrar?\s+(?:um\s+)?demo|prob(?:ar|alo)|d[eé]monstr[ae]"
+    r"|quiero\s+(?:un\s+)?demo|d[eé]mo,?\s+por\s+favor"
+    r")[\s.!,?]*$",
+    re.IGNORECASE,
+)
+
+
+def _is_post_onboarding_demo_request(text: str) -> bool:
+    """Strict detector for the post-onboarding TEST command.
+
+    Only matches messages whose ENTIRE body is a demo/test request — so
+    "I want to test" matches but "I want to test the booking I just made"
+    does not. This protects already-set-up owners' real commands.
+    """
+    return bool(_POST_ONBOARDING_DEMO_RE.match((text or "").strip()))
 
 
 _ONBOARDING_WORD_RE = re.compile(
@@ -1960,11 +1999,12 @@ class OnboardingService:
                     else:
                         await self._send(phone, "No worries! Please share your business name and city, and I'll help you set up manually.")
                     return
-                await self._send(
-                    phone,
-                    "📍 Please share your business location using WhatsApp's location sharing feature so I can search nearby.\n\n"
-                    "Or type *skip* if you'd prefer to set up manually."
+                loc_msg = (
+                    "Perfect! 📍 Let’s find you on the map. "
+                    "Tap 📎 → Location → Send Your Current Location. Takes 2 seconds 🙌"
                 )
+                loc_msg = await self._localize_static(loc_msg, body, session.get("language", "en"))
+                await self._send(phone, loc_msg)
                 return
 
             # Website confirmation step
@@ -2115,7 +2155,7 @@ class OnboardingService:
 
         # Explicit onboarding-start intent: ask for website/maps/instagram first
         if _is_onboarding_start_intent(body):
-            reply = _link_request_message(lang)
+            reply = _link_request_message(lang, push_name)
             conversation_history.append({"role": "assistant", "content": reply})
             db.upsert_onboarding_session(phone, {
                 "conversationHistory": conversation_history,
@@ -2224,9 +2264,18 @@ class OnboardingService:
         if not lang:
             lang, _ = await self._resolve_message_language(body, phone, None)
         now        = datetime.utcnow().isoformat()
+        display_address = lead.get("address") or city
 
         logger.info("[RECEPTE] Showing lead confirmation for %s: businessName=%r", phone, biz_name)
         print(f"[LEAD-LOOKUP] Sending confirmation card to {phone}: businessName={biz_name!r}")
+
+        # Update the confirmation copy to match requested Step 3 format
+        msg = (
+            f"Found you! 🔍🎉 {biz_name} — {biz_type.title()} 📍 {display_address}\n\n"
+            "That’s you, right? Reply yes to lock it in, or no to do it your way 😊"
+        )
+        msg = await self._localize_static(msg, body, lang)
+        await self._send(phone, msg)
 
         session_data = {
             "ownerPhone": phone,
@@ -2246,42 +2295,6 @@ class OnboardingService:
             },
         }
         db.upsert_onboarding_session(phone, session_data)
-
-        # Build a summary card from the lead data
-        greeting = f"Hi{' ' + owner_name if owner_name else ''}! 👋"
-        display_biz = f"🏢 *{biz_name}*" if biz_name else "🏢 *(Business name not available)*"
-        summary_lines = [
-            greeting,
-            "I see you want to activate Recepte for your business.\n",
-            "Here's what I found from your registration:\n",
-            display_biz,
-        ]
-        if biz_type:
-            summary_lines.append(f"📋 Type: {biz_type.title()}")
-        display_address = lead.get("address") or city
-        if display_address:
-            summary_lines.append(f"📍 {display_address}")
-        if lead.get("hours"):
-            summary_lines.append(f"🕐 Hours: {lead['hours']}")
-        lead_services = lead.get("services") or []
-        if lead_services and isinstance(lead_services, list):
-            summary_lines.append("\n*Services:*")
-            for svc in lead_services[:5]:
-                if isinstance(svc, dict):
-                    svc_line = f"  • {svc.get('name', '')}"
-                    if svc.get("duration"):
-                        svc_line += f" — {svc['duration']}"
-                    if svc.get("price"):
-                        svc_line += f" — {svc['price']}"
-                else:
-                    svc_line = f"  • {svc}"
-                summary_lines.append(svc_line)
-        summary_lines += [
-            "",
-            "Is this the right business? "
-            "Reply *yes* to confirm, *edit* to change details, or *no* to start fresh.",
-        ]
-        await self._send(phone, "\n".join(summary_lines))
 
     async def _start_recepte_onboarding(
         self,
@@ -2497,11 +2510,10 @@ class OnboardingService:
         session["refereeDiscountPercent"] = 10
 
         msg = (
-            "Want your customers to bring you new ones?\n"
-            "Turn on referrals, and every happy customer becomes a way to grow. When someone refers a friend, both get a discount: the friend who referred earns money off their next visit, and the new customer gets a welcome discount on their first.\n"
-            "It runs on its own. You just watch your client list grow.\n"
-            "Enable referrals? (yes/no)\n"
-            "Default: 25% off for the referrer, 10% off for the new customer — change either anytime."
+            "Here’s where it gets fun 🤑 Imagine every happy customer quietly bringing you new ones — while you sleep 😴 "
+            "Turn on referrals and they do exactly that. Friend refers a friend → both get a little discount → "
+            "your client list just keeps growing 📈 It runs on its own. You just watch it happen ✨ "
+            "Switch it on? (yes/no) Default: 25% off for the referrer, 10% for the newcomer — change it anytime 👍"
         )
         msg = await self._localize_static(
             msg,
@@ -3279,12 +3291,12 @@ class OnboardingService:
                     "pendingPlacesQuery": query,
                     "askedForLocation": True,
                 })
-                await self._send(
-                    phone,
-                    "📍 To find your business on Google, please share your location using "
-                    "WhatsApp's location sharing feature.\n\n"
-                    "Tap the 📎 attachment icon → Location → *Send Your Current Location*."
+                loc_msg = (
+                    "Perfect! 📍 Let’s find you on the map. "
+                    "Tap 📎 → Location → Send Your Current Location. Takes 2 seconds 🙌"
                 )
+                loc_msg = await self._localize_static(loc_msg, original_body or query, session.get("language", "en"))
+                await self._send(phone, loc_msg)
                 return
             # Already asked — do global textsearch as fallback
             results = await self._search_google_places_multi(query, max_results=5)
@@ -3317,12 +3329,15 @@ class OnboardingService:
                 "currentStep": "website_confirm",
                 "websiteExtractedData": result,
             })
-            card = self._format_places_card(1, result, numbered=False)
+            biz_name = result.get("name", "")
+            biz_type = (result.get("type") or result.get("businessType") or "").title()
+            address = result.get("address") or result.get("formatted_address") or ""
             confirm_msg = (
-                f"I found *{query}* on Google! 🔍\n\n{card}\n\n"
-                "Is this your business? Reply *yes* to confirm or *no* to continue manually."
+                f"Found you! 🔍🎉 {biz_name} — {biz_type} 📍 {address}\n\n"
+                "That’s you, right? Reply yes to lock it in, or no to do it your way 😊"
             )
             # Save bot message to history so context is preserved when user confirms
+            confirm_msg = await self._localize_static(confirm_msg, original_body or query, session.get("language", "en"))
             _h = session.get("conversationHistory", [])
             _h.append({"role": "assistant", "content": confirm_msg})
             db.upsert_onboarding_session(phone, {"conversationHistory": _h})
@@ -4436,7 +4451,12 @@ class OnboardingService:
                         phone, _status_exc,
                     )
 
-            await self._send(phone, "🎉 WhatsApp is successfully linked!")
+            msg = (
+                "🎉 Connected! We’re officially a team now 🤝 "
+                "From this moment, no customer slips through the cracks 💪"
+            )
+            msg = await self._localize_static(msg, "", session.get("language", "en"))
+            await self._send(phone, msg)
             await asyncio.sleep(1)
             await self._transition_to_calendar_setup(session, phone)
             return
@@ -4612,14 +4632,15 @@ class OnboardingService:
         or via pairing code (same phone), then transition to the appropriate sub-step.
         """
         db.upsert_onboarding_session(phone, {"currentStep": "pairing_mode_choice"})
-        await self._send(
-            phone,
-            f"🎉 *{biz_name}* is now live!\n\n"
-            "📱 *How would you like to connect your business WhatsApp?*\n\n"
-            "1️⃣ *Scan QR code* — if you have a tablet, computer, or another phone nearby\n"
-            "2️⃣ *Pairing code* — if you only have this phone with you\n\n"
-            "Reply *1* or *QR* for option 1, or *2* or *code* for option 2.",
+        msg = (
+            f"🎉 {biz_name} is officially LIVE! Big moment 🥳 "
+            "Now let’s connect your business WhatsApp so I can start catching every customer for you 📱\n\n"
+            "1️⃣ Scan QR — if you’ve got a tablet, computer, or second phone nearby\n"
+            "2️⃣ Pairing code — if it’s just you and this phone 😊\n\n"
+            "Reply 1 or 2."
         )
+        msg = await self._localize_static(msg, "", session.get("language", "en"))
+        await self._send(phone, msg)
 
     async def _handle_pairing_mode_choice(
         self, session: dict, phone: str, body: str
@@ -4788,20 +4809,50 @@ class OnboardingService:
     async def _start_scam_warning(self, session: dict, phone: str) -> None:
         """Send the regulatory scam-warning required before generating a
         pairing code, then transition to ``pairing_scam_warning`` step.
+
+        Once an owner has acknowledged the warning at least once (either on
+        the business doc or stored on the onboarding session), we skip it on
+        every subsequent re-link / unlink-re-link cycle and go straight to
+        the pairing code. The owner has already seen the message.
         """
+        if self._scam_warning_already_acknowledged(session):
+            logger.info(
+                "[PAIRING] scam warning already acknowledged — skipping for phone=%s",
+                phone,
+            )
+            db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
+            await self._send_pairing_code(session, phone)
+            return
+
         db.upsert_onboarding_session(phone, {"currentStep": "pairing_scam_warning"})
-        await self._send(
-            phone,
-            "⚠️ *Before we continue — please read this:*\n\n"
-            'WhatsApp may show a screen saying:\n\n'
-            '*"This may be a scam"*\n\n'
-            "This appears automatically whenever WhatsApp links a device using a "
-            "pairing code instead of a QR scan.\n\n"
-            "✅ This is expected\n"
-            "✅ Your account remains fully under your control\n"
-            "✅ You can unlink anytime from WhatsApp settings\n\n"
-            "Reply *YES* to continue.",
+        msg = (
+            "Quick heads-up before we connect 💛\n\n"
+            "WhatsApp might flash a screen saying “This may be a scam.” "
+            "Totally normal — it shows this anytime you link with a code instead of a scan.\n\n"
+            "✅ Expected\n"
+            "✅ Your account stays 100% yours\n"
+            "✅ Unlink anytime, no stress\n\n"
+            "Reply YES and let’s go 🚀"
         )
+        msg = await self._localize_static(msg, "", session.get("language", "en"))
+        await self._send(phone, msg)
+
+    def _scam_warning_already_acknowledged(self, session: dict | None) -> bool:
+        """True if this owner has already confirmed the scam warning before.
+
+        Stored on the business doc (persistent across sessions) and mirrored
+        on the onboarding session for fast checks without an extra read.
+        """
+        if session and session.get("scamWarningAcknowledged"):
+            return True
+        biz_id = (session or {}).get("businessId")
+        if not biz_id:
+            return False
+        try:
+            biz = db.get_business_by_id(biz_id)
+        except Exception:
+            return False
+        return bool(biz and biz.get("scamWarningAcknowledged"))
 
     async def _handle_pairing_scam_warning(
         self, session: dict, phone: str, body: str
@@ -4819,7 +4870,23 @@ class OnboardingService:
             # User confirmed — generate and send the pairing code.
             # Transition back to the standard "pairing" step so the existing
             # _handle_pairing / _send_pairing_code machinery takes over.
-            db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
+            # Persist the acknowledgement so future re-links skip the warning.
+            db.upsert_onboarding_session(phone, {
+                "currentStep": "pairing",
+                "scamWarningAcknowledged": True,
+            })
+            biz_id = session.get("businessId")
+            if biz_id:
+                try:
+                    db.update_business_doc(biz_id, {
+                        "scamWarningAcknowledged": True,
+                        "scamWarningAcknowledgedAt": datetime.utcnow().isoformat(),
+                    })
+                except Exception as exc:
+                    logger.warning(
+                        "[PAIRING] Could not persist scamWarningAcknowledged on biz=%s: %s",
+                        biz_id, exc,
+                    )
             await self._send_pairing_code(session, phone)
             return
 
@@ -4922,28 +4989,29 @@ class OnboardingService:
                     phone_number=f"+{phone}",
                 )
                 code = result.get("code", "????-????")
-                await self._send(
-                    phone,
-                    "📱 *How to link your WhatsApp device using a pairing code:*\n\n"
-                    "1️⃣ Open *WhatsApp* on your phone\n"
-                    "2️⃣ Tap the *3-dot menu* (⋮) at the top right\n"
-                    "3️⃣ Tap *Linked Devices*\n"
-                    "4️⃣ Tap *Link a Device*\n"
-                    "5️⃣ When the camera opens, tap *'Link with phone number instead'*\n"
-                    "6️⃣ Enter your phone number, then enter the code below:\n\n"
-                    "_The code expires in 60 seconds — enter it quickly!_",
+                instructions = (
+                    "Almost there! Here’s how 👇\n\n"
+                    "📱 iPhone: Open WhatsApp → tap Settings (bottom right) → Linked Devices\n"
+                    "🤖 Android: Open WhatsApp → tap the ⋮ menu (top right) → Linked Devices\n\n"
+                    "Then for both:\n"
+                    "1️⃣ Tap Link a Device\n"
+                    "2️⃣ Tap “Link with phone number instead”\n"
+                    "3️⃣ Pop in your number, then the code below ⬇️\n"
+                    "⏱ Be quick — it expires in 60 seconds!"
                 )
+                instructions = await self._localize_static(instructions, "", session.get("language", "en"))
+                await self._send(phone, instructions)
                 await asyncio.sleep(1)
-                await self._send(phone,f"Here's your pairing code:")
-                await self._send(phone, f"*{code}*")
-                await asyncio.sleep(1)
-                await self._send(
-                    phone,
-                    "Copy the code above ☝🏼 and paste it on the screen you opened.\n"
-                    "⏱ 60 seconds\n\n"
-                    "We'll automatically detect once it's linked! 🔄\n"
-                    "Reply *new code* for a fresh code, or *skip* to do it later.",
+
+                code_msg_template = (
+                    "Here’s your pairing code: {code_placeholder}\n\n"
+                    "Copy it ☝🏼 and paste it on that screen.\n"
+                    "⏱ 60 seconds — I’ll know the second it connects 🔄\n\n"
+                    "Reply new code for a fresh one, or skip for later."
                 )
+                code_msg_localized = await self._localize_static(code_msg_template, "", session.get("language", "en"))
+                code_msg = code_msg_localized.replace("{code_placeholder}", f"*{code}*").replace("code_placeholder", f"*{code}*")
+                await self._send(phone, code_msg)
                 # Generate a unique attempt ID so stale poll tasks can self-cancel
                 # when the user requests a fresh code before the old one is used.
                 attempt_id = datetime.utcnow().isoformat()
@@ -5090,14 +5158,16 @@ class OnboardingService:
         base_url = settings.BASE_URL.rstrip("/")
         calendar_link = f"{base_url}/api/v1/calendar/connect?business_id={business_id}"
 
-        msg = (
-            "📅 *Step 2/3 — Google Calendar Integration*\n\n"
-            "Connecting your Google Calendar lets your bookings appear automatically in your calendar, "
-            "and lets you control when you're available.\n\n"
-            "⚠️ *If you skip this step*, all time slots within your working hours will be open for bookings with no limit.\n\n"
-            f"🔗 Click here to connect: {calendar_link}\n\n"
-            "After authorizing, reply *DONE* to continue. Or reply *SKIP* to continue without it."
+        msg_template = (
+            "📅 Next: your calendar (step 2 of 3)\n\n"
+            "Connect Google Calendar and every booking lands in it automatically — "
+            "you’ll always know exactly what your day looks like 🗓️\n\n"
+            "⚠️ Skip it and I’ll treat all your working hours as open for bookings.\n\n"
+            "🔗 Connect here: {calendar_link_placeholder}\n\n"
+            "Reply DONE when you’re in, or SKIP for now 😊"
         )
+        msg_localized = await self._localize_static(msg_template, "", session.get("language", "en"))
+        msg = msg_localized.replace("{calendar_link_placeholder}", calendar_link).replace("calendar_link_placeholder", calendar_link)
         await self._send(phone, msg)
 
     async def _handle_calendar_setup(self, session: dict, phone: str, body: str) -> None:
@@ -5113,10 +5183,9 @@ class OnboardingService:
             if business_id:
                 biz = db.get_business_by_id(business_id)
                 if biz and biz.get("calendarConnected"):
-                    await self._send(
-                        phone,
-                        "✅ Google Calendar connected! Your bookings will be synced automatically.",
-                    )
+                    msg = "✅ Calendar connected! Bookings will now appear like magic ✨"
+                    msg = await self._localize_static(msg, body, session.get("language", "en"))
+                    await self._send(phone, msg)
                     await asyncio.sleep(1)
                     await self._transition_to_call_forwarding(session, phone)
                     return
@@ -5200,21 +5269,16 @@ class OnboardingService:
         # USSD code: **61* = forward on no-answer, *11 = voice calls, *15 = 15-second ring time
         ussd_code = f"**61*{fwd_number}*11*15#"
 
-        await self._send(
-            phone,
-            "📞 *Step 3/3 — Missed Calls*\n\n"
-            "When someone calls you and you don't answer within 15 seconds, "
-            "your AI receptionist will pick up and handle the call for you.\n\n"
-            "Copy the code in the next message, paste it into your Phone/Dialler app, and call ☎️:"
+        msg_template = (
+            "📞 Last step — never miss a call again (step 3 of 3)\n\n"
+            "If someone calls and you can’t pick up within 15 seconds, I’ll answer for you and take care of them 🙌\n\n"
+            "Copy the code below, paste it into your phone’s dialler, and call ☎️:\n\n"
+            "{ussd_code_placeholder}\n\n"
+            "Reply DONE once it’s set, HELP for hand-holding, or SKIP to wrap up 😊"
         )
-        await asyncio.sleep(0.5)
-        await self._send(phone, f"`{ussd_code}`")
-        await asyncio.sleep(0.5)
-        await self._send(
-            phone,
-            "Reply *DONE* once activated, *HELP* for step-by-step instructions, "
-            "or *SKIP* to finish without it."
-        )
+        msg_localized = await self._localize_static(msg_template, "", session.get("language", "en"))
+        msg = msg_localized.replace("{ussd_code_placeholder}", f"`{ussd_code}`").replace("ussd_code_placeholder", f"`{ussd_code}`")
+        await self._send(phone, msg)
 
     async def _handle_call_forwarding(self, session: dict, phone: str, body: str) -> None:
         """Handle Step 3: Call forwarding responses."""
@@ -5272,28 +5336,29 @@ class OnboardingService:
         # Any other message — re-show the USSD code and options
         fwd_number = self._get_call_forwarding_number(phone) or "<forwarding-number>"
         ussd_code = f"**61*{fwd_number}*11*15#"
-        await self._send(
-            phone,
-            "Copy the code in the next message, paste it into your Phone/Dialler app, and press call ☎️:"
+        msg_template = (
+            "Copy the code below, paste it into your phone’s dialler, and call ☎️:\n\n"
+            "{ussd_code_placeholder}\n\n"
+            "Reply DONE once it’s set, HELP for hand-holding, or SKIP to wrap up 😊"
         )
-        await asyncio.sleep(0.5)
-        await self._send(phone, f"`{ussd_code}`")
-        await asyncio.sleep(0.5)
-        await self._send(
-            phone,
-            "Reply *DONE* once activated, *HELP* for step-by-step instructions, "
-            "or *SKIP* to finish without it.",
-        )
+        msg_localized = await self._localize_static(msg_template, "", session.get("language", "en"))
+        msg = msg_localized.replace("{ussd_code_placeholder}", f"`{ussd_code}`").replace("ussd_code_placeholder", f"`{ussd_code}`")
+        await self._send(phone, msg)
 
     async def _complete_onboarding(self, session: dict, phone: str) -> None:
         db.upsert_onboarding_session(phone, {
             "currentStep": "complete",
             "timestamps.completedAt": datetime.utcnow().isoformat(),
         })
-        await self._send(
-            phone,
-            "🎉 All set! Your AI receptionist is ready. You won't miss a customer again 💪",
+        name = session.get("pushName") or (session.get("businessData") or {}).get("ownerName") or ""
+        name_str = f" {name}" if name else ""
+        msg = (
+            f"🎉 You’re ALL set{name_str}! Your AI receptionist is awake, working, and catching every customer — day and night 🌙☀️\n\n"
+            "More clients. More time back. Less slipping through the cracks 💪\n\n"
+            "Welcome to the new way of running your business ✨"
         )
+        msg = await self._localize_static(msg, "", session.get("language", "en"))
+        await self._send(phone, msg)
         logger.info("Onboarding complete for %s", phone)
 
     # ── post-onboarding support ───────────────────────────────────────────
@@ -5843,6 +5908,7 @@ class OnboardingService:
         """Use Claude to classify what a post-onboarding owner message is about.
 
         Returns one of:
+          'demo_test'       – owner wants to see a live booking demo / test the AI
           'wa_reconnect'    – link / reconnect / re-pair their WhatsApp device
           'wa_disconnect'   – disconnect / unlink / remove their WhatsApp device
           'calendar'        – connect or manage Google Calendar
@@ -5850,6 +5916,13 @@ class OnboardingService:
           'new_business'    – wants to add a SECOND/DIFFERENT additional business
           'general'         – anything else
         """
+        # Fast-path: deterministic regex catches "test", "test onboarding",
+        # "demo", "show me a demo", etc. Strict version so real owner
+        # commands like "show me today's bookings" or "preview tomorrow"
+        # are not stolen.
+        if _is_post_onboarding_demo_request(message):
+            return "demo_test"
+
         try:
             resp = await self.client.messages.create(
                 model=self.model,
@@ -5857,6 +5930,10 @@ class OnboardingService:
                 system=(
                     "Classify the business owner's message into exactly one category.\n"
                     "Categories:\n"
+                    "  demo_test      – owner wants to TEST the receptionist, see a DEMO, or watch "
+                    "the AI handle a sample customer booking. Phrases: 'test', 'test it', 'test "
+                    "onboarding', 'demo', 'show me a demo', 'how does it work', 'see it in action', "
+                    "'preview', 'try it out', 'mostrar demo'.\n"
                     "  wa_reconnect   – wants to link, reconnect, pair, or re-pair their WhatsApp device, "
                     "mentions pairing code, WhatsApp connection, unlinked phone, etc.\n"
                     "  wa_disconnect  – wants to disconnect, unlink, remove, or log out their WhatsApp device; "
@@ -5877,11 +5954,154 @@ class OnboardingService:
                 messages=[{"role": "user", "content": message}],
             )
             intent = resp.content[0].text.strip().lower()
-            if intent in {"wa_reconnect", "wa_disconnect", "calendar", "call_forwarding", "new_business", "general"}:
+            if intent in {"demo_test", "wa_reconnect", "wa_disconnect", "calendar", "call_forwarding", "new_business", "general"}:
                 return intent
         except Exception as exc:
             logger.warning("Intent classification failed: %s", exc)
         return "general"
+
+    # ── Post-onboarding demo / "TEST" command ────────────────────────────
+    # Maps a business type to the demo dialect. Each preset is a small dict
+    # that drives a single, business-type-aware roleplay. Defaults gracefully
+    # fall back to "appointment" if the type is unknown.
+    _DEMO_PRESETS: dict[str, dict[str, str]] = {
+        "restaurant": {
+            "noun": "table",
+            "customer_open": "Hi! Do you have a table for 2 tonight around 8?",
+            "sofia_open": "Hi! 🙌 Yes — I can seat 2 at 8pm tonight. Can I grab a name to hold it?",
+            "customer_name": "Sure, it’s Ana",
+            "sofia_close": "Done, Ana — table for 2 at 8pm, booked 🎉 See you tonight!",
+            "outro": "👆 That just happened in seconds — no app, no waiting, no missed customer. "
+                     "Every person who messages you from now on gets exactly this 💪 "
+                     "That’s your time back, and your tables full ✨",
+        },
+        "cafe": {
+            "noun": "table",
+            "customer_open": "Hey! Got a table for 3 at 5pm today?",
+            "sofia_open": "Hi! ☕ Yes — 3 seats free at 5pm. What name should I put it under?",
+            "customer_name": "Leo",
+            "sofia_close": "Booked, Leo — 3 of you at 5pm. See you later! 🎉",
+            "outro": "👆 No phone tag, no missed orders. Every customer who messages you gets "
+                     "this exact 5-second experience from now on ✨",
+        },
+        "salon": {
+            "noun": "appointment",
+            "customer_open": "Hi! Can I get a haircut tomorrow around 11?",
+            "sofia_open": "Hi! 💇 Yes — 11am tomorrow works. What name should I book it under?",
+            "customer_name": "Sofia",
+            "sofia_close": "Done, Sofia — haircut tomorrow at 11am, booked 🎉 See you then!",
+            "outro": "👆 That just happened in seconds — no app, no waiting, no missed customer. "
+                     "Every person who messages you from now on gets exactly this 💪 "
+                     "That’s your time back, and your chairs full ✨",
+        },
+        "barbershop": {
+            "noun": "appointment",
+            "customer_open": "Hey bro, can I get a fade tomorrow at 4?",
+            "sofia_open": "Hey! ✂️ Yes — 4pm tomorrow is open. What's the name?",
+            "customer_name": "Marco",
+            "sofia_close": "Done, Marco — fade tomorrow at 4pm, booked 🎉 See you then!",
+            "outro": "👆 That just happened in seconds — no phone tag, no missed customer. "
+                     "Every walk-in who messages you from now on gets exactly this 💪",
+        },
+        "spa": {
+            "noun": "appointment",
+            "customer_open": "Hi! Can I book a 60-min massage on Saturday at 3?",
+            "sofia_open": "Hi! 🌿 Yes — 60-min massage at 3pm Saturday works. Name?",
+            "customer_name": "Priya",
+            "sofia_close": "Booked, Priya — 60-min massage Saturday at 3pm 🎉 See you then!",
+            "outro": "👆 No back-and-forth, no missed bookings. Every customer message turns "
+                     "into this exact 5-second flow from now on ✨",
+        },
+        "clinic": {
+            "noun": "appointment",
+            "customer_open": "Hello, can I book an appointment for Wednesday morning?",
+            "sofia_open": "Hi! 🩺 Yes — I have a 10am slot Wednesday. Can I take a name to book it?",
+            "customer_name": "John Silva",
+            "sofia_close": "Done, John — appointment Wednesday at 10am, booked 🎉",
+            "outro": "👆 That just happened in seconds — no app, no phone tree, no missed patient. "
+                     "Every person who messages you from now on gets exactly this 💪",
+        },
+        "gym": {
+            "noun": "class",
+            "customer_open": "Hey! Can I join the 7am HIIT class tomorrow?",
+            "sofia_open": "Hi! 💪 Yes — 1 spot left at 7am HIIT tomorrow. Name?",
+            "customer_name": "Carla",
+            "sofia_close": "Booked, Carla — 7am HIIT tomorrow 🎉 See you in class!",
+            "outro": "👆 No more chasing sign-ups, no more missed members. Every message turns "
+                     "into a booked class in seconds ✨",
+        },
+        "store": {
+            "noun": "appointment",
+            "customer_open": "Hi! Can I book a styling session for Friday afternoon?",
+            "sofia_open": "Hi! 🛍️ Yes — Friday 3pm is open. What's the name for the booking?",
+            "customer_name": "Lisa",
+            "sofia_close": "Done, Lisa — styling session Friday at 3pm 🎉 See you then!",
+            "outro": "👆 No missed customers, no manual back-and-forth. Every message becomes "
+                     "a booking in seconds ✨",
+        },
+    }
+
+    _DEMO_DEFAULT_PRESET: dict[str, str] = {
+        "noun": "appointment",
+        "customer_open": "Hi! Can I book an appointment for tomorrow at 11?",
+        "sofia_open": "Hi! 🙌 Yes — 11am tomorrow works. What name should I book it under?",
+        "customer_name": "Alex",
+        "sofia_close": "Done, Alex — appointment tomorrow at 11am, booked 🎉 See you then!",
+        "outro": "👆 That just happened in seconds — no app, no waiting, no missed customer. "
+                 "Every person who messages you from now on gets exactly this 💪 "
+                 "That’s your time back, and your calendar full ✨",
+    }
+
+    def _demo_preset_for(self, business: dict) -> dict[str, str]:
+        """Return the demo preset that best matches the business type."""
+        raw = (business.get("businessType") or "").strip().lower()
+        if not raw:
+            return self._DEMO_DEFAULT_PRESET
+        # Tolerate variants like "hair salon", "barber shop", "fitness gym".
+        for key, preset in self._DEMO_PRESETS.items():
+            if key in raw:
+                return preset
+        return self._DEMO_DEFAULT_PRESET
+
+    async def _handle_post_onboarding_demo(
+        self,
+        business: dict,
+        phone: str,
+        lang: str,
+    ) -> None:
+        """Play a short, business-type-aware customer/Sofia roleplay for the owner.
+
+        Sent as a single WhatsApp message (so the owner sees the whole demo
+        threaded together) with the intro, the labelled roleplay, and the
+        snap-back closer. The flow is fully deterministic — no LLM call, no
+        token cost, no risk of hallucinated booking details — so every owner
+        sees a polished, on-brand demo every time they type "test".
+        """
+        preset = self._demo_preset_for(business)
+        name = business.get("name") or business.get("businessName") or "your business"
+
+        intro = "✨ Love it. Watch this — I’ll play one of your customers, you just read along 👇"
+        roleplay = (
+            "_(demo — not a real booking)_\n\n"
+            f"👤 *Customer:* “{preset['customer_open']}”\n"
+            f"🤖 *Sofia:* “{preset['sofia_open']}”\n"
+            f"👤 *Customer:* “{preset['customer_name']}”\n"
+            f"🤖 *Sofia:* “{preset['sofia_close']}”"
+        )
+        outro = preset["outro"]
+        cta = (
+            f"\n\n_Ready to see it for real? Share your business WhatsApp with a "
+            f"friend and have them message *{name}* — the AI will handle them "
+            f"exactly like this._"
+        )
+
+        body = f"{intro}\n\n{roleplay}\n\n{outro}{cta}"
+        body = await self._localize_static(body, "", lang or "en")
+        await self._send(phone, body)
+        logger.info(
+            "[DEMO-POST-ONBOARDING] business=%s phone=%s preset=%s",
+            business.get("id"), phone, preset.get("noun"),
+        )
 
     async def _handle_post_onboarding_message(
         self,
@@ -5940,6 +6160,11 @@ class OnboardingService:
         # Classify intent via AI (handles typos, all languages, natural phrasing)
         intent = await self._classify_post_onboarding_intent(body)
         logger.info("Post-onboarding intent for %s: %s (body=%s)", phone, intent, body[:60])
+
+        # ── owner wants a live booking demo ─────────────────────────────
+        if intent == "demo_test":
+            await self._handle_post_onboarding_demo(biz, phone, lang)
+            return
 
         # ── add / register a new additional business ───────────────────
         if intent == "new_business":
@@ -6172,7 +6397,7 @@ class OnboardingService:
             try:
                 from app.owner.commands.language import translate_reply
                 reply = await _dispatch_owner_cmd(cmd, biz)
-                reply = await translate_reply(body, reply)
+                reply = await translate_reply(body, reply, lang=lang)
                 await self._send(phone, reply)
                 logger.info("Post-onboarding owner command %s replied to %s", cmd["type"], phone)
                 return

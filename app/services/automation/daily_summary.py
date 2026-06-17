@@ -43,9 +43,10 @@ def _in_range(raw, start: str, end: str) -> bool:
         return False
 
 
-async def run_daily_summary_for_all_businesses() -> None:
+async def run_daily_summary_for_all_businesses(now: datetime | None = None) -> None:
     """Send daily digest to every active business owner with a linked WhatsApp."""
-    now = _now()
+    if now is None:
+        now = _now()
     logger.info("[AUTOMATION:DAILY_SUMMARY] starting run at %s", now.isoformat())
 
     businesses = db.list_active_businesses()
@@ -62,9 +63,19 @@ async def run_daily_summary_for_all_businesses() -> None:
         if not owner_phone:
             continue
 
+        # Check local timezone execution conditions:
+        # 1. Must be 8 AM local time
+        # 2. Must not be Sunday (weekday == 6)
+        tz = _biz_tz(business)
+        now_local = now.astimezone(tz)
+        if now_local.hour != 8:
+            continue
+        if now_local.weekday() == 6:
+            continue
+
         try:
             # Compute the local-day range per business so timezone differences are respected
-            today_start, today_end = _local_day_range(business, 0)
+            today_start, today_end = _local_day_range(business, 0, now=now)
             await _send_daily_summary(business, today_start, today_end)
             sent_count += 1
         except Exception as exc:

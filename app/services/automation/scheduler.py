@@ -23,6 +23,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.services.automation.booking_automation import run_reminder_sweep, run_visit_confirmation_sweep
 from app.services.automation.daily_summary import run_daily_summary_for_all_businesses
+from app.services.automation.weekly_summary import run_weekly_summary_for_all_businesses
 from app.services.automation.customer_intelligence import run_customer_intelligence_sweep
 from app.services.automation.referral_automation import run_referral_invite_sweep, run_referral_discount_expiry_sweep
 from app.services.automation.trial_expiry_automation import run_trial_expiry_sweep
@@ -53,6 +54,13 @@ async def _job_daily_summary() -> None:
         await run_daily_summary_for_all_businesses()
     except Exception as exc:
         logger.exception("[Scheduler] daily summary crashed: %s", exc)
+
+
+async def _job_weekly_summary() -> None:
+    try:
+        await run_weekly_summary_for_all_businesses()
+    except Exception as exc:
+        logger.exception("[Scheduler] weekly summary crashed: %s", exc)
 
 
 async def _job_customer_intel() -> None:
@@ -114,12 +122,22 @@ def start_scheduler() -> None:
         max_instances=1,
     )
 
-    # Daily owner summary — every day at 08:00 UTC
+    # Daily owner summary — run every hour to check business local times (8:00 AM local)
     _scheduler.add_job(
         _job_daily_summary,
-        trigger=CronTrigger(hour=8, minute=0, timezone="UTC"),
+        trigger=CronTrigger(minute=0, timezone="UTC"),
         id="daily_summary",
-        name="Daily owner summary",
+        name="Daily owner summary (hourly timezone check)",
+        replace_existing=True,
+        misfire_grace_time=600,
+    )
+
+    # Weekly owner summary — run every hour to check business local times (Sunday 7:00 PM local)
+    _scheduler.add_job(
+        _job_weekly_summary,
+        trigger=CronTrigger(minute=0, timezone="UTC"),
+        id="weekly_summary",
+        name="Weekly owner summary (hourly timezone check)",
         replace_existing=True,
         misfire_grace_time=600,
     )
