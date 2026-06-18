@@ -323,10 +323,22 @@ async def _process_webhook(payload: dict) -> None:
             # the self-chat we want to process them, not drop them.
             # Non-command text in self-chat (e.g. notes) is still dropped by
             # the protected-number guard below, preventing false takeovers.
+            #
+            # RESUME_AI is allowed in self-chat ONLY when an explicit customer
+            # phone is supplied (e.g. "resume 919905252720"). Without a phone
+            # the command has no implicit target in self-chat — silently let
+            # it fall through to be handled elsewhere rather than guessing.
             from app.owner.commands.parser import parse_command as _pc_sc, CommandType as _CT_sc
             _sc_cmd = _pc_sc(owner_body)
+            _sc_is_resume_with_phone = (
+                _sc_cmd["type"] == _CT_sc.RESUME_AI
+                and bool((_sc_cmd.get("args") or {}).get("phone"))
+            )
             if (
-                _sc_cmd["type"] not in (_CT_sc.UNKNOWN, _CT_sc.RESUME_AI)
+                (
+                    _sc_cmd["type"] not in (_CT_sc.UNKNOWN, _CT_sc.RESUME_AI)
+                    or _sc_is_resume_with_phone
+                )
                 and _is_owner_own_phone(owner_chat, business)
             ):
                 _is_duplicate(owner_msg_id)
@@ -359,6 +371,50 @@ async def _process_webhook(payload: dict) -> None:
                         business.get("id"), _sc_cmd["type"],
                     )
                 return
+
+            # ── Owner KB confirmation reply in self-chat ─────────────────────
+            # `YES KB-XXXX <answer>` or `NO KB-XXXX` is a legitimate self-chat
+            # reply but is NOT recognised by the owner-command parser, so it
+            # would otherwise fall through to the protected-number guard below
+            # (the owner's own phone is in the protected list) and get dropped.
+            # Route it explicitly here so the KB confirmation flow completes.
+            if _is_owner_own_phone(owner_chat, business):
+                from app.services.knowledge_base_service import (
+                    parse_owner_reply as _kb_parse_owner_reply,
+                    handle_owner_kb_reply as _kb_handle_owner_reply,
+                )
+                if _kb_parse_owner_reply(owner_body) is not None:
+                    _is_duplicate(owner_msg_id)
+                    _sc_owner_phone = (
+                        business.get("ownerPhone")
+                        or business.get("owner_phone")
+                        or device_id.replace("biz-", "", 1)
+                    )
+                    try:
+                        kb_handled = await _kb_handle_owner_reply(
+                            business=business,
+                            owner_phone=_sc_owner_phone,
+                            body=owner_body,
+                            device_id=device_id,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[OWNER-KB-SELF] handler failed biz=%s body=%r",
+                            business.get("id"), owner_body[:80],
+                        )
+                        kb_handled = False
+                    if kb_handled:
+                        logger.info(
+                            "[OWNER-KB-SELF] business=%s body=%r — KB reply processed",
+                            business.get("id"), owner_body[:80],
+                        )
+                        _log_event(
+                            "processed",
+                            phone=owner_chat,
+                            message_id=owner_msg_id,
+                            detail="owner KB confirmation reply (self-chat)",
+                        )
+                        return
 
             # ── Protected-chat guard ─────────────────────────────────────────
             # If the owner is replying *inside their chat with Recepte itself*
@@ -585,9 +641,33 @@ async def _process_webhook(payload: dict) -> None:
                         f"[OWNER-CMD] device={device_id} owner_phone={phone} "
                         f"msg_id={message_id!r} body={body[:60]!r}"
                     )
+                    # ── Owner KB confirmation (YES KB-XXXX / NO KB-XXXX) ──────
+                    # Must run BEFORE the referral handler because referral's
+                    # "NO" regex matches any message starting with "no" and
+                    # would otherwise swallow "NO KB-XXXX". The KB matcher is
+                    # strict (verdict + literal "kb-" + code) so anything that
+                    # isn't a KB reply cleanly falls through.
+                    from app.services.knowledge_base_service import handle_owner_kb_reply
+                    kb_handled = await handle_owner_kb_reply(
+                        business=business,
+                        owner_phone=phone,
+                        body=body,
+                        device_id=device_id,
+                    )
+                    if kb_handled:
+                        _log_event(
+                            "processed",
+                            phone=phone,
+                            message_id=message_id,
+                            detail="owner KB confirmation reply",
+                        )
+                        return
+
                     # ── Owner referral confirmation (YES 1234 / NO) ───────────
-                    # Must run before the general owner command parser so these
-                    # replies are never accidentally routed as unknown commands.
+                    # Runs after KB so bare "NO" still reaches the referral
+                    # handler. Must run before the general owner command
+                    # parser so these replies are never routed as unknown
+                    # commands.
                     from app.services.referral_service import handle_owner_referral_reply
                     referral_handled = await handle_owner_referral_reply(
                         business=business,
@@ -655,6 +735,29 @@ async def _process_webhook(payload: dict) -> None:
                                 phone=phone,
                                 message_id=message_id,
                                 detail=f"AI gated — business {biz_id} has no active plan",
+                            )
+                            return
+
+                        # ── CSAT rating reply (must run before AI / referral) ──
+                        # If we asked the customer to rate (1-5) and they did,
+                        # consume the digit here so the AI never sees it as a
+                        # booking-time message ("send 5 people at 7pm").
+                        try:
+                            from app.services.csat_service import handle_csat_reply
+                            csat_handled = await handle_csat_reply(
+                                business=business,
+                                customer_phone=phone,
+                                body=body or "",
+                            )
+                        except Exception as exc:
+                            logger.warning("[CSAT] reply handler error: %s", exc)
+                            csat_handled = False
+                        if csat_handled:
+                            _log_event(
+                                "processed",
+                                phone=phone,
+                                message_id=message_id,
+                                detail="CSAT rating reply handled",
                             )
                             return
 
@@ -734,6 +837,7 @@ async def _process_webhook(payload: dict) -> None:
                                 body=body,
                                 push_name=push_name,
                                 device_id=device_id,
+                                message_id=message_id,
                             )
                             duration = time.time() - customer_ai_start
                             logger.info("[LATENCY] Customer AI Text processing for phone=%s msg_id=%s took %.3fs", phone, message_id, duration)

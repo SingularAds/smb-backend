@@ -22,8 +22,8 @@ from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
 
 from app.config import settings
 from app import firestore as db
-from app.integrations import deepgram_client, cartesia_client
-from app.services import ai_pause_service, vapi_service
+from app.integrations import deepgram_client, cartesia_client, posthog_client
+from app.services import ai_pause_service, csat_service, knowledge_base_service as kb_service, vapi_service
 from app.services.ai_pause_service import DEFAULT_PAUSE_MINUTES, PauseReason
 from app.services.automation import whatsapp_notifier
 from app.services.intent_classifier import Intent, classify_intent
@@ -32,6 +32,64 @@ from app.services.whatsmeow_client import WhatsmeowClient
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY_MESSAGES = 30  # keep conversation context manageable
+
+# Minimum gap between consecutive "AI stayed silent" notifications to the
+# owner for the same customer. Without a cooldown, a customer sending a
+# string of personal messages would spam the owner's WhatsApp.
+SILENT_NOTIFY_COOLDOWN_MINUTES = 15
+
+
+# ── Language detection ────────────────────────────────────────────────────────
+# We use langdetect (already in requirements.txt) on the incoming message so
+# the LLM gets an explicit "reply in <code>" directive instead of having to
+# infer it from context. langdetect is non-deterministic by default; seeding
+# the factory makes results stable across runs so the same message always
+# resolves to the same language code.
+try:  # pragma: no cover — seeding side-effect at import time
+    from langdetect import DetectorFactory as _LangDetectorFactory
+    _LangDetectorFactory.seed = 0
+except Exception:
+    pass
+
+
+# ISO-639-1 → human-readable name, used in the system prompt directive so the
+# LLM sees both the code and the language name (more reliable than code alone).
+_LANG_NAMES = {
+    "en": "English", "es": "Spanish", "pt": "Portuguese", "fr": "French",
+    "de": "German",  "it": "Italian", "nl": "Dutch",     "pl": "Polish",
+    "ru": "Russian", "uk": "Ukrainian",
+    "hi": "Hindi",   "bn": "Bengali", "ta": "Tamil",     "te": "Telugu",
+    "mr": "Marathi", "gu": "Gujarati", "pa": "Punjabi",  "ur": "Urdu",
+    "ar": "Arabic",  "fa": "Persian",  "tr": "Turkish",  "he": "Hebrew",
+    "zh-cn": "Chinese (Simplified)", "zh-tw": "Chinese (Traditional)",
+    "ja": "Japanese", "ko": "Korean", "vi": "Vietnamese", "th": "Thai",
+    "id": "Indonesian", "ms": "Malay", "tl": "Filipino",
+}
+
+
+def _detect_language(text: str) -> tuple[str, str] | None:
+    """Return ``(iso_code, human_name)`` for *text*, or None if undetectable.
+
+    Very short messages (< 3 chars) are not worth classifying — the LLM can
+    fall back to the conversation history. Latin numerals and emoji-only
+    messages return None on purpose so we don't mis-tag them as English.
+    """
+    if not text:
+        return None
+    stripped = text.strip()
+    if len(stripped) < 3:
+        return None
+    # If the message has zero letter characters (digits / emoji / punctuation
+    # only) langdetect will guess wildly — skip and let history decide.
+    if not any(ch.isalpha() for ch in stripped):
+        return None
+    try:
+        from langdetect import detect  # type: ignore
+        code = detect(stripped).lower()
+    except Exception:
+        return None
+    name = _LANG_NAMES.get(code, code.upper())
+    return code, name
 
 
 def _local_date_str(timezone_name: str) -> str:
@@ -264,8 +322,197 @@ def _has_personal_relationship_markers(history: list[dict]) -> bool:
     return False
 
 
-def _build_system_prompt(business: dict) -> str:
-    """Build a system prompt tailored to the business."""
+def _has_active_business_context(history: list[dict], window: int = 10) -> bool:
+    """True when the recent conversation shows an active business interaction.
+
+    Criteria (either is sufficient):
+      1. At least one 'assistant' reply in the last *window* turns — meaning
+         the AI was already engaged and this message is a follow-up.
+      2. At least one of the last 3 customer messages looks like a business
+         inquiry (matches the business keyword regex).
+
+    This is a pure-Python, zero-cost computation used to decide whether a
+    PERSONAL-classified message should pass through to the LLM (continuation
+    of a booking flow) or be dropped silently.
+    """
+    if not history:
+        return False
+    recent = history[-window:]
+    # Condition 1: AI has already replied in this window
+    if any(m.get("role") == "assistant" for m in recent):
+        return True
+    # Condition 2: recent user messages contain business keywords
+    user_msgs = [m for m in recent if m.get("role") == "user"]
+    return any(
+        _looks_like_business_message(m.get("content", ""))
+        for m in user_msgs[-3:]
+    )
+
+
+# ── Industry-aware KB topic classifier ────────────────────────────────────────
+# Maps regex patterns to friendly topic headers used when formatting KB entries
+# for LLM injection. The LLM navigates topics faster when entries are grouped.
+
+_KB_TOPIC_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (
+        re.compile(
+            r"\b(menu|food|dish|cuisine|drink|beverage|dessert|eat|serve|veg|vegan|"
+            r"halal|kosher|allergen|ingredient|pizza|burger|pasta|rice|biryani|curry|"
+            r"sandwich|salad|soup|starter|main|dessert|special|paneer|chicken|mutton|"
+            r"seafood|prawn|fish|beef|pork|gluten|dairy|nut)\b",
+            re.IGNORECASE,
+        ),
+        "\U0001f37d\ufe0f Menu & Food",
+    ),
+    (
+        re.compile(
+            r"\b(price|cost|charge|fee|rate|expensive|cheap|affordable|how much|"
+            r"\u20b9|rs\.?|rupee|dollar|pound|discount|offer|deal|package|combo)\b",
+            re.IGNORECASE,
+        ),
+        "\U0001f4b0 Pricing & Offers",
+    ),
+    (
+        re.compile(
+            r"\b(hour|open|close|timing|time|morning|evening|night|weekend|holiday|"
+            r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|"
+            r"public holiday|shut|closed)\b",
+            re.IGNORECASE,
+        ),
+        "\U0001f550 Hours & Availability",
+    ),
+    (
+        re.compile(
+            r"\b(park|parking|location|address|direction|near|map|how to reach|"
+            r"where|place|landmark|area|navigate|uber|cab|bus|metro|train)\b",
+            re.IGNORECASE,
+        ),
+        "\U0001f4cd Location & Access",
+    ),
+    (
+        re.compile(
+            r"\b(service|treatment|haircut|massage|facial|wax|colour|color|trim|"
+            r"style|nail|therapy|consult|procedure|session|cut|blow|dry|perm|"
+            r"highlight|balayage|keratin|botox|filler|laser|peel|clean|scrub)\b",
+            re.IGNORECASE,
+        ),
+        "\u2702\ufe0f Services & Treatments",
+    ),
+    (
+        re.compile(
+            r"\b(deliver|delivery|takeaway|take away|home|order|pickup|pick.?up|"
+            r"collect|collection|online|zomato|swiggy|door.?dash|uber.?eat)\b",
+            re.IGNORECASE,
+        ),
+        "\U0001f697 Delivery & Pickup",
+    ),
+    (
+        re.compile(
+            r"\b(product|brand|use|recommend|suggest|aftercare|care|maintain|"
+            r"wash|apply|ingredient|ingredient|safe|skin|hair|sensitiv)\b",
+            re.IGNORECASE,
+        ),
+        "\U0001f6cd\ufe0f Products & Care",
+    ),
+    (
+        re.compile(
+            r"\b(wifi|wi-fi|internet|password|seating|capacity|private|room|"
+            r"outdoor|indoor|rooftop|terrace|ac|air.?con|pet|child|kid|baby|"
+            r"wheelchair|access|dress.?code|occasion|event|party|birthday|anniversary)\b",
+            re.IGNORECASE,
+        ),
+        "\U0001f3e0 Facilities & Policies",
+    ),
+]
+
+
+def _categorize_kb_entry(entry: dict) -> str:
+    """Return a topic header for a KB entry based on its question text."""
+    q = (entry.get("question") or "").lower()
+    for pattern, header in _KB_TOPIC_PATTERNS:
+        if pattern.search(q):
+            return header
+    return "\u2139\ufe0f General Info"
+
+
+# Max total characters for the KB block appended to the system prompt.
+# Large enough to cover ~30 short Q&A pairs; small enough not to crowd out
+# the booking/anti-hallucination rules.
+_KB_PROMPT_CHAR_BUDGET = 4000
+
+
+def _build_kb_prompt_section(entries: list[dict]) -> str:
+    """Format a list of confirmed KB entries for injection into the LLM system prompt.
+
+    Entries are grouped by industry topic so the LLM can navigate them faster.
+    Truncated at *_KB_PROMPT_CHAR_BUDGET* characters to keep prompt size bounded.
+    Returns an empty string when there are no entries.
+    """
+    if not entries:
+        return ""
+
+    # Group by topic
+    grouped: dict[str, list[dict]] = {}
+    for entry in entries:
+        topic = _categorize_kb_entry(entry)
+        grouped.setdefault(topic, []).append(entry)
+
+    lines: list[str] = [
+        "\n" + "=" * 60,
+        "OWNER-APPROVED KNOWLEDGE BASE",
+        "These answers come directly from the business owner.",
+        "RULES:",
+        "  • When a customer question closely matches a Q below, reply",
+        "    with the owner's A verbatim — do NOT rephrase or summarise.",
+        "  • These override your general knowledge.",
+        "  • If no KB entry matches AND the question is out-of-scope,",
+        "    reply with exactly: [SILENT_IGNORE]",
+        "=" * 60,
+    ]
+
+    total_chars = 0
+    budget_exceeded = False
+
+    for topic in sorted(grouped):
+        if budget_exceeded:
+            break
+        topic_lines: list[str] = [f"\n{topic}:"]
+        for entry in grouped[topic]:
+            q = (entry.get("question") or "").strip()
+            a = (entry.get("answer") or "").strip()
+            if not q or not a:
+                continue
+            q_short = q[:150] + ("…" if len(q) > 150 else "")
+            a_short = a[:250] + ("…" if len(a) > 250 else "")
+            block = f"  Q: {q_short}\n  A: {a_short}"
+            if total_chars + len(block) > _KB_PROMPT_CHAR_BUDGET:
+                budget_exceeded = True
+                break
+            topic_lines.append(block)
+            total_chars += len(block)
+        if len(topic_lines) > 1:  # at least one real entry
+            lines.extend(topic_lines)
+
+    if total_chars == 0:
+        return ""
+
+    lines.append("\n" + "=" * 60)
+    return "\n".join(lines)
+
+
+def _build_system_prompt(
+    business: dict,
+    kb_entries: list[dict] | None = None,
+) -> str:
+    """Build a system prompt tailored to the business.
+
+    Args:
+        business:   The business document from Firestore.
+        kb_entries: Optional list of confirmed KB entries to inject.  When
+                    provided the owner-approved Q&A pairs are appended as a
+                    dedicated knowledge-base section so the LLM can answer
+                    questions the static business profile doesn't cover.
+    """
     name = business.get("name", "the business")
     biz_type = business.get("businessType", "business")
     vs = business.get("verticalSettings", {})
@@ -299,8 +546,20 @@ def _build_system_prompt(business: dict) -> str:
 
     staff_text = ", ".join(staff) if staff else "Not specified"
     opening_days_text = ", ".join(opening_days) if opening_days else ""
+    maps_url = (business.get("mapsUrl") or business.get("scrapedUrl") or "").strip()
 
-    return f"""\
+    # Build optional location snippet injected into the confirmation format hint.
+    if maps_url:
+        location_hint = ", and location link"
+        location_example = f"\n📍 *Location:* {maps_url}"
+    elif address:
+        location_hint = ", and address"
+        location_example = f"\n📍 *Address:* {address}"
+    else:
+        location_hint = ""
+        location_example = ""
+
+    prompt = f"""\
 You are {name}'s AI receptionist on WhatsApp. You ONLY help customers with topics \
 directly related to this business — bookings, services, prices, hours, complaints, \
 and questions about what this business offers.
@@ -436,7 +695,7 @@ BOOKING OPERATIONS — ZERO TOLERANCE RULES (no exceptions, ever):
   • Date: Must be a specific day (today, tomorrow, a specific date), NOT vague ("sometime next week")
   • Time: MUST be explicit (2pm, 14:00, 2:30pm) — NEVER assume if the customer says only a time without AM/PM
   • Party size: Ask if not provided; default to 1 if customer doesn't specify
-- CONFIRMATION MESSAGE FORMAT: After a successful booking tool call, confirm with a warm, structured message that includes: service name, date & time, party size, and booking ID from the tool result. Keep it concise and friendly — this is WhatsApp. Example: "✅ All set! Here are your booking details:\n📋 *Service:* Table Booking\n📅 *When:* May 27 at 2:00 PM\n👥 *Party:* 2 people\n🆔 *Booking ID:* BK515E53\n\nSee you then! 😊"
+- CONFIRMATION MESSAGE FORMAT: After a successful booking tool call, confirm with a warm, structured message that includes: service name, date & time, party size, booking ID from the tool result{location_hint}. Keep it concise and friendly — this is WhatsApp. Example: "✅ All set! Here are your booking details:\n📋 *Service:* Table Booking\n📅 *When:* May 27 at 2:00 PM\n👥 *Party:* 2 people\n🆔 *Booking ID:* BK515E53{location_example}\n\nSee you then! 😊"
 
 BOOKING ID RULES — MANDATORY ZERO-TOLERANCE:
 - ⚠️ CRITICAL: When the customer sends or mentions ANY booking ID (pattern: BK + alphanumeric, e.g. BKD68B36, BK515E53), you MUST call check_booking FIRST — before ANY other action.
@@ -447,6 +706,11 @@ BOOKING ID RULES — MANDATORY ZERO-TOLERANCE:
 - If check_booking returns "No active bookings found", tell the customer the booking ID was not found in the current business system. Do NOT suggest it might be from another business or offer to create a new one immediately — ask if they have the correct booking ID.
 - NEVER guess or assume a booking ID from context. Booking IDs are only valid when explicitly provided by the customer in their current message or returned by a tool call.
 """
+    # Append owner-approved KB section when entries are provided
+    if kb_entries:
+        prompt += _build_kb_prompt_section(kb_entries)
+
+    return prompt
 
 
 class CustomerAIService:
@@ -465,20 +729,62 @@ class CustomerAIService:
         push_name: str,
         device_id: str,
         customer_jid: str | None = None,
+        message_id: str = "",
+        voice_mode: bool = False,
     ) -> None:
         """Process an incoming customer message and generate an AI response.
-        
+
         ``customer_jid`` is the full JID of the sender (e.g. ``134544296509456@lid``
         or ``917696794756@s.whatsapp.net``).  When provided it is used as the
         reply-to address so privacy-protected contacts receive the reply via
         the correct JID domain instead of a reconstructed ``@s.whatsapp.net``.
+
+        ``message_id`` is the upstream WhatsApp message id (used as an audit
+        breadcrumb when we capture a pending KB entry).
+
+        ``voice_mode`` — when True (set by handle_audio_message after STT),
+        replies are delivered as Cartesia TTS voice notes instead of text.
+        Critical/transactional messages (bookings etc.) also get a text copy.
         """
         business_id = business["id"]
         phone_clean = db._clean_phone(customer_phone)
         # Use the full JID for sending if available, otherwise fall back to digits.
         reply_to = customer_jid or phone_clean
 
-        # ── Step 1: Download audio ──────────────────────────────────────────────
+        # ── Analytics: message received ──────────────────────────────────────
+        # Fired at the very top before any short-circuit so the funnel
+        # captures every customer touchpoint, including silenced ones.
+        try:
+            posthog_client.capture(
+                business_id=business_id,
+                customer_phone=phone_clean,
+                event="message_received",
+                properties={
+                    "voice_mode":   voice_mode,
+                    "message_len":  len(body or ""),
+                    "device_id":    device_id,
+                    "has_push_name": bool(push_name),
+                },
+            )
+        except Exception:
+            pass
+
+        # ── Language detection (used later to anchor the LLM reply language) ─
+        _lang_signal = _detect_language(body)
+        if _lang_signal:
+            logger.info(
+                "[LANG] detected business=%s phone=%s code=%s name=%s",
+                business_id, phone_clean, _lang_signal[0], _lang_signal[1],
+            )
+
+        # ── Voice params (only used when voice_mode=True) ─────────────────────
+        _voice_id: str | None = None
+        _voice_lang: str = "en"
+        if voice_mode:
+            _vs = business.get("verticalSettings", {})
+            _langs = _vs.get("languages", business.get("supportedLanguages", ["en"]))
+            _voice_lang = (_langs[0] if _langs else "en")[:2].lower()
+            _voice_id = _vs.get("cartesiaVoiceId") or None
 
         # Verify the business device session is ready in the bridge.
         # If the device was just activated during onboarding, this health check
@@ -552,20 +858,66 @@ class CustomerAIService:
                 )
                 return
 
+        # ── Typing indicator (fire-and-forget) ───────────────────────────────
+        # Show the recipient a "typing…" bubble while we classify + call the
+        # LLM. WhatsApp auto-expires the bubble after ~10s; that lines up with
+        # our p95 end-to-end latency, so we only need to send it once.
+        # Voice-mode replies arrive as a voice note — there typing isn't
+        # the right indicator, but we still fire 'composing' as a cheap proxy
+        # because WhatsApp's 'recording' state needs a separate code path.
+        try:
+            import asyncio as _asyncio
+            _asyncio.create_task(self.wa.send_typing(reply_to, device_id))
+        except Exception:
+            pass
+
         # ── Intent gate ──────────────────────────────────────────────────────
-        # An LLM-with-history classifier decides whether this message is part
-        # of a business conversation. Personal / bare-greeting messages are
-        # dropped here so the booking AI never sees them. Continuation messages
-        # ("12pm", "yes", "ok") are kept as BUSINESS because prior_history makes
-        # the context visible to the classifier.
+        # Layer 1 (Classifier): LLM-with-history triage — identifies PERSONAL,
+        # GREETING, MIXED, BUSINESS, and safety flags (abusive, frustrated,
+        # out_of_scope). Only truly personal / greeting messages with no active
+        # booking context are hard-blocked here.  MIXED and PERSONAL-with-
+        # active-context reach the Customer AI (Layer 2) which reads the full
+        # history and decides whether to reply or emit [SILENT_IGNORE].
         biz_name = business.get("name", "us")
         biz_type = business.get("businessType", "business")
+        # Conversation-scoped Langfuse session so every turn in the same
+        # WhatsApp chat shows up under one trace timeline.
+        _session_id = f"wa:{business_id}:{phone_clean}"
+        _user_id = posthog_client.distinct_id(business_id, phone_clean)
+        classifier_meta = {
+            "name": "intent_classifier",
+            "business_id": business_id,
+            "business_type": biz_type,
+            "customer_phone_hash": _user_id,
+            "voice_mode": voice_mode,
+            "session_id": _session_id,
+            "user_id": _user_id,
+            "tags": ["intent", business_id],
+        }
         classification = await classify_intent(
             message=body,
             business_name=biz_name,
             business_type=biz_type,
             recent_history=prior_history,
+            trace_metadata=classifier_meta,
         )
+
+        try:
+            posthog_client.capture(
+                business_id=business_id,
+                customer_phone=phone_clean,
+                event="intent_classified",
+                properties={
+                    "intent":       classification.intent.value,
+                    "score":        classification.score,
+                    "frustrated":   classification.frustrated,
+                    "abusive":      classification.abusive,
+                    "out_of_scope": classification.out_of_scope,
+                    "detected_language": _lang_signal[0] if _lang_signal else None,
+                },
+            )
+        except Exception:
+            pass
         logger.info(
             "[INTENT] business=%s phone=%s intent=%s score=%d frustrated=%s abusive=%s "
             "out_of_scope=%s reason=%s",
@@ -575,73 +927,34 @@ class CustomerAIService:
             classification.out_of_scope, classification.reason,
         )
 
-        # ── Safety flags: abuse / frustration → pause + notify owner ─────────
-        # Abuse takes precedence (it is a strict superset of frustration in
-        # impact). Both auto-pause for the standard window so the owner can
-        # step in. The customer's message stays in history so the owner has
-        # full context when they look at the chat.
-        triggered_pause_reason: PauseReason | None = None
+        # ── Safety flag: abuse → pause + notify owner ────────────────────────
+        # ONLY abuse triggers an auto-pause.  Frustration is forwarded to the
+        # LLM with an empathy hint so the AI can still attempt a helpful reply
+        # (using KB + history).  Owner takeover for frustrated customers should
+        # be the owner's manual decision, not an automatic intercept — many
+        # "frustrated" classifications are just impatient customers asking
+        # again, and silencing the AI there makes the experience worse.
         if classification.abusive:
-            triggered_pause_reason = PauseReason.ABUSE
-        elif classification.frustrated:
-            triggered_pause_reason = PauseReason.FRUSTRATION
-
-        if triggered_pause_reason is not None:
             await self._pause_and_notify(
                 business=business,
                 business_id=business_id,
                 phone_clean=phone_clean,
                 push_name=push_name,
                 history=history,
-                reason=triggered_pause_reason,
+                reason=PauseReason.ABUSE,
                 snippet=body,
             )
             return
 
-        # ── Out-of-scope: silent skip + notify owner (no pause) ──────────────
-        # "Yesterday I dyed my hair…" — business-related but the AI must not
-        # answer. We don't pause because the customer's NEXT message about a
-        # booking should still work; we just notify the owner so they can step
-        # in for this one question.
-        if classification.out_of_scope:
-            db.upsert_customer_conversation(business_id, phone_clean, {
-                "messages":      history,
-                "customerPhone": phone_clean,
-                "customerName":  push_name or "",
-                "businessId":    business_id,
-                "lastMessageAt": datetime.utcnow().isoformat(),
-            })
-            label = f"{push_name} (+{phone_clean.lstrip('+')})" if push_name else f"+{phone_clean.lstrip('+')}"
-            try:
-                await whatsapp_notifier.send_to_owner(
-                    business,
-                    (
-                        f"📋 *Out-of-scope message* from {label}:\n\n"
-                        f"> {body[:200]}\n\n"
-                        f"Please respond manually — AI did not reply.\n"
-                        f"_(AI is still active for their next booking message)_"
-                    ),
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[AI-PAUSE] could not notify owner of out_of_scope business=%s: %s",
-                    business_id, exc,
-                )
-            return
-
-        if classification.intent in (Intent.PERSONAL, Intent.GREETING, Intent.MIXED):
-            # PERSONAL / GREETING / MIXED → stay silent. Many SMB owners use
-            # ONE WhatsApp number for both personal and business chats; a
-            # message that mixes "let's grab dinner" with a casual "should we
-            # book?" must not be answered by the receptionist AI. The owner
-            # can intervene manually, and the next clearly-business turn
-            # ("Table for 4 at 8pm tonight please") will still wake the AI.
-            #
-            # We persist the user's message so future classifications see it
-            # as history, but do NOT invoke the booking AI and do NOT reply.
+        # ── Bare greeting: stay silent (no KB check, no LLM call) ────────────
+        # A bare "Hi" / "Hello" with no business context is noise.  The
+        # customer will follow up with an actual question and the next message
+        # will wake the AI.  We persist the message so the classifier sees it
+        # as history on the next turn.
+        if classification.intent == Intent.GREETING:
             logger.info(
-                "[INTENT-SILENT] business=%s phone=%s intent=%s — staying silent",
-                business_id, phone_clean, classification.intent.value,
+                "[INTENT-SILENT] business=%s phone=%s intent=GREETING — staying silent",
+                business_id, phone_clean,
             )
             db.upsert_customer_conversation(business_id, phone_clean, {
                 "messages": history,
@@ -652,18 +965,246 @@ class CustomerAIService:
             })
             return
 
-        # Generate AI response (with potential tool calls)
-        system_prompt = _build_system_prompt(business)
+        # ── Determine whether an active business conversation is in progress ──
+        # This is a pure-Python, zero-cost check.  When True, even a PERSONAL-
+        # classified message is allowed through to the LLM so a customer who
+        # sends a casual follow-up mid-booking ("yes", "ok", "so do you have")
+        # doesn't get silently dropped.
+        active_biz_context: bool = _has_active_business_context(prior_history)
+
+        # ── Hard-block: PERSONAL with NO active business context ──────────────
+        # Only drop PERSONAL messages when there is zero evidence of an ongoing
+        # business interaction.  If we're mid-booking (active_biz_context=True),
+        # we let the LLM read the full history and decide.
+        if classification.intent == Intent.PERSONAL and not active_biz_context:
+            logger.info(
+                "[INTENT-SILENT] business=%s phone=%s intent=PERSONAL active_ctx=False"
+                " — staying silent",
+                business_id, phone_clean,
+            )
+            db.upsert_customer_conversation(business_id, phone_clean, {
+                "messages": history,
+                "customerPhone": phone_clean,
+                "customerName": push_name or "",
+                "businessId": business_id,
+                "lastMessageAt": datetime.utcnow().isoformat(),
+            })
+            return
+
+        # ── Layer A — KB direct hit (fast path, zero LLM cost) ───────────────
+        # Before touching the LLM for ANY non-silent message, check whether the
+        # owner has already confirmed an answer for this exact (or near-exact)
+        # question.  A direct hit is served verbatim — no LLM rephrasing, no
+        # token cost, no owner notification.  Works for both in-scope questions
+        # (where the AI might not know menu specifics) AND out-of-scope questions
+        # (the classic KB use-case).
+        kb_direct_hit: dict | None = None
+        try:
+            kb_direct_hit = kb_service.find_confirmed_match(business_id, body)
+        except Exception as exc:
+            logger.warning(
+                "[KB] Layer-A retrieval error business=%s phone=%s: %s",
+                business_id, phone_clean, exc,
+            )
+
+        if kb_direct_hit is not None and (kb_direct_hit.get("answer") or "").strip():
+            answer = kb_direct_hit["answer"].strip()
+            history.append({"role": "assistant", "content": answer})
+            if len(history) > MAX_HISTORY_MESSAGES:
+                history = history[-MAX_HISTORY_MESSAGES:]
+            db.upsert_customer_conversation(business_id, phone_clean, {
+                "messages":      history,
+                "customerPhone": phone_clean,
+                "customerName":  push_name or "",
+                "businessId":    business_id,
+                "lastMessageAt": datetime.utcnow().isoformat(),
+            })
+            try:
+                db.update_business_kb_entry(business_id, kb_direct_hit["id"], {
+                    "useCount": int(kb_direct_hit.get("useCount") or 0) + 1,
+                    "lastUsedAt": datetime.utcnow().isoformat(),
+                })
+            except Exception as exc:
+                logger.warning("[KB] failed to bump useCount: %s", exc)
+            await self._deliver_reply(reply_to, answer, device_id, voice_mode, _voice_id, _voice_lang)
+            logger.info(
+                "[KB] Layer-A direct hit business=%s phone=%s code=%s intent=%s",
+                business_id, phone_clean,
+                kb_direct_hit.get("shortCode"), classification.intent.value,
+            )
+            return
+
+        # ── Out-of-scope with no KB hit → notify owner + capture ─────────────
+        # "Yesterday I dyed my hair…" — business-related but neither the AI
+        # nor the KB can answer it.  We don't pause (next booking message must
+        # still work) but we alert the owner and queue a pending KB entry so
+        # they can confirm an answer for future customers.
+        if classification.out_of_scope:
+            # Record lastOutOfScopeAt so that when the owner manually replies
+            # to the customer's chat (to answer this question), owner_takeover_service
+            # knows NOT to trigger the 90-minute AI pause — the owner is just
+            # answering the one unanswerable question, not taking over the thread.
+            db.upsert_customer_conversation(business_id, phone_clean, {
+                "messages":        history,
+                "customerPhone":   phone_clean,
+                "customerName":    push_name or "",
+                "businessId":      business_id,
+                "lastMessageAt":   datetime.utcnow().isoformat(),
+                "lastOutOfScopeAt": datetime.utcnow().isoformat(),
+            })
+
+            kb_entry: dict | None = None
+            if kb_service.should_capture(
+                intent=classification.intent.value,
+                out_of_scope=True,
+                abusive=classification.abusive,
+            ):
+                try:
+                    kb_entry = kb_service.create_pending_entry(
+                        business_id=business_id,
+                        question=body,
+                        customer_phone=phone_clean,
+                        message_id=message_id or "",
+                        intent=classification.intent.value,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[KB] capture failed business=%s phone=%s: %s",
+                        business_id, phone_clean, exc,
+                    )
+
+            label = f"{push_name} (+{phone_clean.lstrip('+')})" if push_name else f"+{phone_clean.lstrip('+')}"
+            notification = (
+                f"\U0001f4cb *Out-of-scope message* from {label}:\n\n"
+                f"> {body[:200]}\n\n"
+                f"Please respond manually \u2014 AI did not reply.\n"
+                f"_(AI is still active for their next booking message)_"
+            )
+            if kb_entry is not None:
+                code = kb_entry["shortCode"]
+                notification += (
+                    "\n\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                    "\U0001f9e0 *Save this answer for future customers?*\n\n"
+                    "\u2705 *To save* \u2014 reply with:\n"
+                    f"*YES {code}* <your answer>\n"
+                    f"_Example: YES {code} Yes, we have it_\n\n"
+                    "\u274c *To skip* \u2014 reply with:\n"
+                    f"*NO {code}*\n\n"
+                    "_(expires in 7 days)_"
+                )
+            try:
+                await whatsapp_notifier.send_to_owner(business, notification)
+            except Exception as exc:
+                logger.warning(
+                    "[KB] could not notify owner of out_of_scope business=%s: %s",
+                    business_id, exc,
+                )
+            return
+
+        # ── MIXED with PERSONAL-mid-booking: log and fall through ─────────────
+        # MIXED always reaches the LLM (the LLM reads the full history and
+        # decides).  PERSONAL-with-active-context also falls through here.
+        if classification.intent in (Intent.MIXED, Intent.PERSONAL):
+            logger.info(
+                "[INTENT-PASSTHROUGH] business=%s phone=%s intent=%s active_ctx=%s"
+                " — forwarding to LLM",
+                business_id, phone_clean,
+                classification.intent.value, active_biz_context,
+            )
+
+        # ── Layer B — load all confirmed KB entries for LLM injection ─────────
+        # No direct keyword hit, but the LLM may still match the customer's
+        # question semantically.  We pre-rank the full confirmed list by
+        # (keyword overlap × 10 + use_count) so the most relevant + battle-
+        # tested answers appear first within the character budget.
+        kb_entries_for_prompt: list[dict] = []
+        try:
+            all_confirmed = kb_service.get_confirmed_for_prompt(business_id)
+            if all_confirmed:
+                kb_entries_for_prompt = kb_service.rank_entries_for_question(
+                    all_confirmed, body
+                )
+                logger.debug(
+                    "[KB] Layer-B: injecting %d/%d confirmed entries into prompt"
+                    " business=%s",
+                    len(kb_entries_for_prompt), len(all_confirmed), business_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[KB] Layer-B load error business=%s phone=%s: %s",
+                business_id, phone_clean, exc,
+            )
+
+        # ── Generate AI response (Layer 2 — Customer AI with KB context) ─────
+        # System prompt includes the owner-approved KB entries so the LLM can
+        # answer questions not covered by the static business profile, and can
+        # decide to [SILENT_IGNORE] truly off-topic messages without the
+        # classifier having to make that call alone.
+        system_prompt = _build_system_prompt(business, kb_entries=kb_entries_for_prompt)
         context_note = f"Customer name: {push_name}. " if push_name else ""
         context_note += f"Customer phone: {phone_clean}."
+
+        # ── LANGUAGE DIRECTIVE (hard constraint) ────────────────────────────
+        # The system prompt already asks the AI to mirror the customer's
+        # language, but that instruction loses to the business "Languages: X"
+        # field in practice (LLM picks the first supported language). We
+        # inject a hard directive with the exact detected language so the AI
+        # cannot drift. When detection fails we fall back to the soft rule.
+        if _lang_signal:
+            _code, _name = _lang_signal
+            context_note += (
+                f"\n\nLANGUAGE — STRICTEST RULE (no exceptions): The customer's "
+                f"last message is in **{_name}** (ISO code: {_code}). You MUST "
+                f"reply in {_name}, using the same script the customer used. "
+                f"Do NOT switch to English or to the business's default language. "
+                f"Do NOT translate or mix languages. Do NOT mention the language "
+                f"at all — just answer naturally in {_name}."
+            )
+        if classification.intent in (Intent.MIXED, Intent.PERSONAL) and active_biz_context:
+            context_note += (
+                "\n\nNOTE: The intent classifier flagged this message as "
+                f"{classification.intent.value} but an active business conversation "
+                "is in progress. Read the history carefully — if the customer is "
+                "continuing a booking/enquiry, respond normally. Only emit "
+                "[SILENT_IGNORE] if the message is unmistakably off-topic with "
+                "no business relevance whatsoever."
+            )
+        if classification.frustrated:
+            context_note += (
+                "\n\nNOTE: The customer seems frustrated or impatient. Lead "
+                "your reply with a brief acknowledgement (e.g. \"Sorry for "
+                "the wait — let me check.\"), then answer their question if "
+                "you can, or offer to forward to the owner if you can't."
+            )
+        if voice_mode:
+            context_note += (
+                "\n\nNote: the customer sent a voice message. Keep your reply "
+                "concise and conversational — it will be spoken aloud as a "
+                "voice note. Avoid markdown formatting, bullet lists, or "
+                "symbols that don't sound natural when read aloud."
+            )
         full_system = f"{system_prompt}\n\n{context_note}"
 
+        ai_trace_meta = {
+            "name": "customer_ai_reply",
+            "business_id": business_id,
+            "business_type": biz_type,
+            "customer_phone_hash": _user_id,
+            "voice_mode": voice_mode,
+            "intent": classification.intent.value,
+            "intent_score": classification.score,
+            "detected_language": _lang_signal[0] if _lang_signal else None,
+            "session_id": _session_id,
+            "user_id": _user_id,
+            "tags": ["customer_ai", business_id],
+        }
         reply = await self._get_ai_response(
             system=full_system,
             history=history,
             business=business,
             customer_phone=phone_clean,
             push_name=push_name,
+            trace_metadata=ai_trace_meta,
         )
 
         if reply.strip() == "[SILENT_IGNORE]":
@@ -695,24 +1236,71 @@ class CustomerAIService:
                     "request. Respond to it as a real customer inquiry — do NOT return "
                     "[SILENT_IGNORE] for this message."
                 )
+                _override_meta = dict(ai_trace_meta)
+                _override_meta["name"] = "customer_ai_reply_silent_override"
                 reply = await self._get_ai_response(
                     system=override_system,
                     history=business_history,
                     business=business,
                     customer_phone=phone_clean,
                     push_name=push_name,
+                    trace_metadata=_override_meta,
                 )
 
             if reply.strip() == "[SILENT_IGNORE]":
                 logger.info("Silently ignoring message from %s for business %s (msg=%s)", phone_clean, business_id, body[:60])
-                # Save the user's message to history but don't send a reply or save an assistant message
-                db.upsert_customer_conversation(business_id, phone_clean, {
+
+                # ── Owner notification (rate-limited) ────────────────────────
+                # The AI decided this message is off-topic / personal and chose
+                # not to reply. The owner doesn't see the conversation by
+                # default, so without this they'd never know a customer was
+                # waiting. Notify the owner (once per SILENT_NOTIFY_COOLDOWN
+                # window per customer) so they can step in if the AI was wrong.
+                _silent_update: dict = {
                     "messages": history,
                     "customerPhone": phone_clean,
                     "customerName": push_name or "",
                     "businessId": business_id,
                     "lastMessageAt": datetime.utcnow().isoformat(),
-                })
+                }
+                _now = datetime.utcnow()
+                _last_notified_iso = (convo or {}).get("lastSilentNotifiedAt") if convo else None
+                _should_notify = True
+                if _last_notified_iso:
+                    try:
+                        from datetime import timedelta as _td
+                        _last_dt = datetime.fromisoformat(_last_notified_iso)
+                        if _now - _last_dt < _td(minutes=SILENT_NOTIFY_COOLDOWN_MINUTES):
+                            _should_notify = False
+                    except (ValueError, TypeError):
+                        pass  # malformed timestamp → notify
+
+                if _should_notify:
+                    _name = (push_name or "").strip()
+                    _label = f"{_name} (+{phone_clean})" if _name else f"+{phone_clean}"
+                    _snippet = body.strip()
+                    if len(_snippet) > 200:
+                        _snippet = _snippet[:200] + "…"
+                    _owner_msg = (
+                        f"🤐 *AI stayed silent* for {_label}.\n\n"
+                        f"They sent: \"{_snippet}\"\n\n"
+                        f"AI judged this off-topic. Reply in their chat if you "
+                        f"want to handle it manually."
+                    )
+                    try:
+                        import asyncio as _asyncio
+                        _asyncio.create_task(
+                            whatsapp_notifier.send_to_owner(business, _owner_msg)
+                        )
+                        _silent_update["lastSilentNotifiedAt"] = _now.isoformat()
+                    except Exception as _notify_exc:
+                        logger.warning(
+                            "[SILENT-NOTIFY] could not schedule owner notify business=%s phone=%s: %s",
+                            business_id, phone_clean, _notify_exc,
+                        )
+
+                # Save the user's message to history but don't send a reply or save an assistant message
+                db.upsert_customer_conversation(business_id, phone_clean, _silent_update)
                 return
 
         # Log AI reply for visibility
@@ -734,13 +1322,59 @@ class CustomerAIService:
             "lastMessageAt": datetime.utcnow().isoformat(),
         })
 
-        # Send reply via WhatsApp — use the full JID so @lid contacts are reached
-        await self._send(reply_to, reply, device_id)
+        # Send reply — text or voice note depending on voice_mode
+        await self._deliver_reply(reply_to, reply, device_id, voice_mode, _voice_id, _voice_lang)
 
         logger.info(
-            "Customer AI reply sent to %s for business %s (msg=%s)",
-            phone_clean, business_id, body[:60],
+            "Customer AI reply sent to %s for business %s (msg=%s, voice=%s)",
+            phone_clean, business_id, body[:60], voice_mode,
         )
+
+        # ── Analytics: AI reply sent ─────────────────────────────────────────
+        try:
+            posthog_client.capture(
+                business_id=business_id,
+                customer_phone=phone_clean,
+                event="ai_reply_sent",
+                properties={
+                    "voice_mode":   voice_mode,
+                    "intent":       classification.intent.value,
+                    "reply_len":    len(reply or ""),
+                    "detected_language": _lang_signal[0] if _lang_signal else None,
+                },
+            )
+        except Exception:
+            pass
+
+        # ── CSAT: mark conversation eligible for the post-chat rating prompt
+        try:
+            csat_service.mark_ai_reply(business_id, phone_clean)
+        except Exception as exc:
+            logger.debug("[CSAT] mark_ai_reply failed (non-fatal): %s", exc)
+
+    async def _deliver_reply(
+        self,
+        phone: str,
+        text: str,
+        device_id: str,
+        voice_mode: bool = False,
+        voice_id: str | None = None,
+        lang: str = "en",
+    ) -> None:
+        """Send a reply as a voice note (voice_mode=True) or plain text."""
+        if not voice_mode:
+            await self._send(phone, text, device_id)
+            return
+        try:
+            audio = await cartesia_client.synthesize(text, voice_id=voice_id, language=lang)
+            await self._send_audio(phone, audio, device_id, mime_type=cartesia_client.OUTPUT_MIME_TYPE)
+            # Transactional messages (bookings, IDs, etc.) also need a text copy
+            # so customers have a reliable record they can reference later.
+            if self._is_critical_message(text):
+                await self._send(phone, text, device_id)
+        except Exception as exc:
+            logger.error("TTS failed for %s — falling back to text: %s", phone, exc)
+            await self._send(phone, text, device_id)
 
     async def _pause_and_notify(
         self,
@@ -809,16 +1443,20 @@ class CustomerAIService:
         business: dict,
         customer_phone: str,
         push_name: str,
+        trace_metadata: dict | None = None,
     ) -> str:
         """Send conversation to Claude with tools and handle tool calls."""
         try:
-            response = await self.client.messages.create(
+            _create_kwargs = dict(
                 model=self.model,
                 max_tokens=1000,
                 system=system,
                 messages=history,
                 tools=CUSTOMER_TOOLS,
             )
+            if trace_metadata:
+                _create_kwargs["trace_metadata"] = trace_metadata
+            response = await self.client.messages.create(**_create_kwargs)
 
             # Process the response
             # NOTE: pre_tool_text_parts collects any text Claude emits BEFORE the tool call
@@ -884,13 +1522,19 @@ class CustomerAIService:
                 # Get final response after tool execution.
                 # We do NOT include pre_tool_text_parts here — the complete reply
                 # must be derived from the tool result only.
-                follow_up = await self.client.messages.create(
+                _follow_kwargs = dict(
                     model=self.model,
                     max_tokens=1000,
                     system=system,
                     messages=history_with_tools,
                     tools=CUSTOMER_TOOLS,
                 )
+                if trace_metadata:
+                    _fm = dict(trace_metadata)
+                    _fm["name"] = (trace_metadata.get("name") or "customer_ai_reply") + ":after_tools"
+                    _fm["called_tools"] = sorted({tr["name"] for tr in tool_results})
+                    _follow_kwargs["trace_metadata"] = _fm
+                follow_up = await self.client.messages.create(**_follow_kwargs)
 
                 for block in follow_up.content:
                     if block.type == "text":
@@ -949,7 +1593,7 @@ class CustomerAIService:
                         "i found your booking", "found your reservation",
                         "your booking is scheduled",
                     ],
-                    {"get_booking", "list_bookings", "get_customer_bookings"},
+                    {"check_booking", "create_booking", "reschedule_booking", "cancel_booking"},
                 ),
             ]
 
@@ -1381,28 +2025,26 @@ class CustomerAIService:
         device_id: str,
         customer_jid: str | None = None,
     ) -> None:
-        """Process an incoming WhatsApp voice note and reply with an audio message.
+        """Process an incoming WhatsApp voice note and reply with a voice note.
 
         ``customer_jid`` is the full JID of the sender (preserves ``@lid`` etc.).
 
         Pipeline:
           1. Download audio bytes from the bridge/CDN URL
           2. Transcribe with Deepgram (STT)
-          3. Run the transcription through the existing AI + booking logic
-          4. Convert the AI text reply to audio via Cartesia (TTS)
-          5. Send the audio reply as a WhatsApp voice note
-          Fallbacks:
-            - If download fails   → send an apology text message
-            - If transcription fails / empty → send an apology text message
-            - If TTS / audio send fails → fall back to sending the text reply
+          3. Delegate to handle_customer_message(voice_mode=True) so the full
+             business logic runs: intent classification, KB lookup, pause gates,
+             booking/cancel/reschedule tools, owner notifications, etc.
+          The voice_mode flag causes all replies to be delivered as Cartesia TTS
+          voice notes (with text fallback on TTS failure, and a text copy for
+          transactional messages like booking confirmations).
         """
-        business_id = business["id"]
         phone_clean = db._clean_phone(customer_phone)
         reply_to = customer_jid or phone_clean
+
+        # ── Step 1: Download ──────────────────────────────────────────────────
         try:
             audio_bytes, detected_mime = await self.wa.download_media(media_url)
-            # Use the Content-Type returned by the server — it's more accurate
-            # than the mime_type in the webhook payload (which can lag or be generic).
             effective_mime = detected_mime if detected_mime not in ("", "application/octet-stream") else mime_type
             logger.info(
                 "[AUDIO] Downloaded %d bytes from %s for %s (mime=%r → effective=%r)",
@@ -1411,9 +2053,7 @@ class CustomerAIService:
             if len(audio_bytes) < 100:
                 raise ValueError(f"Downloaded audio too small ({len(audio_bytes)} bytes) — possible error response")
         except Exception as exc:
-            logger.error(
-                "Failed to download audio for %s (url=%s): %s", phone_clean, media_url, exc
-            )
+            logger.error("Failed to download audio for %s (url=%s): %s", phone_clean, media_url, exc)
             await self._send(
                 reply_to,
                 "Sorry, I couldn't process your voice message. "
@@ -1422,10 +2062,10 @@ class CustomerAIService:
             )
             return
 
-        # ── Step 2: Transcribe with Deepgram ─────────────────────────────
+        # ── Step 2: Transcribe with Deepgram STT ─────────────────────────────
         try:
             transcript = await deepgram_client.transcribe_audio(audio_bytes, effective_mime)
-            logger.debug("[AUDIO] Transcript for %s: %r", phone_clean, transcript)
+            logger.info("[AUDIO] Transcript for %s: %r", phone_clean, transcript[:120])
         except Exception as exc:
             logger.error("Deepgram transcription failed for %s: %s", phone_clean, exc)
             await self._send(
@@ -1446,78 +2086,20 @@ class CustomerAIService:
             )
             return
 
-        # ── Step 3: AI processing (identical to text path) ────────────────
-        convo = db.get_customer_conversation(business_id, phone_clean)
-        history = convo.get("messages", []) if convo else []
-
-        # Store transcription in history so Claude has context
-        history.append({"role": "user", "content": f"[Voice message]: {transcript}"})
-        if len(history) > MAX_HISTORY_MESSAGES:
-            history = history[-MAX_HISTORY_MESSAGES:]
-
-        db.upsert_customer(business_id, phone_clean, {
-            "name": push_name or "",
-            "lastMessageAt": datetime.utcnow().isoformat(),
-        })
-
-        system_prompt = _build_system_prompt(business)
-        context_note = f"Customer name: {push_name}. " if push_name else ""
-        context_note += (
-            f"Customer phone: {phone_clean}. "
-            "Note: the customer sent a voice message — keep the reply concise and clear."
-        )
-        full_system = f"{system_prompt}\n\n{context_note}"
-
-        reply_text = await self._get_ai_response(
-            system=full_system,
-            history=history,
+        # ── Step 3: Delegate to the full text pipeline (voice_mode=True) ────
+        # Prefix body with [Voice message] so conversation history makes clear
+        # this turn came from a voice note, not text.
+        voice_body = f"[Voice message]: {transcript}"
+        await self.handle_customer_message(
             business=business,
-            customer_phone=phone_clean,
+            customer_phone=customer_phone,
+            body=voice_body,
             push_name=push_name,
+            device_id=device_id,
+            customer_jid=customer_jid,
+            message_id="",
+            voice_mode=True,
         )
-        logger.debug("[AUDIO] AI reply for %s: %r", phone_clean, reply_text[:100])
-
-        # Persist updated conversation
-        history.append({"role": "assistant", "content": reply_text})
-        if len(history) > MAX_HISTORY_MESSAGES:
-            history = history[-MAX_HISTORY_MESSAGES:]
-
-        db.upsert_customer_conversation(business_id, phone_clean, {
-            "messages": history,
-            "customerPhone": phone_clean,
-            "customerName": push_name or "",
-            "businessId": business_id,
-            "lastMessageAt": datetime.utcnow().isoformat(),
-        })
-
-        # ── Step 4: TTS + send audio (fallback to text on failure) ────────
-        vs = business.get("verticalSettings", {})
-        languages = vs.get("languages", business.get("supportedLanguages", ["en"]))
-        lang = (languages[0] if languages else "en")[:2].lower()
-        voice_id: str | None = vs.get("cartesiaVoiceId") or None
-
-        try:
-            audio_reply = await cartesia_client.synthesize(
-                reply_text, voice_id=voice_id, language=lang
-            )
-            await self._send_audio(
-                reply_to, audio_reply, device_id,
-                mime_type=cartesia_client.OUTPUT_MIME_TYPE,
-            )
-            logger.info(
-                "Audio AI reply sent to %s for business %s (transcript=%s)",
-                phone_clean, business_id, transcript[:60],
-            )
-            # Send text only for critical/transactional messages so customers
-            # have a reliable record (bookings, reschedules, cancellations).
-            if self._is_critical_message(reply_text):
-                await self._send(reply_to, reply_text, device_id)
-        except Exception as exc:
-            logger.error(
-                "Cartesia TTS / audio send failed for %s — falling back to text: %s",
-                phone_clean, exc,
-            )
-            await self._send(reply_to, reply_text, device_id)
 
     async def _send_audio(
         self,

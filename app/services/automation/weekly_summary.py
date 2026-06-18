@@ -61,7 +61,7 @@ async def run_weekly_summary_for_all_businesses(now: datetime | None = None) -> 
             # 7 days ago to today
             week_start, _ = _local_day_range(business, -6, now=now)
             _, week_end = _local_day_range(business, 0, now=now)
-            await _send_weekly_summary(business, week_start, week_end)
+            await _send_weekly_summary(business, week_start, week_end, now=now)
             sent_count += 1
         except Exception as exc:
             logger.exception("[Automation] Weekly summary failed for business %s: %s", biz_id, exc)
@@ -70,21 +70,41 @@ async def run_weekly_summary_for_all_businesses(now: datetime | None = None) -> 
     logger.info("[AUTOMATION:WEEKLY_SUMMARY] done — %d/%d summaries sent", sent_count, len(businesses))
 
 
-async def _send_weekly_summary(business: dict, week_start: str, week_end: str) -> None:
+def _calls_week(business: dict, today_local_iso: str) -> int:
+    """Read the rolling 7-day weekly call counter, gated on its date range.
+
+    `weekly_counter` is a rolling 7-day window starting on the first call of
+    the window. We only trust it if "today" (business-local) falls inside the
+    stored range — otherwise the value is stale and we report 0.
+    """
+    weekly_range = business.get("weekly_counter_date_range") or {}
+    start_iso = weekly_range.get("start")
+    end_iso = weekly_range.get("end")
+    if not (start_iso and end_iso and start_iso <= today_local_iso <= end_iso):
+        return 0
+    try:
+        return int(business.get("weekly_counter", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _send_weekly_summary(business: dict, week_start: str, week_end: str, now: datetime | None = None) -> None:
+    if now is None:
+        now = _now()
     biz_id = business["id"]
     biz_name = business.get("name") or "Your business"
     tz = _biz_tz(business)
-    
+
     all_bookings = db.list_bookings(biz_id, limit=1000)
     all_customers = db.list_customers(biz_id, limit=1000)
 
-    # Week's bookings
+    # Week's bookings (received and still active)
     week_bookings = [
         b for b in all_bookings
         if _in_range(b.get("datetime") or b.get("date"), week_start, week_end)
         and b.get("status") != "cancelled"
     ]
-    
+
     cancelled_week = [
         b for b in all_bookings
         if b.get("status") == "cancelled"
@@ -104,27 +124,29 @@ async def _send_weekly_summary(business: dict, week_start: str, week_end: str) -
     customers_handled = len(handled_set)
 
     bookings_made = len(week_bookings)
+    # Total bookings received this week = active + cancelled (anything booked).
+    total_bookings_received = bookings_made + len(cancelled_week)
     owner_name = str(business.get("ownerName") or business.get("owner_name") or "there").split()[0]
 
-    # Check AI Call Counter
-    now_local_iso = datetime.now(timezone.utc).astimezone(tz).strftime("%Y-%m-%d")
-    weekly_range = business.get("weekly_counter_date_range") or {}
-    start_iso = weekly_range.get("start")
-    end_iso = weekly_range.get("end")
-    ai_calls_week = 0
-    if start_iso and end_iso and start_iso <= now_local_iso <= end_iso:
-        ai_calls_week = int(business.get("weekly_counter", 0) or 0)
+    now_local_iso = now.astimezone(tz).strftime("%Y-%m-%d")
+    ai_calls_week = _calls_week(business, now_local_iso)
 
-    stats_lines = []
-    if customers_handled > 0 or bookings_made > 0 or ai_calls_week > 0:
+    has_activity = bool(customers_handled or total_bookings_received or ai_calls_week)
+
+    # Always surface the headline metrics together when there's any activity, so
+    # the owner can compare week-over-week. Calls and bookings render as 0 if
+    # absent (rather than being hidden) — this is what the owner is tracking.
+    stats_lines: list[str] = []
+    if has_activity:
         stats_lines.append(f"💬 {customers_handled} customers handled")
-        stats_lines.append(f"📅 {bookings_made} booking{'s' if bookings_made != 1 else ''} made")
-        if ai_calls_week > 0:
-            stats_lines.append(f"📞 *Calls automatically managed: {ai_calls_week}*")
+        stats_lines.append(
+            f"📅 *Bookings this week: {bookings_made}* "
+            f"({total_bookings_received} received incl. cancellations)"
+        )
+        stats_lines.append(f"📞 *Calls handled this week: {ai_calls_week}*")
         stats_lines.append("")
 
-    lines = []
-    if customers_handled == 0 and bookings_made == 0 and ai_calls_week == 0:
+    if not has_activity:
         lines = [
             f"🌟 A calm week, {owner_name} — nothing slipped, nothing missed 😌",
             "I was watching your WhatsApp every hour of every day. When your customers come, I'll be ready 🙌"
@@ -139,12 +161,15 @@ async def _send_weekly_summary(business: dict, week_start: str, week_end: str) -
             "That's a whole week you didn't have to chase anyone. I held it all together while you ran your business 💪",
             "Imagine where you'll be in three months 🚀"
         ]
-        
+
     lines += [
         "",
         "You were living your life. I had your back 💪",
     ]
 
     msg = "\n".join(lines)
-    logger.info("[AUTOMATION:WEEKLY_SUMMARY] sending to owner of biz %s (%s)", biz_id, biz_name)
+    logger.info(
+        "[AUTOMATION:WEEKLY_SUMMARY] sending to owner of biz %s (%s) | bookings=%d calls=%d",
+        biz_id, biz_name, bookings_made, ai_calls_week,
+    )
     await send_to_owner(business, msg)

@@ -137,6 +137,30 @@ class Settings(BaseSettings):
     # Rate Limiting
     RATE_LIMIT_PER_MINUTE: int = 60
     RATE_LIMIT_PER_HOUR: int = 1000
+
+    # ── LLM Observability (Langfuse) ──
+    # Wraps every OpenAI call with traces, token cost, latency, and lets you
+    # correlate customer CSAT scores back to the exact AI prompt/response.
+    LANGFUSE_PUBLIC_KEY: str = ""
+    LANGFUSE_SECRET_KEY: str = ""
+    LANGFUSE_HOST: str = "https://cloud.langfuse.com"
+    LANGFUSE_ENABLED: bool = True
+
+    # ── Product Analytics (PostHog backend) ──
+    # The whatsmeow bridge already sends PostHog events; this is the backend
+    # counterpart so the full conversion funnel (message → intent → booking)
+    # lives in one PostHog project.
+    POSTHOG_API_KEY: str = ""
+    POSTHOG_HOST: str = "https://app.posthog.com"
+    POSTHOG_ENABLED: bool = True
+
+    # ── CSAT (1-5 rating) ──
+    # Conversation is considered "ended" after CSAT_IDLE_MINUTES of silence.
+    # The sweep job runs every CSAT_SWEEP_INTERVAL_MINUTES.
+    CSAT_ENABLED: bool = True
+    CSAT_IDLE_MINUTES: int = 30
+    CSAT_SWEEP_INTERVAL_MINUTES: int = 5
+    CSAT_COOLDOWN_DAYS: int = 7
     
     class Config:
         import os as _os

@@ -97,6 +97,13 @@ async def lifespan(app: FastAPI):
     start_scheduler()
     yield
     stop_scheduler()
+    # Flush any queued PostHog events before the worker exits so we don't
+    # drop the last batch of analytics on graceful shutdown.
+    try:
+        from app.integrations.posthog_client import shutdown as _posthog_shutdown
+        _posthog_shutdown()
+    except Exception:
+        pass
     
 
 from fastapi.staticfiles import StaticFiles 

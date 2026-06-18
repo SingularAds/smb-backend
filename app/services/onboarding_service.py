@@ -346,6 +346,22 @@ When the owner asks for a demo ("show me how it works", "I want to see a demo", 
 - Do NOT restart from the beginning — pick up exactly where you left off.
 - Do NOT mention pricing or subscriptions when resuming onboarding.
 
+PAYMENT / SUBSCRIPTION GATE (HARD RULE — NEVER VIOLATE):
+- NEVER call the `send_stripe_link` tool until ALL of the following are true:
+  1) Business name, type, and address have been collected and confirmed.
+  2) The mini-summary has been shown and the owner has explicitly approved it.
+  3) The system has registered the business (you'll see a "[CONFIRMED]" flow complete).
+- During the demo, during data collection, and during any post-demo resume,
+  NEVER discuss pricing, plans, payment, or subscription. Do NOT say things
+  like "the monthly price starts from $X" or "would you like to subscribe?".
+- If the owner brings up pricing before the business is registered, give the
+  short pricing overview from the Knowledge Base (Starter & Pro plans) but
+  explicitly tell them you will share the actual checkout link AFTER setup is
+  complete and they can try everything free for 7 days. Do NOT call any tool.
+- The server enforces this gate — calling `send_stripe_link` before the
+  business is registered is refused and will require you to restart the
+  onboarding from where the owner stopped giving details.
+
 HANDLING CONVERSATIONAL / INTENT MESSAGES:
 When the owner's first message is conversational ("I came through ads", "I heard about you",
 "I'm interested", etc.) instead of business data:
@@ -1391,17 +1407,19 @@ You are now running the live booking demo.  Your goal: show the owner exactly \
 how their AI receptionist handles a real customer request on their own WhatsApp.
 
 Instructions:
-1. Invite the owner to roleplay as a customer — use their business type and language. \
-Example (PT): "Vamos fazer um teste rápido. Faz de conta que és uma cliente a marcar \
-um serviço. Escreve como se fosses uma cliente normal 😊"
+1. Invite the owner to roleplay as a customer — use their business type and the \
+conversation language. Keep the invitation short and conversational.
 2. Then respond AS the receptionist — greet the "customer", ask for service + date + time, \
 propose a slot, confirm the booking.  Keep each message short (WhatsApp style).
 3. Stay fully in character throughout.  Do NOT reveal you are an AI during the roleplay.
-4. After 4–6 exchanges, break character with EXACTLY this closing line \
-(translate only if the conversation is not in Portuguese, preserve the meaning): \
-"E pronto. A tua cliente está marcada. Tu nem largaste a tesoura."
-5. Immediately after that line, pivot back to selling: mention the monthly price and \
-ask if the owner wants to set this up for their business.""",
+4. Stay in character for the FULL roleplay. Do NOT break character on your own. The \
+system tracks demo turns and will inject an explicit BREAK CHARACTER instruction when \
+it's time to close. Until you receive that instruction, keep the roleplay going.
+5. NEVER mention pricing, subscriptions, payment links, or call the send_stripe_link \
+tool during the demo. Pricing comes only AFTER the system tells you to break character \
+AND only after the business has been registered.
+6. Reply in the owner's conversation language at all times. Do NOT insert sentences in \
+a different language (e.g. do not paste a Portuguese phrase into an English chat).""",
 
     "pricing": """\
 SALES PHASE — PRICING
@@ -1481,7 +1499,16 @@ ONBOARDING_TOOLS: list[dict] = [
         "name": "send_stripe_link",
         "description": (
             "Send the subscription / payment link to the owner. "
-            "Call this when the owner agrees to subscribe or asks how to pay."
+            "PRECONDITION (HARD): only call this AFTER the business has been "
+            "registered (i.e. the owner has confirmed the business summary "
+            "and the system has created the business in the database). "
+            "NEVER call this during the demo, during onboarding data "
+            "collection, or before the owner has confirmed the business "
+            "summary — doing so corrupts the onboarding flow and will be "
+            "refused server-side. "
+            "Call this only when both conditions are true: (a) the business "
+            "is already created, AND (b) the owner has agreed to subscribe "
+            "or asked how to pay."
         ),
         "input_schema": {
             "type": "object",
@@ -1998,6 +2025,22 @@ class OnboardingService:
                         await self._run_places_search(session, phone, _pending_query, push_name)
                     else:
                         await self._send(phone, "No worries! Please share your business name and city, and I'll help you set up manually.")
+                    return
+                # Demo-intent escape: an explicit "demo" request must never be
+                # held hostage by a stale Places location prompt. Drop the
+                # location_request lock, clear the pending Places query, and
+                # route to the demo handler so the owner gets what they asked
+                # for.
+                if _is_demo_request(body):
+                    db.upsert_onboarding_session(phone, {
+                        "currentStep": "conversing",
+                        "pendingPlacesQuery": None,
+                    })
+                    session["currentStep"] = "conversing"
+                    session["pendingPlacesQuery"] = None
+                    await self._handle_demo_request_during_onboarding(
+                        session, phone, body, push_name, message_id
+                    )
                     return
                 loc_msg = (
                     "Perfect! 📍 Let’s find you on the map. "
@@ -2670,12 +2713,21 @@ class OnboardingService:
         })
 
         # ── Demo-request interruption ─────────────────────────────────────
-        # If the owner is in onboarding discovery and asks for a demo,
-        # pause onboarding, run the demo, then resume where we left off.
-        # This check runs before everything else (URL, Places, etc.) so that
-        # an explicit demo request is always honoured.
+        # If the owner asks for a demo, pause onboarding, run the demo, then
+        # resume where we left off. This check runs before everything else
+        # (URL, Places, etc.) so that an explicit demo request is always
+        # honoured.
+        # Edge case: a previous demo trigger may have set salesPhase="demo"
+        # but the AI never actually started the roleplay (it sent the standard
+        # greeting because of the FIRST MESSAGE rule). In that stuck state
+        # demoMessageCount is still ≤ 1. Re-trigger the demo handler so the
+        # owner is not punished for asking again.
         _cur_sales_phase = session.get("salesPhase", "discovery")
-        if _cur_sales_phase == "discovery" and _is_demo_request(body):
+        _cur_demo_count = int(session.get("demoMessageCount", 0))
+        if _is_demo_request(body) and (
+            _cur_sales_phase == "discovery"
+            or (_cur_sales_phase == "demo" and _cur_demo_count <= 1)
+        ):
             await self._handle_demo_request_during_onboarding(
                 session, phone, body, push_name, message_id
             )
@@ -2816,10 +2868,20 @@ class OnboardingService:
         # and the Places API is configured, search for up to 5 matches.
         # Guard: skip Places search for conversational noise (ad referrals, intent
         # statements) even if the heuristic passes — they are never business names.
+        # Also skip when the owner is asking for a demo (handled above) or when
+        # we're not in the discovery phase — both are signals that a short message
+        # like "Demo please" is intent, not a business name. Without this guard
+        # "Demo please" gets routed to Places search, sets currentStep to
+        # "location_request", and then every subsequent message is held hostage
+        # by the location prompt loop until the owner shares a location or
+        # explicitly types "no/skip/cancel".
+        _sales_phase_check = session.get("salesPhase", "discovery")
         if (
             settings.GOOGLE_PLACES_API_KEY
             and _looks_like_business_name(body)
             and not _is_conversational_noise(body)
+            and not _is_demo_request(body)
+            and _sales_phase_check == "discovery"
             and len(session.get("conversationHistory", [])) < 6
         ):
             # Persist user message BEFORE branching so history stays in sync
@@ -2831,7 +2893,13 @@ class OnboardingService:
             return  # always handled (either shows results or falls through to AI)
 
         # Stated-name Places trigger: e.g. "My business name is Biryani by Kilo"
-        if settings.GOOGLE_PLACES_API_KEY:
+        # Same gate as the bare-name fast-path above: stay in discovery phase
+        # and never poach demo-intent messages.
+        if (
+            settings.GOOGLE_PLACES_API_KEY
+            and _sales_phase_check == "discovery"
+            and not _is_demo_request(body)
+        ):
             _stated_name = _extract_stated_business_name(body)
             if _stated_name and len(session.get("conversationHistory", [])) < 8:
                 # Persist user message BEFORE branching so history stays in sync
@@ -2888,23 +2956,29 @@ class OnboardingService:
                     # to break character and transition back to onboarding, NOT pricing.
                     _ctx_parts.append(
                         "CRITICAL — BREAK CHARACTER NOW: This is turn 4+ of the demo. "
-                        "You MUST close the roleplay by ending your message with EXACTLY "
-                        "this sentence (translate if not in Portuguese but preserve meaning): "
-                        '"E pronto. A tua cliente está marcada. Tu nem largaste a tesoura." '
-                        "After that sentence add EXACTLY one more line: "
-                        '"Agora vamos continuar a configurar o teu negócio! 🚀" '
-                        "(translate that line too if needed). "
-                        "Do NOT mention pricing, subscription, or payment. Add nothing else."
+                        "You MUST close the roleplay in the OWNER'S CONVERSATION "
+                        "LANGUAGE with a short two-line wrap-up: "
+                        "(a) one playful line confirming the demo booking is done "
+                        "(meaning: 'And that's it — your customer is booked, you "
+                        "didn't even put down your scissors / hands / phone'), then "
+                        "(b) one line saying you are returning to finish setting up "
+                        "their business. "
+                        "Do NOT mention pricing, subscription, payment, plans, or "
+                        "send_stripe_link. Do NOT call any tool. Reply ONLY in the "
+                        "conversation language — never insert a sentence in a "
+                        "different language. Add nothing else."
                     )
                 else:
                     _ctx_parts.append(
                         "CRITICAL — BREAK CHARACTER NOW: This is turn 4+ of the demo. "
-                        "You MUST close the roleplay by ending your message with EXACTLY "
-                        "this sentence (translate only if not conversing in Portuguese, "
-                        "but preserve the meaning): "
-                        '"E pronto. A tua cliente está marcada. Tu nem largaste a tesoura." '
-                        "After this sentence, add one line pivoting back to pricing/next steps. "
-                        "Add nothing else after that line."
+                        "You MUST close the roleplay in the OWNER'S CONVERSATION "
+                        "LANGUAGE with a short playful confirmation that the demo "
+                        "booking is done (meaning: 'And that's it — your customer "
+                        "is booked, you didn't even put down your scissors'), then "
+                        "ONE line pivoting back to pricing / next steps. "
+                        "Reply ONLY in the conversation language — never insert a "
+                        "sentence in a different language. Add nothing else after "
+                        "that line."
                     )
 
         # Daniel persona override — used after human escalation
@@ -2977,21 +3051,62 @@ class OnboardingService:
         # Check if the AI has signalled confirmation
         confirmed, clean_reply = self._check_confirmed(ai_reply)
 
-        # ── BACKEND GUARD: default mandatory fields silently if missing ──
+        # ── BACKEND GUARD: validate mandatory fields & default what we can ──
+        # Hours / openingDays default silently (we don't ask for those), but
+        # name / businessType / address are mandatory.  If Claude emits
+        # [CONFIRMED] before they've been collected (e.g. it misread "Ok" to a
+        # pricing pitch as confirmation of the entire business setup), reject
+        # the confirmation server-side, swap the reply for an explicit ask,
+        # and do NOT call _finalize_business — otherwise we'd register a
+        # business with the demo's business-type as its name and no address.
+        _merged_check: dict = {}
         if confirmed:
             _pre_check = session.get("websiteExtractedData") or {}
             _conv_check = await self._extract_business_data(history) or {}
-            _merged_check: dict = dict(_pre_check)
+            _merged_check = dict(_pre_check)
             for _k, _v in _conv_check.items():
                 if _v:
                     _merged_check[_k] = _v
 
-            # Apply silent defaults if hours/days are missing
-            if not _merged_check.get("hours"):
-                _merged_check["hours"] = "Mon–Sun 9am–9pm"
-            _od_check = _merged_check.get("openingDays") or []
-            if not (isinstance(_od_check, list) and any(str(d).strip() for d in _od_check)):
-                _merged_check["openingDays"] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            def _blank(v: Any) -> bool:
+                if v is None:
+                    return True
+                return not str(v).strip()
+
+            _missing: list[str] = []
+            if _blank(_merged_check.get("name")):
+                _missing.append("business name")
+            if _blank(_merged_check.get("businessType")):
+                _missing.append("business type (e.g. restaurant, salon, clinic)")
+            if _blank(_merged_check.get("address")):
+                _missing.append("business address (city is fine)")
+
+            if _missing:
+                logger.warning(
+                    "[CONFIRMED-REJECTED] AI emitted [CONFIRMED] but required "
+                    "fields are missing for phone=%s: %s",
+                    phone, _missing,
+                )
+                confirmed = False
+                if len(_missing) == 1:
+                    clean_reply = (
+                        f"Before I can set everything up, I just need your "
+                        f"{_missing[0]}. What is it?"
+                    )
+                else:
+                    _bullets = "\n".join(f"• {m}" for m in _missing)
+                    clean_reply = (
+                        "Almost there! Before I can finalize, I still need:\n"
+                        f"{_bullets}\n\n"
+                        "Could you share these?"
+                    )
+            else:
+                # Apply silent defaults if hours/days are missing
+                if not _merged_check.get("hours"):
+                    _merged_check["hours"] = "Mon–Sun 9am–9pm"
+                _od_check = _merged_check.get("openingDays") or []
+                if not (isinstance(_od_check, list) and any(str(d).strip() for d in _od_check)):
+                    _merged_check["openingDays"] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
         # Store updated history
         history.append({"role": "assistant", "content": clean_reply})
@@ -3082,6 +3197,23 @@ class OnboardingService:
             "with the standard line and then tell the owner you are returning to finish "
             "setting up their business. Do NOT mention pricing or subscriptions."
         )
+        # First-message override: when the owner opens the conversation with a
+        # demo request, the base system prompt's "FIRST MESSAGE: greet them"
+        # rule otherwise wins and the AI sends only the greeting (the demo
+        # never starts). Explicitly tell the AI to combine a brief one-line
+        # greeting with the demo invite so the owner immediately gets what
+        # they asked for.
+        _is_first_turn = not any(m.get("role") == "user" for m in (history or [])[:-1])
+        if _is_first_turn:
+            _resume_note += (
+                "\n\nFIRST-TURN OVERRIDE: This is the owner's first message and they "
+                "explicitly asked for a demo. Do NOT send only the standard 'Hi, "
+                "I'm Sofia, drop a website link' greeting. Instead, in ONE short "
+                "message: (1) a one-line warm greeting using their name if known, "
+                "and (2) the demo roleplay invitation from step 1 above (ask their "
+                "business type and tell them to message you as if they were a "
+                "customer). Reply in the owner's language."
+            )
         _combined = _demo_phase_prompt + _resume_note
 
         # Always use the tool-capable path so demo can execute properly
@@ -4128,11 +4260,21 @@ class OnboardingService:
         now = _now_dt.isoformat()
 
         biz_name = business_json.get("name", "My Business")
-        biz_lang = (
-            business_json.get("languages", [session.get("language", "en")])[0]
-            if business_json.get("languages")
-            else session.get("language", "en")
-        )
+        # primaryLanguage source-of-truth: the language the OWNER actually
+        # spoke to us in (session["language"], resolved from their messages).
+        # The LLM extraction step has been observed to return "pt" even for
+        # English-only conversations because Sofia's persona defaults are
+        # Portuguese — never trust that as primary. Use extraction only to
+        # widen the supportedLanguages list, not to override the primary.
+        biz_lang = (session.get("language") or "en").strip().lower() or "en"
+        _extracted_langs = business_json.get("languages") or []
+        if not isinstance(_extracted_langs, list):
+            _extracted_langs = [_extracted_langs]
+        _extracted_langs = [
+            str(l).strip().lower() for l in _extracted_langs if str(l).strip()
+        ]
+        # Merge: owner's conversation language first, then any extras.
+        _supported_langs = [biz_lang] + [l for l in _extracted_langs if l != biz_lang]
         currency = business_json.get("currency", "EUR")
 
         # Resolve billing tier from country (lead data takes priority over phone-prefix)
@@ -4151,7 +4293,7 @@ class OnboardingService:
             **billing_snapshot,      # billingCountry, billingTier, starterPriceEur, proPriceEur
             "createdAt": now,
             "primaryLanguage": biz_lang,
-            "supportedLanguages": business_json.get("languages", [biz_lang]),
+            "supportedLanguages": _supported_langs,
             "businessType": business_json.get("businessType", "other"),
             "services": business_json.get("services", []),
             "hoursRaw": business_json.get("hours", ""),
@@ -4671,6 +4813,13 @@ class OnboardingService:
                     "Reply *done* once linked, *refresh* for a new QR code, or "
                     "*code* to switch to a pairing code instead.",
                 )
+                # Launch background poll — auto-complete when bridge detects the scan
+                _qr_sid = session.get("pairingSessionId", f"biz-{phone}")
+                _qr_attempt_id = datetime.utcnow().isoformat()
+                db.upsert_onboarding_session(phone, {"qrAttemptId": _qr_attempt_id})
+                asyncio.ensure_future(
+                    self._poll_qr_pairing_status(phone, _qr_sid, _qr_attempt_id)
+                )
             else:
                 # QR unavailable after all retries — reset step and offer a clear
                 # actionable alternative rather than a vague "bridge starting up" message.
@@ -4781,6 +4930,12 @@ class OnboardingService:
                     "Fresh QR code sent! ☝🏼\n\n"
                     "Reply *done* once linked, *refresh* for another new code, or "
                     "*code* to switch to a pairing code.",
+                )
+                # Restart background poll for the refreshed QR
+                _qr_attempt_id_new = datetime.utcnow().isoformat()
+                db.upsert_onboarding_session(phone, {"qrAttemptId": _qr_attempt_id_new})
+                asyncio.ensure_future(
+                    self._poll_qr_pairing_status(phone, pairing_sid, _qr_attempt_id_new)
                 )
             except Exception as exc:
                 logger.error("[QR] Failed to send refreshed QR image to %s: %s", phone, exc)
@@ -5003,15 +5158,18 @@ class OnboardingService:
                 await self._send(phone, instructions)
                 await asyncio.sleep(1)
 
-                code_msg_template = (
-                    "Here’s your pairing code: {code_placeholder}\n\n"
-                    "Copy it ☝🏼 and paste it on that screen.\n"
+                code_intro_template = "Here’s your pairing code — copy it ☝🏼 and paste it on that screen:"
+                code_intro_localized = await self._localize_static(code_intro_template, "", session.get("language", "en"))
+                await self._send(phone, code_intro_localized)
+                await asyncio.sleep(0.5)
+                await self._send(phone, f"*{code}*")
+                await asyncio.sleep(0.5)
+                followup_template = (
                     "⏱ 60 seconds — I’ll know the second it connects 🔄\n\n"
-                    "Reply new code for a fresh one, or skip for later."
+                    "Reply *new code* for a fresh one, or *skip* for later."
                 )
-                code_msg_localized = await self._localize_static(code_msg_template, "", session.get("language", "en"))
-                code_msg = code_msg_localized.replace("{code_placeholder}", f"*{code}*").replace("code_placeholder", f"*{code}*")
-                await self._send(phone, code_msg)
+                followup_localized = await self._localize_static(followup_template, "", session.get("language", "en"))
+                await self._send(phone, followup_localized)
                 # Generate a unique attempt ID so stale poll tasks can self-cancel
                 # when the user requests a fresh code before the old one is used.
                 attempt_id = datetime.utcnow().isoformat()
@@ -5148,6 +5306,81 @@ class OnboardingService:
                 "or *skip* to connect WhatsApp later.",
             )
 
+    async def _poll_qr_pairing_status(
+        self,
+        phone: str,
+        pairing_sid: str,
+        attempt_id: str,
+    ) -> None:
+        """Background task: poll bridge every 4 s for up to 120 s after QR is sent.
+
+        Auto-completes pairing when the device scans and connects — owner does not
+        need to type "done".  Self-cancels when:
+        - currentStep is no longer ``"pairing_qr_active"`` (switched to code / done).
+        - ``qrAttemptId`` changed (owner refreshed QR, issuing a new attempt).
+        """
+        logger.info(
+            "[QR-POLL] Started for phone=%s session=%s attempt=%s",
+            phone, pairing_sid, attempt_id,
+        )
+
+        poll_interval = 4.0    # seconds between bridge checks
+        timeout_s     = 120.0  # allow 2 min; owner may need to refresh once
+        elapsed       = 0.0
+
+        while elapsed < timeout_s:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+            session = db.get_onboarding_session(phone)
+            if not session:
+                logger.info("[QR-POLL] Session gone for %s — exiting.", phone)
+                return
+
+            if session.get("currentStep") != "pairing_qr_active":
+                logger.info(
+                    "[QR-POLL] Step changed to %r for %s — exiting.",
+                    session.get("currentStep"), phone,
+                )
+                return
+
+            if session.get("qrAttemptId") != attempt_id:
+                logger.info("[QR-POLL] Attempt ID superseded for %s — exiting.", phone)
+                return
+
+            try:
+                status_data = await self.wa.get_session_status(pairing_sid)
+                is_paired = (
+                    status_data.get("paired")
+                    or status_data.get("status") == "connected"
+                )
+                if is_paired:
+                    logger.info(
+                        "[QR-POLL] Auto-detected scan for phone=%s session=%s",
+                        phone, pairing_sid,
+                    )
+                    fresh = db.get_onboarding_session(phone) or session
+                    await self._handle_pairing(fresh, phone, "done")
+                    return
+            except Exception as exc:
+                logger.warning(
+                    "[QR-POLL] Bridge status check failed for %s: %s", pairing_sid, exc
+                )
+
+        # Timeout — nudge the owner; don't leave them in a silent dead end.
+        session = db.get_onboarding_session(phone)
+        if (
+            session
+            and session.get("currentStep") == "pairing_qr_active"
+            and session.get("qrAttemptId") == attempt_id
+        ):
+            logger.info("[QR-POLL] 120 s timeout for %s — sending refresh prompt.", phone)
+            await self._send(
+                phone,
+                "⏱ *QR code expired.*\n\n"
+                "Reply *refresh* for a new QR code or *code* to switch to a pairing code.",
+            )
+
     # ── step transition helpers ──────────────────────────────────────────
 
     async def _transition_to_calendar_setup(self, session: dict, phone: str) -> None:
@@ -5269,16 +5502,19 @@ class OnboardingService:
         # USSD code: **61* = forward on no-answer, *11 = voice calls, *15 = 15-second ring time
         ussd_code = f"**61*{fwd_number}*11*15#"
 
-        msg_template = (
+        intro_template = (
             "📞 Last step — never miss a call again (step 3 of 3)\n\n"
             "If someone calls and you can’t pick up within 15 seconds, I’ll answer for you and take care of them 🙌\n\n"
-            "Copy the code below, paste it into your phone’s dialler, and call ☎️:\n\n"
-            "{ussd_code_placeholder}\n\n"
-            "Reply DONE once it’s set, HELP for hand-holding, or SKIP to wrap up 😊"
+            "Copy the code below, paste it into your phone’s dialler, and call ☎️:"
         )
-        msg_localized = await self._localize_static(msg_template, "", session.get("language", "en"))
-        msg = msg_localized.replace("{ussd_code_placeholder}", f"`{ussd_code}`").replace("ussd_code_placeholder", f"`{ussd_code}`")
-        await self._send(phone, msg)
+        intro_localized = await self._localize_static(intro_template, "", session.get("language", "en"))
+        await self._send(phone, intro_localized)
+        await asyncio.sleep(0.5)
+        await self._send(phone, f"`{ussd_code}`")
+        await asyncio.sleep(0.5)
+        fwd_followup_template = "Reply *DONE* once it’s set, *HELP* for step-by-step instructions, or *SKIP* to wrap up 😊"
+        fwd_followup_localized = await self._localize_static(fwd_followup_template, "", session.get("language", "en"))
+        await self._send(phone, fwd_followup_localized)
 
     async def _handle_call_forwarding(self, session: dict, phone: str, body: str) -> None:
         """Handle Step 3: Call forwarding responses."""
@@ -5336,14 +5572,15 @@ class OnboardingService:
         # Any other message — re-show the USSD code and options
         fwd_number = self._get_call_forwarding_number(phone) or "<forwarding-number>"
         ussd_code = f"**61*{fwd_number}*11*15#"
-        msg_template = (
-            "Copy the code below, paste it into your phone’s dialler, and call ☎️:\n\n"
-            "{ussd_code_placeholder}\n\n"
-            "Reply DONE once it’s set, HELP for hand-holding, or SKIP to wrap up 😊"
-        )
-        msg_localized = await self._localize_static(msg_template, "", session.get("language", "en"))
-        msg = msg_localized.replace("{ussd_code_placeholder}", f"`{ussd_code}`").replace("ussd_code_placeholder", f"`{ussd_code}`")
-        await self._send(phone, msg)
+        reshow_template = "Here’s the code again — copy it, paste it into your dialler, and call ☎️:"
+        reshow_localized = await self._localize_static(reshow_template, "", session.get("language", "en"))
+        await self._send(phone, reshow_localized)
+        await asyncio.sleep(0.5)
+        await self._send(phone, f"`{ussd_code}`")
+        await asyncio.sleep(0.5)
+        reshow_followup_template = "Reply *DONE* once it’s set, *HELP* for step-by-step instructions, or *SKIP* to wrap up 😊"
+        reshow_followup_localized = await self._localize_static(reshow_followup_template, "", session.get("language", "en"))
+        await self._send(phone, reshow_followup_localized)
 
     async def _complete_onboarding(self, session: dict, phone: str) -> None:
         db.upsert_onboarding_session(phone, {
@@ -6841,14 +7078,31 @@ class OnboardingService:
             elif tool_name == "send_stripe_link":
                 plan = (tool_input.get("plan") or "starter").lower()
                 business_id = session.get("businessId")
-                if business_id:
-                    biz = db.get_business_by_id(business_id)
-                    if biz and await self._send_plan_checkout_link(phone, biz, plan, session):
-                        return f"Stripe checkout link sent for plan={plan}, business={business_id}"
-                    return "Stripe checkout link generation failed."
-                pricing_url = f"{settings.BASE_URL.rstrip('/')}/pricing"
-                await self._send(phone, f"💳 Vê os nossos preços aqui:\n{pricing_url}")
-                return "Pricing page sent (business not yet created)."
+                if not business_id:
+                    # HARD GATE — never send a payment link before the business
+                    # is registered. Doing so previously routed owners to a
+                    # /pricing page that does not exist (404) and skipped the
+                    # data-collection step entirely. Return a directive that
+                    # forces Claude to resume onboarding instead.
+                    logger.warning(
+                        "[ONBOARDING_TOOL] send_stripe_link refused — business not yet "
+                        "created phone=%s plan=%s", phone, plan,
+                    )
+                    return (
+                        "STRIPE_LINK_BLOCKED: The business is not registered yet, so "
+                        "no payment link can be sent. Do NOT mention pricing, "
+                        "subscriptions, or send any link in your reply. Instead, "
+                        "continue the onboarding flow: ask the owner for their "
+                        "business website, Google Maps link, or Instagram (or the "
+                        "business name if they don't have a link), then collect any "
+                        "missing required fields (name, type, address). Only after "
+                        "the business is created and confirmed will pricing be "
+                        "offered. Reply in the owner's language."
+                    )
+                biz = db.get_business_by_id(business_id)
+                if biz and await self._send_plan_checkout_link(phone, biz, plan, session):
+                    return f"Stripe checkout link sent for plan={plan}, business={business_id}"
+                return "Stripe checkout link generation failed."
 
             elif tool_name == "alert_daniel":
                 reason = tool_input.get("reason", "owner request")

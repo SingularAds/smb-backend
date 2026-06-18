@@ -31,7 +31,7 @@ async def synthesize(
     voice_id: str | None = None,
     language: str = "en",
 ) -> bytes:
-    """Convert text to MP3 audio using Cartesia sonic-multilingual.
+    """Convert text to MP3 audio using Cartesia sonic-2.
 
     Args:
         text:     The text to speak.
@@ -57,7 +57,7 @@ async def synthesize(
     }
     body = {
         "transcript": text,
-        "model_id": "sonic-multilingual",
+        "model_id": "sonic-2",
         "voice": {
             "mode": "id",
             "id": vid,

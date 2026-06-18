@@ -1038,6 +1038,28 @@ def create_owner_doc(phone: str, data: dict) -> None:
 
 # ── business lookup by waSessionId ────────────────────────────────────────────
 
+def list_businesses_with_wa_session() -> list[dict]:
+    """Return every active business that has a WhatsApp bridge session attached.
+
+    Used by background sweeps (CSAT prompts, reminders, daily summaries) that
+    must iterate the whole tenant set. ``status==active`` is enforced so we
+    don't message customers of dormant / churned tenants.
+    """
+    docs = (
+        _db().collection("businesses")
+        .where(filter=FieldFilter("status", "==", "active"))
+        .stream()
+    )
+    out: list[dict] = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        if not data.get("waSessionId"):
+            continue
+        data["id"] = doc.id
+        out.append(data)
+    return out
+
+
 def get_business_by_wa_session_id(session_id: str) -> dict | None:
     """Find a business by its WhatsApp bridge session ID (device_id)."""
     docs = (
@@ -1319,3 +1341,138 @@ def set_global_kb(content: str) -> None:
         "content": content,
         "updatedAt": _now_iso(),
     })
+
+
+# ── per-business knowledge base ───────────────────────────────────────────────
+# Subcollection: businesses/{businessId}/knowledge/{entryId}
+#
+# Each entry captures a question a customer asked that the AI could not answer,
+# along with the owner's confirmed answer (when provided). High-level lifecycle
+# logic — normalization, dedup, lifecycle transitions — lives in
+# `app.services.knowledge_base_service`. This module is the pure CRUD layer.
+
+def _kb_col(business_id: str):
+    return (
+        _db().collection("businesses").document(business_id).collection("knowledge")
+    )
+
+
+def create_business_kb_entry(business_id: str, data: dict) -> dict:
+    """Create a new KB entry. The caller (knowledge_base_service) is
+    responsible for setting status, intent guard, normalization, and short code.
+    """
+    doc_id = data.get("id") or new_id()
+    data["id"] = doc_id
+    data["businessId"] = business_id
+    data.setdefault("createdAt", _now_iso())
+    data.setdefault("updatedAt", _now_iso())
+    _kb_col(business_id).document(doc_id).set(data)
+    return data
+
+
+def get_business_kb_entry(business_id: str, entry_id: str) -> dict | None:
+    doc = _kb_col(business_id).document(entry_id).get()
+    if not doc.exists:
+        return None
+    out = doc.to_dict()
+    out["id"] = doc.id
+    out["businessId"] = business_id
+    return out
+
+
+def get_business_kb_entry_by_code(business_id: str, short_code: str) -> dict | None:
+    """Look up a pending entry by its human-facing short code (e.g. 'KB-A3F7').
+
+    Used when an owner replies 'YES KB-A3F7 <answer>' / 'NO KB-A3F7' so we can
+    match the reply to the exact pending entry.
+    """
+    docs = (
+        _kb_col(business_id)
+        .where(filter=FieldFilter("shortCode", "==", short_code))
+        .limit(1)
+        .stream()
+    )
+    for doc in docs:
+        out = doc.to_dict()
+        out["id"] = doc.id
+        out["businessId"] = business_id
+        return out
+    return None
+
+
+def find_business_kb_by_normalized(
+    business_id: str,
+    normalized_question: str,
+    statuses: list[str] | None = None,
+) -> dict | None:
+    """Return the most recent entry matching the normalized question, optionally
+    filtered by status. Used for dedup — so we don't ask the owner the same
+    question twice or re-answer a question already in pending/confirmed/rejected.
+    """
+    query = _kb_col(business_id).where(
+        filter=FieldFilter("questionNormalized", "==", normalized_question)
+    )
+    docs = list(query.stream())
+    if statuses:
+        docs = [d for d in docs if (d.to_dict() or {}).get("status") in statuses]
+    if not docs:
+        return None
+    # Sort by createdAt desc — most recent first.
+    docs.sort(key=lambda d: (d.to_dict() or {}).get("createdAt", ""), reverse=True)
+    out = docs[0].to_dict()
+    out["id"] = docs[0].id
+    out["businessId"] = business_id
+    return out
+
+
+def list_business_kb_by_status(
+    business_id: str,
+    status: str,
+    limit: int = 200,
+) -> list[dict]:
+    """List all entries with a given status. Used for retrieval ('confirmed'),
+    sweepers ('pending_review' for expiry), and admin tooling.
+    """
+    docs = (
+        _kb_col(business_id)
+        .where(filter=FieldFilter("status", "==", status))
+        .limit(limit)
+        .stream()
+    )
+    out: list[dict] = []
+    for doc in docs:
+        data = doc.to_dict()
+        data["id"] = doc.id
+        data["businessId"] = business_id
+        out.append(data)
+    return out
+
+
+def list_recent_pending_kb_for_owner(
+    business_id: str,
+    limit: int = 5,
+) -> list[dict]:
+    """Return the most-recent pending_review entries. Used as a fallback when
+    the owner replies 'YES' with no code — we match the latest pending entry.
+    """
+    entries = list_business_kb_by_status(business_id, "pending_review", limit=limit * 4)
+    entries.sort(key=lambda e: e.get("createdAt", ""), reverse=True)
+    return entries[:limit]
+
+
+def update_business_kb_entry(
+    business_id: str,
+    entry_id: str,
+    updates: dict,
+) -> dict | None:
+    payload = dict(updates or {})
+    payload.setdefault("updatedAt", _now_iso())
+    ref = _kb_col(business_id).document(entry_id)
+    ref.update(payload)
+    doc = ref.get()
+    if not doc.exists:
+        return None
+    out = doc.to_dict()
+    out["id"] = doc.id
+    out["businessId"] = business_id
+    return out

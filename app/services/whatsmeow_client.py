@@ -149,6 +149,37 @@ class WhatsmeowClient:
                 )
                 raise
 
+    async def send_typing(
+        self,
+        phone: str,
+        device_id: str | None = None,
+        state: str = "composing",
+    ) -> None:
+        """Show "typing…" (or "recording") in the recipient's chat for ~10s.
+
+        ``state`` is ``"composing"`` (the typing-bubble) or ``"recording"``
+        (the mic-recording indicator used before sending a voice note).
+
+        Fire-and-forget: any failure is logged at debug and swallowed —
+        a flaky presence call must never block the AI reply.
+        """
+        device = device_id or self.default_device_id
+        jid = _phone_to_jid(phone)
+        try:
+            async with self._client(timeout=5.0) as client:
+                resp = await client.post(
+                    "/send/presence",
+                    json={"phone": jid, "state": state},
+                    headers={"X-Device-Id": device},
+                )
+                if resp.status_code >= 400:
+                    logger.debug(
+                        "Presence call returned %s for %s (state=%s): %s",
+                        resp.status_code, phone, state, (resp.text or '')[:120],
+                    )
+        except Exception as exc:
+            logger.debug("send_typing(%s) failed (non-fatal): %s", phone, exc)
+
     async def send_messages(
         self,
         phone: str,

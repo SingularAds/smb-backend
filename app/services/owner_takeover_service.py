@@ -20,7 +20,7 @@ time we are called, the message is known to be human-typed by the owner.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app import firestore as db
 from app.services import ai_pause_service
@@ -105,6 +105,41 @@ async def handle_owner_message(
                 business_id, target_phone,
             )
         return
+
+    # ── Out-of-scope pass-through ─────────────────────────────────────────────
+    # If the AI just silenced itself because the customer's last message was
+    # out-of-scope (e.g. "do you have chicken?"), the owner is replying to
+    # answer THAT specific question — not taking over the conversation thread.
+    # Triggering a 90-minute pause here would block the AI from handling the
+    # customer's very next booking request.
+    # Grace window: 30 minutes after an out-of-scope classification.
+    _oos_ts = (convo or {}).get("lastOutOfScopeAt")
+    if _oos_ts:
+        try:
+            _oos_age = datetime.utcnow() - datetime.fromisoformat(_oos_ts)
+            if _oos_age < timedelta(minutes=30):
+                # Owner is answering the out-of-scope question — just record in
+                # history and leave AI active for the next customer message.
+                messages: list = (convo or {}).get("messages", [])
+                messages.append({"role": "assistant", "content": body, "origin": "owner"})
+                if len(messages) > MAX_HISTORY_MESSAGES:
+                    messages = messages[-MAX_HISTORY_MESSAGES:]
+                db.upsert_customer_conversation(business_id, phone_clean, {
+                    "messages":      messages,
+                    "customerPhone": phone_clean,
+                    "businessId":    business_id,
+                    "lastMessageAt": datetime.utcnow().isoformat(),
+                    # Clear the flag so a second owner reply triggers normal takeover
+                    "lastOutOfScopeAt": None,
+                })
+                logger.info(
+                    "[OWNER-TAKEOVER] skipping pause — owner replied within 30 min of "
+                    "out-of-scope message business=%s phone=%s",
+                    business_id, phone_clean,
+                )
+                return
+        except (ValueError, TypeError):
+            pass  # malformed timestamp → fall through to normal takeover
 
     # ── Genuine takeover ─────────────────────────────────────────────────────
     was_already_paused = is_active_pause(convo)

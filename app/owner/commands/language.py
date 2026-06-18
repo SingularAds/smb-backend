@@ -2,8 +2,8 @@
 
 Strategy (zero-hardcode):
   1. Detect the language of the owner's raw message using langdetect.
-  2. If it differs from Portuguese (the default template language),
-     call Claude to translate the reply into the detected language.
+  2. If it differs from English (the language command replies are
+     authored in), call Claude to translate into the detected language.
   3. Return the translated (or original) reply.
 """
 from __future__ import annotations
@@ -13,8 +13,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Supported languages — iso 639-1 codes.
-# Detection works for any language; we only skip translation for 'pt' (template default).
-_TEMPLATE_LANG = "pt"
+# Command reply strings in services.py are authored in English; we skip
+# translation when the owner is already writing in English.
+_TEMPLATE_LANG = "en"
 
 
 def _detect_language(text: str) -> str:
@@ -53,13 +54,13 @@ def _detect_language(text: str) -> str:
 async def translate_reply(raw_message: str, reply: str, lang: str | None = None) -> str:
     """Translate *reply* into the same language as *raw_message*.
 
-    If the detected language is already Portuguese (the template default) or
-    detection fails, the reply is returned unchanged.
+    If the detected language is English (the language command replies are
+    authored in) or detection fails, the reply is returned unchanged.
 
     Pass *lang* directly when the caller has already resolved the session
     language (e.g. from onboarding_service) to avoid re-detecting from a
     short or ambiguous command body like "resume ai" which langdetect may
-    misclassify as Portuguese.
+    misclassify.
     """
     if lang is None:
         lang = _detect_language(raw_message)
@@ -68,6 +69,7 @@ async def translate_reply(raw_message: str, reply: str, lang: str | None = None)
 
     lang_names = {
         "en": "English",
+        "pt": "Portuguese",
         "es": "Spanish",
         "fr": "French",
         "de": "German",
@@ -87,14 +89,23 @@ async def translate_reply(raw_message: str, reply: str, lang: str | None = None)
     try:
         from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
         from app.config import settings
-        
+
         client = AsyncOpenAIAnthropicWrapper(api_key=settings.OPENAI_API_KEY)
 
+        # Source-language-agnostic prompt: command replies are authored in
+        # English but some flows (e.g. handle_owner_message acknowledgements)
+        # already produce localized text. Telling Claude the source explicitly
+        # caused mistranslations (English source → "translate from Portuguese"
+        # → Portuguese output). Have it auto-detect and no-op when already
+        # in the target language.
         system = (
             f"You are a professional translator. "
-            f"Translate the following WhatsApp message from Portuguese to {lang_name}. "
-            "Preserve all WhatsApp formatting (bold *text*, italics _text_, bullet characters, emojis). "
-            "Return ONLY the translated message text — no explanation, no quotes."
+            f"Translate the following WhatsApp message into {lang_name}. "
+            f"If the message is already in {lang_name}, return it unchanged. "
+            "Preserve all WhatsApp formatting (bold *text*, italics _text_, "
+            "bullet characters, emojis, phone numbers, and identifiers like "
+            "+919905252720). Return ONLY the translated message text — no "
+            "explanation, no quotes."
         )
 
         message = await client.messages.create(
@@ -104,7 +115,7 @@ async def translate_reply(raw_message: str, reply: str, lang: str | None = None)
             messages=[{"role": "user", "content": reply}],
         )
         translated = message.content[0].text.strip()
-        logger.debug("Translated reply from pt → %s", lang)
+        logger.debug("Translated reply → %s", lang)
         return translated
     except Exception as exc:
         logger.warning("Translation failed (%s), returning original reply: %s", lang, exc)

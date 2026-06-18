@@ -36,9 +36,8 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 
-from openai import AsyncOpenAI
-
 from app.config import settings
+from app.integrations.langfuse_client import get_async_openai
 
 logger = logging.getLogger(__name__)
 
@@ -118,8 +117,19 @@ mode the current chat is in.
   and the owner can intervene manually.
 
 FLAGS (independent of intent — set true when applicable):
-  frustrated   — Customer is angry, upset, demanding escalation, repeating
-                 themselves, or expressing dissatisfaction.
+  frustrated   — RARE. Only set when the customer is clearly *angry* and
+                 escalating: shouting in caps, repeating angrily, threatening
+                 a refund/complaint, saying "this is unacceptable", "worst
+                 service ever", "I'm so done", etc. Setting this flag
+                 SILENCES the AI, so be conservative.
+                 Do NOT set frustrated for:
+                   • Impatience ("what's going on?", "still waiting", "can
+                     someone reply please")
+                   • Asking the same question again ("I asked for the menu")
+                   • A short curt message ("hello??", "anyone there?")
+                   • Mild dissatisfaction inside a normal request
+                 These are normal customer behaviour; the AI should still
+                 try to help.
   abusive      — Message contains insults, profanity directed at the business
                  or staff, slurs, threats, or sexual harassment.
   out_of_scope — Message IS business-related but NOT booking/reschedule/cancel/FAQ.
@@ -168,6 +178,14 @@ User: "This is the worst service ever, I want my money back NOW!!"
 Output: {"intent": "BUSINESS", "score": 70, "reason": "Angry refund demand",
          "frustrated": true, "abusive": false, "out_of_scope": true}
 
+User: "Whats happening i am asking for menu"
+Output: {"intent": "BUSINESS", "score": 70, "reason": "Customer chasing for the menu — impatient but not angry",
+         "frustrated": false, "abusive": false, "out_of_scope": true}
+
+User: "hello?? anyone there?"
+Output: {"intent": "GREETING", "score": 20, "reason": "Customer checking if anyone is online — not angry",
+         "frustrated": false, "abusive": false, "out_of_scope": false}
+
 User: "you f***ing idiots ruined my hair"
 Output: {"intent": "BUSINESS", "score": 65, "reason": "Abusive complaint",
          "frustrated": true, "abusive": true, "out_of_scope": true}
@@ -203,6 +221,8 @@ async def classify_intent(
     business_name: str,
     business_type: str,
     recent_history: list[dict] | None = None,
+    *,
+    trace_metadata: dict | None = None,
 ) -> ClassifierResult:
     """Classify whether *message* is business-related for the given business.
 
@@ -216,7 +236,8 @@ async def classify_intent(
         ClassifierResult with intent, score, and reason.
         Defaults to PERSONAL on any error to ensure silent fail-safe.
     """
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    client = get_async_openai(api_key=settings.OPENAI_API_KEY)
+    _is_traced = client.__class__.__module__.startswith("langfuse")
 
     # Build context snippet from recent history (last CLASSIFIER_HISTORY_WINDOW turns)
     history_snippet = ""
@@ -240,7 +261,7 @@ async def classify_intent(
 
     try:
         start = time.monotonic()
-        resp = await client.chat.completions.create(
+        _call_kwargs = dict(
             model="gpt-4o-mini",
             max_tokens=100,
             temperature=0,
@@ -250,6 +271,19 @@ async def classify_intent(
                 {"role": "user",   "content": user_content},
             ],
         )
+        if _is_traced and trace_metadata:
+            _call_kwargs["name"] = "intent_classifier"
+            _call_kwargs["metadata"] = {
+                k: v for k, v in trace_metadata.items()
+                if k not in {"session_id", "user_id", "tags"}
+            }
+            if trace_metadata.get("session_id"):
+                _call_kwargs["session_id"] = trace_metadata["session_id"]
+            if trace_metadata.get("user_id"):
+                _call_kwargs["user_id"] = trace_metadata["user_id"]
+            if trace_metadata.get("tags"):
+                _call_kwargs["tags"] = trace_metadata["tags"]
+        resp = await client.chat.completions.create(**_call_kwargs)
         elapsed = time.monotonic() - start
         raw = resp.choices[0].message.content or "{}"
         logger.info(

@@ -85,17 +85,34 @@ async def run_daily_summary_for_all_businesses(now: datetime | None = None) -> N
     logger.info("[AUTOMATION:DAILY_SUMMARY] done — %d/%d summaries sent", sent_count, len(businesses))
 
 
+def _calls_today(business: dict, today_local_iso: str) -> int:
+    """Read the per-business daily AI call counter, gated on its date stamp.
+
+    The counter is maintained by `firestore.increment_call_counters` and is
+    only meaningful if `daily_counter_date` matches the business-local "today".
+    A stale stamp (no calls today) means we report 0 rather than yesterday's
+    value.
+    """
+    if business.get("daily_counter_date") != today_local_iso:
+        return 0
+    try:
+        return int(business.get("daily_counter", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 async def _send_daily_summary(business: dict, today_start: str, today_end: str) -> None:
     biz_id = business["id"]
     biz_name = business.get("name") or "Your business"
     tz = _biz_tz(business)
     _dl = datetime.fromisoformat(today_start).astimezone(tz)
     today_label = f"{_dl.day} {_dl.strftime('%b %Y')}"
+    today_local_iso = _dl.strftime("%Y-%m-%d")
 
     all_bookings = db.list_bookings(biz_id, limit=300)
     all_customers = db.list_customers(biz_id, limit=500)
 
-    # Today's bookings
+    # Today's bookings (received and still active)
     today_bookings = [
         b for b in all_bookings
         if _in_range(b.get("datetime") or b.get("date"), today_start, today_end)
@@ -115,6 +132,15 @@ async def _send_daily_summary(business: dict, today_start: str, today_end: str) 
         c for c in all_customers
         if _in_range(c.get("createdAt"), today_start, today_end)
     ]
+
+    # AI-handled calls today (counter is reset/rolled per business-local day)
+    calls_today = _calls_today(business, today_local_iso)
+
+    # Total bookings received today = active + cancelled (anything booked today).
+    # `today_bookings` filters non-cancelled by their scheduled datetime,
+    # `cancelled_today` filters cancelled by when they were cancelled. Together
+    # they represent what the SMB received throughout the day.
+    total_bookings_received = len(today_bookings) + len(cancelled_today)
 
     # Build message
     total_people = sum(int(b.get("partySize") or 1) for b in today_bookings)
@@ -144,6 +170,8 @@ async def _send_daily_summary(business: dict, today_start: str, today_end: str) 
 
     lines += [
         "",
+        f"📞 *Calls handled today: {calls_today}*",
+        f"📥 *Total bookings received today: {total_bookings_received}*",
         f"🆕 *New customers today: {len(new_customers)}*",
         f"❌ *Cancellations today: {len(cancelled_today)}*",
         "",
@@ -151,5 +179,8 @@ async def _send_daily_summary(business: dict, today_start: str, today_end: str) 
     ]
 
     msg = "\n".join(lines)
-    logger.info("[AUTOMATION:DAILY_SUMMARY] sending to owner of biz %s (%s)", biz_id, biz_name)
+    logger.info(
+        "[AUTOMATION:DAILY_SUMMARY] sending to owner of biz %s (%s) | bookings=%d calls=%d",
+        biz_id, biz_name, len(today_bookings), calls_today,
+    )
     await send_to_owner(business, msg)

@@ -82,7 +82,14 @@ def is_protected_number(phone: str, business: dict | None = None) -> bool:
     if settings.RECEPTE_PHONE:
         candidates.append(settings.RECEPTE_PHONE)
     if business:
-        for key in ("ownerPhone", "owner_phone", "waPhoneNumber"):
+        # Per-business stored copies of the global onboarding number. We accept
+        # several aliases so the field can be populated by any onboarding path
+        # (server-side handler, dashboard, manual support edit) without forcing
+        # everyone onto a single schema migration.
+        for key in (
+            "ownerPhone", "owner_phone", "waPhoneNumber",
+            "globalOnboardingNumber", "onboardedViaPhone", "recepteNumber",
+        ):
             if business.get(key):
                 candidates.append(business[key])
         for admin in business.get("adminPhones") or []:

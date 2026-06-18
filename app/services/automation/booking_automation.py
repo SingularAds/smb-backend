@@ -32,8 +32,11 @@ from app.services.tz_utils import biz_tz as _biz_tz, parse_dt as _parse_dt_tz, f
 
 logger = logging.getLogger(__name__)
 
-# How soon after reminder threshold we consider it "already sent"
-_REMINDER_WINDOW_MINUTES = 25  # run every 30 min, match within 25-min window
+# Reminder match window. Must be ≥ the scheduler sweep interval so every booking
+# is guaranteed to fall inside the window for at least one sweep. The sweep runs
+# every 30 min (see scheduler.py); a 30-min window with the `remindersSent`
+# de-dup guarantees exactly-once delivery even under scheduler jitter.
+_REMINDER_WINDOW_MINUTES = 30
 
 
 def _now() -> datetime:
@@ -179,14 +182,14 @@ async def run_reminder_sweep() -> None:
 
                 sent_reminders: list = b.get("remindersSent", [])
 
-                # 24-hour reminder: between 23h35 and 24h00 ahead
-                if 23 * 60 + 35 <= delta <= 24 * 60 and "24h" not in sent_reminders:
+                # 24-hour reminder: within the sweep window ending at 24h ahead.
+                if (24 * 60 - _REMINDER_WINDOW_MINUTES) <= delta <= 24 * 60 and "24h" not in sent_reminders:
                     await _send_reminder(business, b, "24h", booking_dt)
                     db.update_booking(b["id"], {"remindersSent": sent_reminders + ["24h"]}, biz_id)
                     total_sent += 1
 
-                # 2-hour reminder: between 1h35 and 2h00 ahead
-                elif 60 + 35 <= delta <= 2 * 60 and "2h" not in sent_reminders:
+                # 2-hour reminder: within the sweep window ending at 2h ahead.
+                elif (2 * 60 - _REMINDER_WINDOW_MINUTES) <= delta <= 2 * 60 and "2h" not in sent_reminders:
                     await _send_reminder(business, b, "2h", booking_dt)
                     db.update_booking(b["id"], {"remindersSent": sent_reminders + ["2h"]}, biz_id)
                     total_sent += 1

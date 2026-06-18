@@ -1,7 +1,8 @@
 import json
 import logging
 from typing import Any, List, Optional
-from openai import AsyncOpenAI
+
+from app.integrations.langfuse_client import get_async_openai
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,7 @@ class MessageResponse:
         self.role = role
 
 class MessagesResource:
-    def __init__(self, client: AsyncOpenAI):
+    def __init__(self, client: Any):
         self.client = client
 
     def _convert_tools(self, anthropic_tools: list[dict]) -> list[dict]:
@@ -115,18 +116,40 @@ class MessagesResource:
 
     async def create(self, model: str, max_tokens: int, messages: list[dict], system: str = "", tools: list[dict] = None, **kwargs) -> MessageResponse:
         openai_messages = self._convert_history(messages, system)
-        
+
         # Override model to the requested OpenAI model unless specified
         # Assuming the caller might still pass 'claude-haiku...', we intercept it.
         # But for safety, we just force gpt-4o-mini here as per requirements.
         actual_model = "gpt-4o-mini"
-        
+
         call_kwargs = {
             "model": actual_model,
             "messages": openai_messages,
             "max_tokens": max_tokens,
         }
-        
+
+        # ── Langfuse tracing metadata ─────────────────────────────────────────
+        # When the caller passes trace_metadata={...}, forward it to the
+        # langfuse-wrapped OpenAI client. The wrapper recognises 'name',
+        # 'metadata', 'session_id', 'user_id', 'tags' kwargs and emits a
+        # fully-attributed trace. On the vanilla SDK these kwargs are unknown
+        # and would raise TypeError, so we strip them when langfuse isn't
+        # active (detected by the absence of the 'langfuse' attribute).
+        _is_traced_client = self.client.__class__.__module__.startswith("langfuse")
+        if "trace_metadata" in kwargs:
+            tm = kwargs.pop("trace_metadata") or {}
+            if _is_traced_client:
+                call_kwargs["name"] = tm.get("name", "customer_ai_reply")
+                call_kwargs["metadata"] = {
+                    k: v for k, v in tm.items() if k not in {"name", "session_id", "user_id", "tags"}
+                }
+                if tm.get("session_id"):
+                    call_kwargs["session_id"] = tm["session_id"]
+                if tm.get("user_id"):
+                    call_kwargs["user_id"] = tm["user_id"]
+                if tm.get("tags"):
+                    call_kwargs["tags"] = tm["tags"]
+
         if tools:
             call_kwargs["tools"] = self._convert_tools(tools)
 
@@ -175,7 +198,12 @@ class AsyncOpenAIAnthropicWrapper:
     """
     A drop-in replacement for AsyncAnthropic that routes calls to OpenAI.
     Provides backward compatibility with Anthropic tool schemas and message history formats.
+
+    When LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY are set, the underlying
+    OpenAI client is automatically wrapped by Langfuse so every chat
+    completion is traced (prompt, response, tokens, cost, latency) and
+    callers can attach metadata via ``trace_metadata={...}`` kwarg.
     """
     def __init__(self, api_key: str):
-        self._openai_client = AsyncOpenAI(api_key=api_key)
+        self._openai_client = get_async_openai(api_key=api_key)
         self.messages = MessagesResource(self._openai_client)

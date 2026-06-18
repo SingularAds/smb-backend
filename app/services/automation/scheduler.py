@@ -27,6 +27,9 @@ from app.services.automation.weekly_summary import run_weekly_summary_for_all_bu
 from app.services.automation.customer_intelligence import run_customer_intelligence_sweep
 from app.services.automation.referral_automation import run_referral_invite_sweep, run_referral_discount_expiry_sweep
 from app.services.automation.trial_expiry_automation import run_trial_expiry_sweep
+from app.services.automation.kb_expiry import run_kb_expiry_sweep
+from app.services.csat_service import sweep_all as run_csat_sweep
+from app.config import settings as _settings
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +91,20 @@ async def _job_trial_expiry() -> None:
         await run_trial_expiry_sweep()
     except Exception as exc:
         logger.exception("[Scheduler] trial expiry sweep crashed: %s", exc)
+
+
+async def _job_kb_expiry() -> None:
+    try:
+        await run_kb_expiry_sweep()
+    except Exception as exc:
+        logger.exception("[Scheduler] KB expiry sweep crashed: %s", exc)
+
+
+async def _job_csat_sweep() -> None:
+    try:
+        await run_csat_sweep()
+    except Exception as exc:
+        logger.exception("[Scheduler] CSAT sweep crashed: %s", exc)
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -184,6 +201,33 @@ def start_scheduler() -> None:
         replace_existing=True,
         misfire_grace_time=600,
     )
+
+    # KB expiry sweep — every day at 04:00 UTC. Flips pending KB entries past
+    # their TTL (default 7 days) from pending_review → expired so the dedup
+    # window resets and the next customer asking the same question creates a
+    # fresh prompt.  Off-peak slot to avoid contention with the summary jobs.
+    _scheduler.add_job(
+        _job_kb_expiry,
+        trigger=CronTrigger(hour=4, minute=0, timezone="UTC"),
+        id="kb_expiry_sweep",
+        name="Per-SMB knowledge-base expiry sweep",
+        replace_existing=True,
+        misfire_grace_time=600,
+    )
+
+    # CSAT prompt sweep — every CSAT_SWEEP_INTERVAL_MINUTES (default 5 min).
+    # Finds conversations that have been idle for CSAT_IDLE_MINUTES after the
+    # last AI reply and sends a "rate 1-5" WhatsApp prompt.
+    if _settings.CSAT_ENABLED:
+        _scheduler.add_job(
+            _job_csat_sweep,
+            trigger=IntervalTrigger(minutes=_settings.CSAT_SWEEP_INTERVAL_MINUTES),
+            id="csat_sweep",
+            name=f"CSAT prompt sweep (idle ≥ {_settings.CSAT_IDLE_MINUTES} min)",
+            replace_existing=True,
+            misfire_grace_time=120,
+            max_instances=1,
+        )
 
     _scheduler.start()
     logger.info("[Scheduler] started — %d jobs registered", len(_scheduler.get_jobs()))
