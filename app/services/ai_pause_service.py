@@ -35,6 +35,7 @@ from enum import Enum
 
 from app import firestore as db
 from app.config import settings
+from app.integrations import posthog_client
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +201,15 @@ def pause(
         "[AI-PAUSE] business=%s phone=%s reason=%s until=%s",
         business_id, customer_phone, reason.value, until.isoformat(),
     )
+    try:
+        posthog_client.capture(
+            business_id=business_id,
+            customer_phone=customer_phone,
+            event="ai_paused",
+            properties={"reason": reason.value, "minutes": minutes},
+        )
+    except Exception:
+        pass
     return PauseState(
         paused=True,
         reason=reason.value,
@@ -218,6 +228,15 @@ def resume(business_id: str, customer_phone: str) -> None:
     }
     db.upsert_customer_conversation(business_id, customer_phone, patch)
     logger.info("[AI-RESUME] business=%s phone=%s", business_id, customer_phone)
+    try:
+        posthog_client.capture(
+            business_id=business_id,
+            customer_phone=customer_phone,
+            event="ai_resumed",
+            properties={},
+        )
+    except Exception:
+        pass
 
 
 # ── Resume-command detection ─────────────────────────────────────────────────

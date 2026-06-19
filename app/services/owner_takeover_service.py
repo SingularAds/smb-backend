@@ -23,6 +23,7 @@ import logging
 from datetime import datetime, timedelta
 
 from app import firestore as db
+from app.integrations import posthog_client
 from app.services import ai_pause_service
 from app.services.ai_pause_service import (
     DEFAULT_PAUSE_MINUTES,
@@ -170,6 +171,15 @@ async def handle_owner_message(
     })
 
     if not was_already_paused:
+        try:
+            posthog_client.capture(
+                business_id=business_id,
+                customer_phone=phone_clean,
+                event="owner_takeover",
+                properties={"pause_minutes": DEFAULT_PAUSE_MINUTES},
+            )
+        except Exception:
+            pass
         label = _format_customer_label(convo, phone_clean)
         await _notify_owner_safely(
             business,

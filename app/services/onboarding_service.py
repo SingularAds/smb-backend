@@ -29,6 +29,7 @@ from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
 
 from app.config import settings
 from app import firestore as db
+from app.integrations import posthog_client
 from app.services.whatsmeow_client import PairingStateConflict, WhatsmeowClient
 from app.services.ai_service import AIService
 from app.services.onboarding_plan_info import (
@@ -4552,6 +4553,20 @@ class OnboardingService:
                             "[TRIAL] 7-day PRO trial activated for business=%s at WhatsApp Done",
                             business_id,
                         )
+                        try:
+                            posthog_client.capture(
+                                business_id=business_id,
+                                customer_phone=phone,
+                                event="business_trial_started",
+                                properties={
+                                    "plan": "trialing",
+                                    "trial_days": 7,
+                                    "business_name": session.get("businessName") or "",
+                                    "business_type": session.get("businessType") or "",
+                                },
+                            )
+                        except Exception:
+                            pass
                 except Exception as _trial_exc:
                     logger.error("[TRIAL] Failed to activate trial for business=%s: %s", business_id, _trial_exc)
 
@@ -4599,6 +4614,31 @@ class OnboardingService:
             )
             msg = await self._localize_static(msg, "", session.get("language", "en"))
             await self._send(phone, msg)
+
+            # Analytics: WhatsApp successfully linked
+            try:
+                _biz_name = session.get("businessName") or ""
+                _biz_type = session.get("businessType") or ""
+                posthog_client.capture(
+                    business_id=business_id or phone,
+                    customer_phone=phone,
+                    event="whatsapp_connected",
+                    properties={
+                        "session_id": pairing_sid,
+                        "reconnect_mode": bool(session.get("reconnectMode")),
+                        "business_name": _biz_name,
+                        "business_type": _biz_type,
+                    },
+                    person_properties={
+                        "business_id":   business_id or phone,
+                        "business_name": _biz_name,
+                        "business_type": _biz_type,
+                        "plan":          "trialing",
+                    },
+                )
+            except Exception:
+                pass
+
             await asyncio.sleep(1)
             await self._transition_to_calendar_setup(session, phone)
             return

@@ -66,16 +66,63 @@ def distinct_id(business_id: str, customer_phone: str) -> str:
     return f"biz:{business_id}:cust:{_hash_phone(customer_phone)}"
 
 
+# Cache of distinct_ids that have already been identified this process lifetime.
+# Avoids sending an identify() on every single message.
+_identified: set[str] = set()
+
+
+def identify(
+    business_id: str,
+    customer_phone: str,
+    person_properties: dict | None = None,
+) -> None:
+    """Link distinct_id to a PostHog Person so events appear in dashboards.
+
+    PostHog's Activity tab shows raw events regardless, but Insights /
+    Persons / Funnels only work when the distinct_id has been identified.
+    Call this once per customer×business pair (cached in-process).
+    Never raises.
+    """
+    client = _client()
+    if client is None:
+        return
+    did = distinct_id(business_id, customer_phone)
+    if did in _identified:
+        return
+    try:
+        props = dict(person_properties or {})
+        props.setdefault("business_id", business_id)
+        # Send $identify event with $set to populate Person properties.
+        # This is the only way PostHog Python SDK supports setting Person properties.
+        client.capture(
+            distinct_id=did,
+            event="$identify",
+            properties={"$set": props},
+        )
+        _identified.add(did)
+    except Exception as exc:
+        logger.warning("[POSTHOG] identify failed: %s", exc)
+
+
 def capture(
     business_id: str,
     customer_phone: str,
     event: str,
     properties: dict | None = None,
+    person_properties: dict | None = None,
 ) -> None:
-    """Fire a PostHog event. Never raises."""
+    """Fire a PostHog event. Never raises.
+
+    Automatically calls identify() on the first event for each
+    customer×business pair so events appear in PostHog dashboards.
+    Pass person_properties to enrich the Person record (business name,
+    plan, language, etc.).
+    """
     client = _client()
     if client is None:
         return
+    # Ensure the person exists in PostHog before the event
+    identify(business_id, customer_phone, person_properties)
     try:
         props = dict(properties or {})
         props.setdefault("business_id", business_id)

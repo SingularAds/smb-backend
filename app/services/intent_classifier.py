@@ -90,7 +90,12 @@ Your job: classify the message AND flag safety signals.
 INTENTS:
   BUSINESS  — In-scope booking/reschedule/cancel/FAQ request.
   PERSONAL  — Social, emotional, or off-business chat (jokes, family, etc.).
-  GREETING  — A bare greeting with no business content ("Hi", "Hello").
+  GREETING  — A bare greeting with no business content ("Hi", "Hello", "Hey").
+              NOTE: Language-switch requests ("can you speak in English",
+              "please reply in Hindi", "speak English please") are NOT
+              GREETING — they are BUSINESS (score 65) because the AI
+              responded to this customer and they want to continue in a
+              different language. Always classify these as BUSINESS.
   MIXED     — In-scope request wrapped inside friendly chat.
 
 SOCIAL INVITATIONS vs TRANSACTIONS: If the sender is asking the owner to hang \
@@ -136,6 +141,11 @@ FLAGS (independent of intent — set true when applicable):
                  (Post-service advice, technical product questions, detailed
                  complaints needing human judgment. Do not set this for PERSONAL
                  or GREETING — they have their own intents.)
+                 ⚠️ MENU / SERVICE AVAILABILITY is always FAQ (in-scope), NEVER
+                 out_of_scope. Questions like "do you have X?", "do you offer
+                 X?", "do you serve X?", "is X available?" — regardless of
+                 whether X is a dish, drink, service, treatment, or product —
+                 are availability FAQs. Classify as BUSINESS with out_of_scope=false.
 
 Rules:
 - Respond ONLY with valid JSON. No markdown, no explanation outside JSON.
@@ -164,6 +174,22 @@ Output: {"intent": "BUSINESS", "score": 90, "reason": "Customer requesting a res
 
 User: "Hey! Can I get the menu please?"
 Output: {"intent": "BUSINESS", "score": 95, "reason": "Customer inquiring about services",
+         "frustrated": false, "abusive": false, "out_of_scope": false}
+
+User: "do you offer chicken?"
+Output: {"intent": "BUSINESS", "score": 90, "reason": "Menu/service availability FAQ",
+         "frustrated": false, "abusive": false, "out_of_scope": false}
+
+User: "do you have chicken?"
+Output: {"intent": "BUSINESS", "score": 90, "reason": "Menu/service availability FAQ",
+         "frustrated": false, "abusive": false, "out_of_scope": false}
+
+User: "do you serve vegan options?"
+Output: {"intent": "BUSINESS", "score": 90, "reason": "Menu/service availability FAQ",
+         "frustrated": false, "abusive": false, "out_of_scope": false}
+
+User: "is haircut available today?"
+Output: {"intent": "BUSINESS", "score": 90, "reason": "Service availability FAQ",
          "frustrated": false, "abusive": false, "out_of_scope": false}
 
 User: "12pm"   (assistant just asked "what time?")
@@ -212,6 +238,21 @@ Recent context:
 User: "Can i book the table today ?"
 Output: {"intent": "BUSINESS", "score": 95,
          "reason": "Genuine booking request continuing a customer enquiry",
+         "frustrated": false, "abusive": false, "out_of_scope": false}
+
+User: "Can you speak in english"
+Output: {"intent": "BUSINESS", "score": 65,
+         "reason": "Customer asking the AI to switch to English — conversation meta-request, not a bare greeting",
+         "frustrated": false, "abusive": false, "out_of_scope": false}
+
+User: "Please reply in Hindi"
+Output: {"intent": "BUSINESS", "score": 65,
+         "reason": "Customer requesting language switch — treat as business interaction",
+         "frustrated": false, "abusive": false, "out_of_scope": false}
+
+User: "speak english please"
+Output: {"intent": "BUSINESS", "score": 65,
+         "reason": "Language preference request during a customer interaction",
          "frustrated": false, "abusive": false, "out_of_scope": false}
 """
 

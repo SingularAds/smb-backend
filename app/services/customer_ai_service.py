@@ -38,6 +38,48 @@ MAX_HISTORY_MESSAGES = 30  # keep conversation context manageable
 # string of personal messages would spam the owner's WhatsApp.
 SILENT_NOTIFY_COOLDOWN_MINUTES = 15
 
+# Same cooldown for "knowledge gap" notifications (AI replied with uncertainty).
+KB_GAP_NOTIFY_COOLDOWN_MINUTES = 30
+
+# Patterns that indicate the AI lacked specific knowledge to answer fully.
+_UNCERTAIN_REPLY_RE = re.compile(
+    r"not sure|don'?t know|cannot confirm|can'?t confirm|"
+    r"check our website|visit our website|visit us for|"
+    r"please check|check with us|contact us for|reach out to us|"
+    r"give us a call|I don'?t have|unable to confirm|unable to provide|"
+    r"for more (information|details)|specific (information|details)|"
+    r"I'?m not (certain|sure|aware)|I cannot (say|confirm|tell)|"
+    r"I'?m unable|I am unable|not available in|don'?t have (that|this) information",
+    re.IGNORECASE,
+)
+
+# Patterns that indicate the reply is a booking-info-gathering step, not an
+# uncertain FAQ. These override the uncertain detection to avoid false positives.
+_BOOKING_COLLECT_RE = re.compile(
+    r"what time|which time|what date|which date|"
+    r"how many (people|guests|persons|pax)|which service|what service|"
+    r"your name|party size|am or pm",
+    re.IGNORECASE,
+)
+
+
+def _is_uncertain_reply(reply: str) -> bool:
+    """True when the AI's reply signals it lacks specific info to answer fully."""
+    if _BOOKING_COLLECT_RE.search(reply):
+        return False  # it's booking info-gathering, not an uncertain FAQ
+    return bool(_UNCERTAIN_REPLY_RE.search(reply))
+
+
+# Words that signal an unambiguous booking/business intent. Any customer message
+# containing one of these must NEVER be silenced — even if the LLM still returns
+# [SILENT_IGNORE] we force a retry.
+_BOOKING_INTENT_RE = re.compile(
+    r"\b(book|booking|bookings|appointment|appointments|reservation|reservations|"
+    r"reserve|cancel|cancellation|reschedule|rescheduling|available|availability|"
+    r"slot|slots|schedule|scheduled)\b",
+    re.IGNORECASE,
+)
+
 
 # ── Language detection ────────────────────────────────────────────────────────
 # We use langdetect (already in requirements.txt) on the incoming message so
@@ -70,22 +112,39 @@ _LANG_NAMES = {
 def _detect_language(text: str) -> tuple[str, str] | None:
     """Return ``(iso_code, human_name)`` for *text*, or None if undetectable.
 
-    Very short messages (< 3 chars) are not worth classifying — the LLM can
-    fall back to the conversation history. Latin numerals and emoji-only
-    messages return None on purpose so we don't mis-tag them as English.
+    Guards against false positives on short or typo-heavy messages:
+    - Requires either ≥ 35 characters or ≥ 7 words — langdetect needs enough
+      signal to be reliable. Below these thresholds it guesses wildly:
+      "Hello" → Finnish, "Cab we do booking" → Somali.
+    - Uses detect_langs() confidence scoring; only applies the directive when
+      a single language wins with ≥ 90% confidence, preventing a 60/40
+      ambiguous split from injecting a wrong language directive.
+    - Skips non-letter-character-only messages (emoji / digit strings).
+    When detection is skipped the LLM reads the message naturally and picks
+    the right language from context — safer than a bad forced directive.
     """
     if not text:
         return None
     stripped = text.strip()
-    if len(stripped) < 3:
+    if not stripped:
         return None
-    # If the message has zero letter characters (digits / emoji / punctuation
-    # only) langdetect will guess wildly — skip and let history decide.
+    # Must have at least one letter — skip emoji/digit-only messages.
     if not any(ch.isalpha() for ch in stripped):
         return None
+    # Require enough content for reliable detection.
+    word_count = len(stripped.split())
+    if len(stripped) < 35 and word_count < 7:
+        return None
     try:
-        from langdetect import detect  # type: ignore
-        code = detect(stripped).lower()
+        from langdetect import detect_langs  # type: ignore
+        results = detect_langs(stripped)
+        if not results:
+            return None
+        top = results[0]
+        # Skip low-confidence detections — ambiguous text produces noisy codes.
+        if top.prob < 0.90:
+            return None
+        code = str(top.lang).lower()
     except Exception:
         return None
     name = _LANG_NAMES.get(code, code.upper())
@@ -574,6 +633,14 @@ internal keyword:
   [SILENT_IGNORE]
 - Do NOT engage with off-topic or personal messages in any way. Do NOT answer them even partially.
 
+LANGUAGE SWITCH REQUESTS — ALWAYS RESPOND (exception to [SILENT_IGNORE]):
+If the customer asks you to speak in a specific language — e.g. "can you speak in English", \
+"please reply in Hindi", "speak English please", "talk to me in French", "في اللغة العربية من فضلك" \
+— you MUST respond in that language. Do NOT emit [SILENT_IGNORE] for language-switch requests. \
+Reply warmly in the requested language and invite them to continue: e.g. "Of course! How can I \
+help you today?" This is the highest-priority exception — it overrides every other SILENT_IGNORE \
+rule above and below. Language-switch requests always get a response.
+
 PERSONAL-CHAT DETECTION FROM HISTORY — CRITICAL:
 Many business owners share ONE WhatsApp number for personal AND business use.
 You receive the recent conversation history. Use it to detect when the sender
@@ -582,11 +649,9 @@ real customer:
 - If the prior turns are clearly personal (e.g. "let's grab dinner today bro",
   "love you", "miss you", emojis-only banter, family/relationship words,
   no service / time / party size / booking ID ever mentioned), even a
-  business-looking follow-up ("should I book?", "can I book the table
-  today?", "shall we?") is the SAME personal thread continuing — NOT a
-  customer transaction.
-- In that case you MUST reply with exactly:
-  [SILENT_IGNORE]
+  business-looking follow-up like "can you book a table", "should I book?",
+  "shall we?" is the SAME personal thread — NOT a customer transaction.
+  Reply with: [SILENT_IGNORE]
 - Only treat the conversation as BUSINESS when the prior turns themselves
   read like a customer interaction (asking about hours, services, prices,
   or making concrete booking requests with details).
@@ -600,12 +665,23 @@ real customer:
   • Personal messages about family, love, dinner plans, etc. → [SILENT_IGNORE]
   • "How are you?" followed by no business question → [SILENT_IGNORE]
   • "Hi" or "Hello" with nothing else → [SILENT_IGNORE]
+⚠️ BOOKING KEYWORD ABSOLUTE OVERRIDE — NO EXCEPTIONS:
+If the customer's message contains ANY of these words — "book", "booking",
+"appointment", "reservation", "reserve", "cancel", "reschedule", "slot",
+"available", "availability", "schedule" — it is ALWAYS a business request.
+NEVER emit [SILENT_IGNORE] for messages containing these words, regardless of
+how casual or greeting-heavy the message looks. "Hii can you do a booking",
+"hey bro book a table", "hi booking please" — ALL must be handled as real
+customer requests.
+
 - Examples of on-topic messages you MUST handle:
   • "Do you have availability tomorrow?" → handle
   • "What are your prices?" → handle
   • "I want to cancel my booking" → handle
   • "What services do you offer?" → handle
   • "I have a complaint" → handle
+  • "Hii can you do a booking" → handle (contains "booking")
+  • "hi book a table for 2" → handle (contains "book")
 
 BUSINESS INFORMATION:
   Name: {name}
@@ -662,13 +738,13 @@ STANDARD RULES:
 - If you don't know something about the business, say so honestly
 - For cancellations and reschedules, ask the customer to confirm ONCE with a direct question like "Cancel your 3pm appointment on April 27th? Reply CANCEL to confirm."
 
-WORKING HOURS & BACKEND AUTHORITY RULES — ZERO EXCEPTIONS:
-- ⚠️ The backend is the ONLY source of truth for working hours, capacity, and availability.
-- NEVER state or suggest specific working hours from your own knowledge. The ONLY hours you may quote are those returned verbatim inside a backend tool error message.
-- When the backend rejects a booking for being outside working hours, relay the EXACT error text word for word. Do NOT paraphrase, rephrase, or "correct" the hours — the backend is always right.
-- NEVER suggest a time that you think might be within hours. If the backend said we close at 5 PM, do NOT suggest 7 PM, 8 PM, or 9 PM. Only suggest times that are provably earlier than the backend-reported closing time.
-- Example of WRONG behavior: Backend says "Our working hours are 11:30 AM to 5 PM" → You say "hours are 11:30 AM to 9 PM". This is FORBIDDEN.
-- Example of CORRECT behavior: Backend says "Sorry, we are closed at that time. Our working hours are 11:30 AM to 5 PM." → You say exactly that, then ask if they want a time before 5 PM.
+WORKING HOURS & BACKEND AUTHORITY RULES:
+- ⚠️ Working hours are provided in the BUSINESS INFORMATION section above. You MAY quote those hours directly to answer customer questions like "What are your hours?" or "Are you open at 2pm?"
+- When a customer asks about availability for a specific time/date, call get_available_slots to check real-time capacity.
+- If a tool call is REJECTED because of working hours (e.g. backend error: "Sorry, we are closed at that time. Our working hours are 11:30 AM to 5 PM"), relay that error EXACTLY verbatim. Do NOT paraphrase or "correct" it.
+- NEVER suggest a time outside the stated working hours. If hours say 11:30 AM to 5 PM, do NOT suggest 7 PM or 8 PM.
+- Example: Customer asks "Are you open at 8pm?" → You say "No, we close at 5pm. Would you like to book before then?"
+- Example: Customer asks "Can you check the calendar for tomorrow?" → Call get_available_slots to show actual slots.
 
 REPLY COMPOSITION RULES — NO MIXED MESSAGES:
 - NEVER write "Perfect! Let me book..." or any optimistic confirmation language before you have called the booking tool and received its result.
@@ -695,7 +771,13 @@ BOOKING OPERATIONS — ZERO TOLERANCE RULES (no exceptions, ever):
   • Date: Must be a specific day (today, tomorrow, a specific date), NOT vague ("sometime next week")
   • Time: MUST be explicit (2pm, 14:00, 2:30pm) — NEVER assume if the customer says only a time without AM/PM
   • Party size: Ask if not provided; default to 1 if customer doesn't specify
-- CONFIRMATION MESSAGE FORMAT: After a successful booking tool call, confirm with a warm, structured message that includes: service name, date & time, party size, booking ID from the tool result{location_hint}. Keep it concise and friendly — this is WhatsApp. Example: "✅ All set! Here are your booking details:\n📋 *Service:* Table Booking\n📅 *When:* May 27 at 2:00 PM\n👥 *Party:* 2 people\n🆔 *Booking ID:* BK515E53{location_example}\n\nSee you then! 😊"
+- CONFIRMATION MESSAGE FORMAT: After a successful booking tool call, confirm with a warm, structured message that includes: service name, date & time, party size, booking ID from the tool result{location_hint}. Keep it concise and friendly — this is WhatsApp. Example (English): "✅ All set! Here are your booking details:\n📋 *Service:* Table Booking\n📅 *When:* May 27 at 2:00 PM\n👥 *Party:* 2 people\n🆔 *Booking ID:* BK515E53{location_example}\n\nSee you then! 😊"
+- ⚠️ CONFIRMATION LANGUAGE — ZERO TOLERANCE: The ENTIRE confirmation message MUST be in the SAME language as the customer's last message (the language fixed by the LANGUAGE — STRICTEST RULE directive below). This applies to:
+  • Every label (e.g. "All set!", "Service:", "When:", "Party:", "Booking ID:", "Location:")
+  • The date and time wording (e.g. natural English "May 27 at 2:00 PM" — do NOT auto-translate into another language like Finnish "20. kesäkuuta klo 14:00", Portuguese, Spanish, etc.)
+  • The party-size word ("people", not "henkilöä"/"personas"/"pessoas" unless that IS the conversation language)
+  • The closing sign-off (e.g. "See you then! 😊" in English — do NOT switch to "Nähdään silloin!", "Te esperamos!", etc.)
+- The ONLY field that may stay in its original language is the *service name* returned by the tool (it is a proper noun configured by the business). Everything else MUST follow the conversation language. NEVER mix languages in the confirmation message.
 
 BOOKING ID RULES — MANDATORY ZERO-TOLERANCE:
 - ⚠️ CRITICAL: When the customer sends or mentions ANY booking ID (pattern: BK + alphanumeric, e.g. BKD68B36, BK515E53), you MUST call check_booking FIRST — before ANY other action.
@@ -760,10 +842,18 @@ class CustomerAIService:
                 customer_phone=phone_clean,
                 event="message_received",
                 properties={
-                    "voice_mode":   voice_mode,
-                    "message_len":  len(body or ""),
-                    "device_id":    device_id,
+                    "voice_mode":    voice_mode,
+                    "message_len":   len(body or ""),
+                    "device_id":     device_id,
                     "has_push_name": bool(push_name),
+                },
+                person_properties={
+                    "business_id":   business_id,
+                    "business_name": business.get("name") or biz_name,
+                    "business_type": biz_type,
+                    "plan":          business.get("plan", ""),
+                    "customer_name": push_name or "",
+                    "language":      business.get("primaryLanguage", "en"),
                 },
             )
         except Exception:
@@ -1074,26 +1164,34 @@ class CustomerAIService:
                     )
 
             label = f"{push_name} (+{phone_clean.lstrip('+')})" if push_name else f"+{phone_clean.lstrip('+')}"
-            notification = (
+            _oos_msg1 = (
                 f"\U0001f4cb *Out-of-scope message* from {label}:\n\n"
                 f"> {body[:200]}\n\n"
                 f"Please respond manually \u2014 AI did not reply.\n"
                 f"_(AI is still active for their next booking message)_"
             )
+            _oos_msgs = [_oos_msg1]
             if kb_entry is not None:
                 code = kb_entry["shortCode"]
-                notification += (
-                    "\n\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-                    "\U0001f9e0 *Save this answer for future customers?*\n\n"
-                    "\u2705 *To save* \u2014 reply with:\n"
-                    f"*YES {code}* <your answer>\n"
-                    f"_Example: YES {code} Yes, we have it_\n\n"
-                    "\u274c *To skip* \u2014 reply with:\n"
-                    f"*NO {code}*\n\n"
-                    "_(expires in 7 days)_"
+                _oos_msgs.append(
+                    f"\U0001f9e0 *Save YES answer* (copy, edit & send):\n\n"
+                    f"YES {code} <your answer here>\n"
+                    f"_Example: YES {code} Yes, we have it_ _(expires 7 days)_"
+                )
+                _oos_msgs.append(
+                    f"\u274c *Skip* (copy & send):\n\n"
+                    f"NO {code}"
                 )
             try:
-                await whatsapp_notifier.send_to_owner(business, notification)
+                import asyncio as _asyncio_oos
+                async def _send_oos_notifications():
+                    for _m in _oos_msgs:
+                        try:
+                            await whatsapp_notifier.send_to_owner(business, _m)
+                            await _asyncio_oos.sleep(0.5)
+                        except Exception as _e:
+                            logger.warning("[KB] oos notify part failed business=%s: %s", business_id, _e)
+                _asyncio_oos.create_task(_send_oos_notifications())
             except Exception as exc:
                 logger.warning(
                     "[KB] could not notify owner of out_of_scope business=%s: %s",
@@ -1183,6 +1281,23 @@ class CustomerAIService:
                 "voice note. Avoid markdown formatting, bullet lists, or "
                 "symbols that don't sound natural when read aloud."
             )
+
+        # Detect booking keyword BEFORE first LLM call so we can inject a
+        # hard override and also use the flag in the post-call fallback.
+        _has_booking_keyword = bool(_BOOKING_INTENT_RE.search(body))
+        # Only inject the hard override when the intent classifier ALSO
+        # confirmed this is a genuine business request (BUSINESS intent).
+        # MIXED/PERSONAL with booking words (e.g. wife saying "can you book
+        # a table, we're having dinner") must stay silent — the classifier
+        # already handles that distinction correctly.
+        _is_confirmed_booking = _has_booking_keyword and classification.intent == Intent.BUSINESS
+        if _is_confirmed_booking:
+            context_note += (
+                "\n\n⚠️ CONFIRMED BUSINESS BOOKING REQUEST:\n"
+                "The intent classifier confirmed this is a genuine customer "
+                "booking request (BUSINESS intent). You MUST respond. "
+                "[SILENT_IGNORE] is forbidden for this message."
+            )
         full_system = f"{system_prompt}\n\n{context_note}"
 
         ai_trace_meta = {
@@ -1208,33 +1323,37 @@ class CustomerAIService:
         )
 
         if reply.strip() == "[SILENT_IGNORE]":
-            # High-confidence BUSINESS intent: the intent classifier is more
-            # reliable than the AI's history-based personal-chat heuristic here.
-            # The customer may have started with personal chat but their latest
-            # message is a clear booking request. Strip the personal noise from
-            # history and retry so the AI responds to the actual request.
+            # Override whenever the classifier said BUSINESS (any score) and
+            # there are no personal-relationship markers in the history.
+            # The score threshold (≥ 80) was too strict — a BUSINESS score of
+            # 65 is still a confirmed business signal (e.g. language-switch
+            # requests like "can you speak in english").
+            # MIXED/PERSONAL intents are not overridden — the classifier is the
+            # authoritative signal for the personal-chat / social-invite cases.
             if (
-                classification.intent == Intent.BUSINESS
-                and classification.score >= 80
-                and not _has_personal_relationship_markers(history[:-1])
-            ):
-                logger.info(
-                    "[SILENT_IGNORE-OVERRIDE] business=%s phone=%s score=%d — retrying "
-                    "without personal history context",
-                    business_id, phone_clean, classification.score,
+                _is_confirmed_booking
+                or (
+                    classification.intent == Intent.BUSINESS
+                    and not _has_personal_relationship_markers(history[:-1])
                 )
+            ):
+                _override_reason = "confirmed_booking_keyword" if _is_confirmed_booking else f"classifier BUSINESS score={classification.score}"
+                logger.info(
+                    "[SILENT_IGNORE-OVERRIDE] business=%s phone=%s reason=%r — retrying "
+                    "without personal history context",
+                    business_id, phone_clean, _override_reason,
+                )
+                # Strip history down to business-only turns and retry.
                 business_history = [
-                    m for m in history[:-1]  # exclude current user turn (re-added below)
-                    if m.get("role") == "assistant"  # keep AI turns (they're business replies)
+                    m for m in history[:-1]
+                    if m.get("role") == "assistant"
                     or _looks_like_business_message(m.get("content", ""))
                 ]
                 business_history.append({"role": "user", "content": body})
                 override_system = (
                     f"{system_prompt}\n\n{context_note}\n\n"
-                    "IMPORTANT OVERRIDE: The intent classifier has determined with HIGH "
-                    "CONFIDENCE that the customer's latest message is a genuine business "
-                    "request. Respond to it as a real customer inquiry — do NOT return "
-                    "[SILENT_IGNORE] for this message."
+                    "MANDATORY: The customer is making a business/booking request. "
+                    "You MUST respond. [SILENT_IGNORE] is not permitted here."
                 )
                 _override_meta = dict(ai_trace_meta)
                 _override_meta["name"] = "customer_ai_reply_silent_override"
@@ -1245,6 +1364,25 @@ class CustomerAIService:
                     customer_phone=phone_clean,
                     push_name=push_name,
                     trace_metadata=_override_meta,
+                )
+
+            # Absolute last resort: classifier said BUSINESS + booking keyword
+            # but LLM still returns [SILENT_IGNORE] after the override retry.
+            # Use a generic booking starter — a confirmed customer booking
+            # request must never be silently dropped.
+            if reply.strip() == "[SILENT_IGNORE]" and _is_confirmed_booking:
+                _biz_name = business.get("name") or biz_name or "us"
+                reply = (
+                    f"Hi! I'd love to help you with your booking at {_biz_name}. "
+                    f"Could you please let me know:\n"
+                    f"• What service would you like to book?\n"
+                    f"• Your preferred date and time?\n"
+                    f"• Your name?"
+                )
+                logger.info(
+                    "[SILENT_IGNORE-FALLBACK] booking keyword detected — using default "
+                    "booking opener for business=%s phone=%s",
+                    business_id, phone_clean,
                 )
 
             if reply.strip() == "[SILENT_IGNORE]":
@@ -1321,6 +1459,96 @@ class CustomerAIService:
             "businessId": business_id,
             "lastMessageAt": datetime.utcnow().isoformat(),
         })
+
+        # ── Knowledge gap: AI replied with uncertainty → notify owner ────────
+        # The AI tried to answer but signalled it lacks the specific info.
+        # Owner is notified so they can: (a) reply manually to the customer,
+        # and (b) save the confirmed answer to the KB so future customers get
+        # an instant, confident reply.
+        if (
+            classification.intent == Intent.BUSINESS
+            and not classification.out_of_scope
+            and _is_uncertain_reply(reply)
+        ):
+            _gap_conv = convo or {}
+            _gap_last_iso = _gap_conv.get("lastKbGapNotifiedAt")
+            _gap_notify = True
+            if _gap_last_iso:
+                try:
+                    from datetime import timedelta as _td_gap
+                    _gap_last_dt = datetime.fromisoformat(_gap_last_iso)
+                    if datetime.utcnow() - _gap_last_dt < _td_gap(minutes=KB_GAP_NOTIFY_COOLDOWN_MINUTES):
+                        _gap_notify = False
+                except (ValueError, TypeError):
+                    pass
+
+            if _gap_notify:
+                _gap_entry: dict | None = None
+                try:
+                    _gap_entry = kb_service.create_pending_entry(
+                        business_id=business_id,
+                        question=body,
+                        customer_phone=phone_clean,
+                        message_id=message_id or "",
+                        intent=classification.intent.value,
+                    )
+                except Exception as _gap_exc:
+                    logger.warning("[KB-GAP] capture failed business=%s: %s", business_id, _gap_exc)
+
+                _gap_name = (push_name or "").strip()
+                _gap_label = f"{_gap_name} (+{phone_clean})" if _gap_name else f"+{phone_clean}"
+                _gap_snippet = body.strip()[:200]
+                _gap_reply_snip = reply.strip()[:120]
+
+                _gap_msgs = [
+                    f"🤔 *I couldn't fully answer {_gap_label}:*\n\n"
+                    f"> {_gap_snippet}\n\n"
+                    f"I replied: _\"{_gap_reply_snip}\"_\n\n"
+                    f"Reply in their chat manually, then save the right answer 👇"
+                ]
+                if _gap_entry is not None:
+                    _gap_code = _gap_entry["shortCode"]
+                    _gap_msgs.append(
+                        f"\U0001f9e0 *Save YES answer* (copy, edit & send):\n\n"
+                        f"YES {_gap_code} <your answer here>\n"
+                        f"_Example: YES {_gap_code} Yes, we have chicken biryani!_ _(expires 7 days)_"
+                    )
+                    _gap_msgs.append(
+                        f"❌ *Skip* (copy & send):\n\n"
+                        f"NO {_gap_code}"
+                    )
+
+                import asyncio as _asyncio_gap
+                async def _send_gap_notifications(_msgs=_gap_msgs):
+                    for _m in _msgs:
+                        try:
+                            await whatsapp_notifier.send_to_owner(business, _m)
+                            await _asyncio_gap.sleep(0.5)
+                        except Exception as _e:
+                            logger.warning("[KB-GAP] notify part failed: %s", _e)
+                _asyncio_gap.create_task(_send_gap_notifications())
+
+                try:
+                    db.upsert_customer_conversation(business_id, phone_clean, {
+                        "lastKbGapNotifiedAt": datetime.utcnow().isoformat(),
+                    })
+                except Exception:
+                    pass
+
+                try:
+                    posthog_client.capture(
+                        business_id=business_id,
+                        customer_phone=phone_clean,
+                        event="ai_kb_gap",
+                        properties={
+                            "intent": classification.intent.value,
+                            "question_len": len(body or ""),
+                            "has_kb_entry": _gap_entry is not None,
+                            "short_code": (_gap_entry or {}).get("shortCode"),
+                        },
+                    )
+                except Exception:
+                    pass
 
         # Send reply — text or voice note depending on voice_mode
         await self._deliver_reply(reply_to, reply, device_id, voice_mode, _voice_id, _voice_lang)
@@ -1747,7 +1975,23 @@ class CustomerAIService:
                     "specialRequests": tool_input.get("specialRequests", ""),
                     "source": "whatsapp",
                 }
-                return vapi_service.tool_create_booking(args, call_info)
+                result = vapi_service.tool_create_booking(args, call_info)
+                if "booking_id=" in result or "capacity_ok" in result:
+                    try:
+                        posthog_client.capture(
+                            business_id=business_id,
+                            customer_phone=customer_phone,
+                            event="booking_created",
+                            properties={
+                                "service": args.get("serviceName"),
+                                "date_time": args.get("dateTime"),
+                                "party_size": args.get("partySize", 1),
+                                "source": "whatsapp",
+                            },
+                        )
+                    except Exception:
+                        pass
+                return result
 
             elif tool_name == "get_available_slots":
                 args = {
@@ -1827,6 +2071,15 @@ class CustomerAIService:
                     return f"Error: {payload['error']}"
                 logger.info("[TOOL_RESULT] cancel_booking OK bookingId=%s", booking_id)
                 try:
+                    posthog_client.capture(
+                        business_id=business_id,
+                        customer_phone=customer_phone,
+                        event="booking_cancelled",
+                        properties={"booking_id": booking_id, "source": "whatsapp"},
+                    )
+                except Exception:
+                    pass
+                try:
                     import asyncio as _asyncio
                     from app.services.automation.booking_automation import send_cancellation_notice
                     from app.services.automation.whatsapp_notifier import send_to_owner
@@ -1876,6 +2129,19 @@ class CustomerAIService:
                     logger.warning("[TOOL_RESULT] reschedule_booking error: %s", payload['error'])
                     return f"Error: {payload['error']}"
                 logger.info("[TOOL_RESULT] reschedule_booking OK bookingId=%s newDT=%s", booking_id, tool_input.get('newDateTime'))
+                try:
+                    posthog_client.capture(
+                        business_id=business_id,
+                        customer_phone=customer_phone,
+                        event="booking_rescheduled",
+                        properties={
+                            "booking_id": booking_id,
+                            "new_date_time": tool_input.get("newDateTime"),
+                            "source": "whatsapp",
+                        },
+                    )
+                except Exception:
+                    pass
                 updated_bk = payload.get("booking") or {}
                 try:
                     import asyncio as _asyncio
