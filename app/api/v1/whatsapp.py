@@ -848,21 +848,19 @@ async def _process_webhook(payload: dict) -> None:
                                 detail=f"customer AI reply via device {device_id!r}",
                             )
             else:
-                # Fallback: no business found for this device — send holding message
-                logger.warning("No business found for device_id %s", device_id)
-                fallback_reply = (
-                    "👋 Hello! Thanks for reaching out.\n"
-                    "We'll be right with you — please hold on a moment!"
+                # No business linked to this device — stay silent.
+                # The biz-* device may still be used by the owner for personal
+                # chats (shared WhatsApp account), so sending any auto-reply
+                # would leak into private conversations with friends/family.
+                logger.warning(
+                    "No business found for device_id %s — skipping auto-reply (chat=%s)",
+                    device_id, phone,
                 )
-                try:
-                    await _wa.send_message(phone, fallback_reply, device_id=_wa.default_device_id)
-                except Exception as exc:
-                    logger.warning("Could not send fallback reply: %s", exc)
                 _log_event(
                     "processed",
                     phone=phone,
                     message_id=message_id,
-                    detail=f"fallback reply (no business) via device {device_id!r}",
+                    detail=f"no business linked to device {device_id!r} — silent skip",
                 )
             return
 

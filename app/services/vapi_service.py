@@ -1272,7 +1272,7 @@ def reschedule_booking_payload(args: dict[str, Any], call_info: dict) -> dict[st
     }
 
 
-def cancel_booking_payload(args: dict[str, Any], call_info: dict) -> dict[str, Any]:
+def cancel_booking_payload(args: dict[str, Any], call_info: dict, *, skip_whatsapp: bool = False) -> dict[str, Any]:
     business = _resolve_business(args, call_info)
     if not business:
         return {"error": "Business not found"}
@@ -1388,27 +1388,28 @@ def cancel_booking_payload(args: dict[str, Any], call_info: dict) -> dict[str, A
             owner_phone, booking_id, _sms_owner_err, exc_info=True
         )
 
-    # Customer WhatsApp cancellation notification
-    try:
-        from app.services.automation.booking_automation import send_cancellation_notice
-        asyncio.get_event_loop().create_task(send_cancellation_notice(updated, business))
-    except Exception as _wa_cancel_err:
-        logger.warning("[WhatsApp] Customer cancellation notification skipped: %s", _wa_cancel_err)
+    if not skip_whatsapp:
+        # Customer WhatsApp cancellation notification
+        try:
+            from app.services.automation.booking_automation import send_cancellation_notice
+            asyncio.get_event_loop().create_task(send_cancellation_notice(updated, business))
+        except Exception as _wa_cancel_err:
+            logger.warning("[WhatsApp] Customer cancellation notification skipped: %s", _wa_cancel_err)
 
-    # Owner WhatsApp notification
-    try:
-        from app.services.automation.whatsapp_notifier import send_to_owner
-        asyncio.get_event_loop().create_task(send_to_owner(
-            business,
-            f"❌ *Booking cancelled*\n"
-            f"Customer: {customer_name_str}\n"
-            f"Phone: {customer_phone_str}\n"
-            f"Service: {service_name_str}\n"
-            f"Was: {formatted_cancel_dt}\n"
-            f"Booking ID: {booking_id}",
-        ))
-    except Exception as _notify_err:
-        logger.warning("[Booking] Cancel owner notification skipped: %s", _notify_err)
+        # Owner WhatsApp notification
+        try:
+            from app.services.automation.whatsapp_notifier import send_to_owner
+            asyncio.get_event_loop().create_task(send_to_owner(
+                business,
+                f"❌ *Booking cancelled*\n"
+                f"Customer: {customer_name_str}\n"
+                f"Phone: {customer_phone_str}\n"
+                f"Service: {service_name_str}\n"
+                f"Was: {formatted_cancel_dt}\n"
+                f"Booking ID: {booking_id}",
+            ))
+        except Exception as _notify_err:
+            logger.warning("[Booking] Cancel owner notification skipped: %s", _notify_err)
 
     return {
         "businessId": business["id"],

@@ -780,13 +780,14 @@ BOOKING OPERATIONS — ZERO TOLERANCE RULES (no exceptions, ever):
 - The ONLY field that may stay in its original language is the *service name* returned by the tool (it is a proper noun configured by the business). Everything else MUST follow the conversation language. NEVER mix languages in the confirmation message.
 
 BOOKING ID RULES — MANDATORY ZERO-TOLERANCE:
-- ⚠️ CRITICAL: When the customer sends or mentions ANY booking ID (pattern: BK + alphanumeric, e.g. BKD68B36, BK515E53), you MUST call check_booking FIRST — before ANY other action.
-- NEVER call update_booking, cancel_booking, or reschedule_booking based on a booking ID without first calling check_booking to verify the booking exists and retrieve its details.
-- Even if the customer explicitly says "cancel my booking BKD68B36" or "reschedule BKD68B36" — you MUST call check_booking first, show the customer the booking details, and THEN perform the requested action.
+- ⚠️ CRITICAL: Before ANY cancel, reschedule, or update operation, you MUST call check_booking FIRST — no exceptions, even if you believe you already know the booking ID.
+- This applies whether the customer mentions an ID in their current message OR the ID appears anywhere in the conversation history (e.g. in a previous confirmation you sent). NEVER use a booking ID from history without verifying it via check_booking first — IDs in history may be incorrect.
+- Even if the customer explicitly says "cancel my booking BKD68B36" or "reschedule BKD68B36" — you MUST call check_booking first, verify the booking exists, and THEN perform the requested action.
+- If the customer says "reschedule my booking" or "cancel my booking" WITHOUT providing a booking ID in their current message, call check_booking with NO bookingId parameter — the system will look up by their phone number.
 - If the customer ONLY sends a booking ID (e.g. "BKD68B36" or "BKD68B36\nThis is my booking id") with NO explicit action — call check_booking ONLY. Show the booking details. Do NOT assume they want to update, cancel, or reschedule anything.
 - NEVER carry forward party size, service name, date, or time from earlier in the conversation when the customer shares a booking ID. Every operation must use ONLY what the customer explicitly provides in their current message. Previous conversation context is NOT a valid source of booking parameters.
 - If check_booking returns "No active bookings found", tell the customer the booking ID was not found in the current business system. Do NOT suggest it might be from another business or offer to create a new one immediately — ask if they have the correct booking ID.
-- NEVER guess or assume a booking ID from context. Booking IDs are only valid when explicitly provided by the customer in their current message or returned by a tool call.
+- NEVER guess or assume a booking ID from context. The ONLY valid source for a booking ID is: (a) the customer typing it explicitly in their current message, or (b) a tool result returned in this turn.
 """
     # Append owner-approved KB section when entries are provided
     if kb_entries:
@@ -1174,12 +1175,15 @@ class CustomerAIService:
             if kb_entry is not None:
                 code = kb_entry["shortCode"]
                 _oos_msgs.append(
-                    f"\U0001f9e0 *Save YES answer* (copy, edit & send):\n\n"
-                    f"YES {code} <your answer here>\n"
+                    f"\U0001f9e0 *Save YES answer* (copy, edit & send):\n\n")
+                _oos_msgs.append(
+                    f"YES {code} <your answer here>\n")
+                _oos_msgs.append(
                     f"_Example: YES {code} Yes, we have it_ _(expires 7 days)_"
                 )
                 _oos_msgs.append(
-                    f"\u274c *Skip* (copy & send):\n\n"
+                    f"\u274c *Skip* (copy & send):\n\n")
+                _oos_msgs.append(
                     f"NO {code}"
                 )
             try:
@@ -1505,16 +1509,20 @@ class CustomerAIService:
                     f"> {_gap_snippet}\n\n"
                     f"I replied: _\"{_gap_reply_snip}\"_\n\n"
                     f"Reply in their chat manually, then save the right answer 👇"
+                     f"\U0001f9e0 *Save YES answer* (copy, edit & send):\n\n"
                 ]
                 if _gap_entry is not None:
                     _gap_code = _gap_entry["shortCode"]
                     _gap_msgs.append(
-                        f"\U0001f9e0 *Save YES answer* (copy, edit & send):\n\n"
                         f"YES {_gap_code} <your answer here>\n"
-                        f"_Example: YES {_gap_code} Yes, we have chicken biryani!_ _(expires 7 days)_"
+                        )
+                    _gap_msgs.append(
+                       f"_Example: YES {_gap_code} Yes, we have chicken biryani!_ _(expires 7 days)_"
                     )
                     _gap_msgs.append(
                         f"❌ *Skip* (copy & send):\n\n"
+                    )
+                    _gap_msgs.append(
                         f"NO {_gap_code}"
                     )
 
@@ -1783,16 +1791,25 @@ class CustomerAIService:
             # Map: (action phrases) → (required tools)
             _action_checks = [
                 (
-                    # Booking created / confirmed
+                    # Phrases that ONLY make sense when a NEW booking was just created
                     [
-                        "booking confirmed", "reservation confirmed",
-                        "your table has been booked", "your table is confirmed",
+                        "your table has been booked",
                         "reservation successfully created", "booking successfully created",
-                        "booking is confirmed", "reservation is confirmed",
                         "successfully booked", "i've booked", "i have booked",
-                        "your booking id", "booking id:", "booking id =",
                     ],
                     {"create_booking"},
+                ),
+                (
+                    # Phrases that describe booking status — valid after ANY booking
+                    # action tool (create, check, reschedule, cancel, update).
+                    # "booking id:" appears in reschedule/cancel confirmations too.
+                    [
+                        "booking confirmed", "reservation confirmed",
+                        "your table is confirmed",
+                        "booking is confirmed", "reservation is confirmed",
+                        "your booking id", "booking id:", "booking id =",
+                    ],
+                    {"create_booking", "check_booking", "reschedule_booking", "cancel_booking", "update_booking"},
                 ),
                 (
                     # Booking cancelled
@@ -1850,7 +1867,30 @@ class CustomerAIService:
                     customer_phone=customer_phone,
                     push_name=push_name,
                 )
-            
+
+            # ── BOOKING ID CORRECTION ────────────────────────────────────────
+            # The LLM sometimes garbles the booking ID when composing the
+            # confirmation message (e.g. BK4B84D2 → BK484D2).  After any
+            # create_booking / reschedule_booking call, extract the authoritative
+            # ID from the tool result and patch any BK-pattern in the reply.
+            _bk_pattern = re.compile(r"\bBK[A-Z0-9]{4,10}\b")
+            _true_ids: list[str] = []
+            for _tr in tool_results:
+                if _tr["name"] in ("create_booking", "reschedule_booking"):
+                    _m = _bk_pattern.search(_tr["result"] or "")
+                    if _m:
+                        _true_ids.append(_m.group())
+
+            if _true_ids:
+                _true_id = _true_ids[0]
+                _reply_ids = _bk_pattern.findall(final_reply)
+                if _reply_ids and _reply_ids[0] != _true_id:
+                    logger.warning(
+                        "[BOOKING-ID-CORRECTION] customer=%s: reply had %s, correcting to %s",
+                        customer_phone, _reply_ids[0], _true_id,
+                    )
+                    final_reply = _bk_pattern.sub(_true_id, final_reply)
+
             try:
                 print("AI (customer) generated reply:", final_reply)
                 logger.debug("AI (customer) generated reply: %s", final_reply)
@@ -2030,13 +2070,34 @@ class CustomerAIService:
                 active = [b for b in all_bookings if (b.get("status") or "").lower() != "cancelled"]
                 if not active:
                     return "No active bookings found for this customer."
+
+                # Firestore stores booking datetimes in UTC (e.g. "2026-06-19T11:30:00+00:00").
+                # We must convert to the business's local timezone before formatting,
+                # otherwise the AI tells customers the wrong time (e.g. shows 11:30 AM
+                # when the booking is actually at 5:00 PM IST).
+                biz_tz = None
+                try:
+                    import pytz
+                    biz_tz = pytz.timezone(business.get("timezone") or "UTC")
+                except Exception:
+                    biz_tz = None
+
                 result = []
                 for b in active:
                     dt_raw = b.get("datetime") or b.get("dateTime") or ""
-                    try:
-                        dt_fmt = datetime.fromisoformat(str(dt_raw)).strftime("%Y-%m-%d %I:%M %p") if dt_raw else dt_raw
-                    except ValueError:
-                        dt_fmt = dt_raw
+                    dt_fmt = dt_raw
+                    if dt_raw:
+                        try:
+                            dt_obj = datetime.fromisoformat(str(dt_raw))
+                            if biz_tz is not None:
+                                if dt_obj.tzinfo is None:
+                                    # Naive datetime — assume UTC (matches Firestore convention)
+                                    import pytz as _pytz
+                                    dt_obj = _pytz.utc.localize(dt_obj)
+                                dt_obj = dt_obj.astimezone(biz_tz)
+                            dt_fmt = dt_obj.strftime("%Y-%m-%d %I:%M %p")
+                        except (ValueError, TypeError):
+                            dt_fmt = dt_raw
                     result.append({
                         "bookingId": b.get("id"),
                         "service": b.get("serviceName"),
@@ -2065,10 +2126,32 @@ class CustomerAIService:
                     "bookingId": booking_id,
                     "customerPhone": customer_phone,
                 }
-                payload = vapi_service.cancel_booking_payload(args, call_info)
+                payload = vapi_service.cancel_booking_payload(args, call_info, skip_whatsapp=True)
                 if payload.get("error"):
-                    logger.warning("[TOOL_RESULT] cancel_booking error: %s", payload['error'])
-                    return f"Error: {payload['error']}"
+                    error_msg = payload["error"]
+                    if "not found" in error_msg.lower() and booking_id:
+                        logger.warning(
+                            "[TOOL_RESULT] cancel_booking ID %s not found — falling back to phone lookup for customer=%s",
+                            booking_id, customer_phone,
+                        )
+                        fallback_id = self._resolve_booking_id(
+                            business_id=business_id,
+                            customer_phone=customer_phone,
+                            service_hint=(tool_input.get("serviceName") or "").strip(),
+                            time_hint=(tool_input.get("currentDateTime") or "").strip(),
+                            call_info=call_info,
+                        )
+                        if not (fallback_id.startswith("Error:") or fallback_id.startswith("Ambiguous:")):
+                            logger.info(
+                                "[TOOL_RESULT] cancel_booking fallback resolved %s → %s",
+                                booking_id, fallback_id,
+                            )
+                            args["bookingId"] = fallback_id
+                            booking_id = fallback_id
+                            payload = vapi_service.cancel_booking_payload(args, call_info, skip_whatsapp=True)
+                    if payload.get("error"):
+                        logger.warning("[TOOL_RESULT] cancel_booking error: %s", payload['error'])
+                        return f"Error: {payload['error']}"
                 logger.info("[TOOL_RESULT] cancel_booking OK bookingId=%s", booking_id)
                 try:
                     posthog_client.capture(
@@ -2126,8 +2209,32 @@ class CustomerAIService:
                 }
                 payload = vapi_service.reschedule_booking_payload(args, call_info)
                 if payload.get("error"):
-                    logger.warning("[TOOL_RESULT] reschedule_booking error: %s", payload['error'])
-                    return f"Error: {payload['error']}"
+                    # If the provided ID was not found, fall back to phone-based lookup.
+                    # This handles cases where the AI carries a garbled ID from history.
+                    error_msg = payload["error"]
+                    if "not found" in error_msg.lower() and booking_id:
+                        logger.warning(
+                            "[TOOL_RESULT] reschedule_booking ID %s not found — falling back to phone lookup for customer=%s",
+                            booking_id, customer_phone,
+                        )
+                        fallback_id = self._resolve_booking_id(
+                            business_id=business_id,
+                            customer_phone=customer_phone,
+                            service_hint=(tool_input.get("serviceName") or "").strip(),
+                            time_hint=(tool_input.get("currentDateTime") or "").strip(),
+                            call_info=call_info,
+                        )
+                        if not (fallback_id.startswith("Error:") or fallback_id.startswith("Ambiguous:")):
+                            logger.info(
+                                "[TOOL_RESULT] reschedule_booking fallback resolved %s → %s",
+                                booking_id, fallback_id,
+                            )
+                            booking_id = fallback_id  # keep local var in sync for notifications/result
+                            args["bookingId"] = booking_id
+                            payload = vapi_service.reschedule_booking_payload(args, call_info)
+                    if payload.get("error"):
+                        logger.warning("[TOOL_RESULT] reschedule_booking error: %s", payload['error'])
+                        return f"Error: {payload['error']}"
                 logger.info("[TOOL_RESULT] reschedule_booking OK bookingId=%s newDT=%s", booking_id, tool_input.get('newDateTime'))
                 try:
                     posthog_client.capture(
@@ -2169,7 +2276,7 @@ class CustomerAIService:
                     ))
                 except Exception as _notify_err:
                     logger.warning("Reschedule owner notification skipped: %s", _notify_err)
-                return "Booking rescheduled successfully."
+                return f"Booking rescheduled successfully. booking_id={booking_id}"
 
             elif tool_name == "update_booking":
                 args: dict[str, Any] = {
