@@ -30,7 +30,7 @@ from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
 from app.config import settings
 from app import firestore as db
 from app.integrations import posthog_client
-from app.services.whatsmeow_client import PairingStateConflict, WhatsmeowClient
+from app.services.whatsmeow_client import PairingStateConflict, ReachoutTimelocked, WhatsmeowClient
 from app.services.ai_service import AIService
 from app.services.onboarding_plan_info import (
     build_plan_info_for_tool,
@@ -2554,10 +2554,16 @@ class OnboardingService:
         session["refereeDiscountPercent"] = 10
 
         msg = (
-            "Here’s where it gets fun 🤑 Imagine every happy customer quietly bringing you new ones — while you sleep 😴 "
-            "Turn on referrals and they do exactly that. Friend refers a friend → both get a little discount → "
-            "your client list just keeps growing 📈 It runs on its own. You just watch it happen ✨ "
-            "Switch it on? (yes/no) Default: 25% off for the referrer, 10% for the newcomer — change it anytime 👍"
+            "Here’s where it gets fun 🤑\n\n"
+            "Imagine every happy customer quietly bringing you new ones — while you sleep 😴\n\n"
+            "Turn on referrals and they do exactly that:\n"
+            "Friend refers a friend → both get a little discount → your client list keeps growing 📈\n\n"
+            "It runs itself. You just watch it happen ✨\n\n"
+            "*Switch it on?* Reply *yes* or *no*\n\n"
+            "Default discounts:\n"
+            "• 25% off for the referrer\n"
+            "• 10% off for the newcomer\n"
+            "(You can change these anytime 👍)"
         )
         msg = await self._localize_static(
             msg,
@@ -4597,8 +4603,9 @@ class OnboardingService:
                         await self._send(
                             phone,
                             "🤔 I don't see WhatsApp linked yet.\n\n"
-                            "Make sure you've entered the code in WhatsApp → "
-                            "Settings → Linked Devices, then reply *done* again.\n\n"
+                            "Make sure you've entered the code in:\n"
+                            "WhatsApp → Settings → Linked Devices\n\n"
+                            "Then reply *done* again.\n\n"
                             "Need a fresh code? Reply *new code*.",
                         )
                         return
@@ -4609,7 +4616,7 @@ class OnboardingService:
                     )
 
             msg = (
-                "🎉 Connected! We’re officially a team now 🤝 "
+                "🎉 Connected! We’re officially a team now 🤝\n\n"
                 "From this moment, no customer slips through the cracks 💪"
             )
             msg = await self._localize_static(msg, "", session.get("language", "en"))
@@ -4652,7 +4659,7 @@ class OnboardingService:
                 })
                 await self._send(
                     phone,
-                    "👍 No problem — your AI receptionist is still active.\n"
+                    "👍 No problem — your AI receptionist is still active.\n\n"
                     "Reply *reconnect whatsapp* whenever you're ready to link your device.",
                 )
                 return
@@ -4673,8 +4680,10 @@ class OnboardingService:
         await self._send(
             phone,
             "Copy the code above ☝🏼 and paste it on the screen you opened.\n"
-            "⏱ 60 seconds\n\n"
-            "Reply *done* when linked, *new code* for a fresh code, or *skip* to do it later.",
+            "⏱ You have 60 seconds before it expires.\n\n"
+            "Reply *done* when linked\n"
+            "Reply *new code* for a fresh code\n"
+            "Reply *skip* to do it later",
         )
 
     # ── QR / pairing-mode helpers ─────────────────────────────────────────
@@ -4922,9 +4931,10 @@ class OnboardingService:
 
             await self._send(
                 phone,
-                "🤔 I don't see the WhatsApp link yet. "
-                "Please make sure you scanned the QR code fully, then reply *done* again.\n\n"
-                "Reply *refresh* for a new QR code or *code* to use a pairing code instead.",
+                "🤔 I don't see the WhatsApp link yet.\n\n"
+                "Make sure you scanned the QR code fully, then reply *done* again.\n\n"
+                "Reply *refresh* for a new QR code\n"
+                "Reply *code* to use a pairing code instead",
             )
             return
 
@@ -4968,8 +4978,9 @@ class OnboardingService:
                 await self._send(
                     phone,
                     "Fresh QR code sent! ☝🏼\n\n"
-                    "Reply *done* once linked, *refresh* for another new code, or "
-                    "*code* to switch to a pairing code.",
+                    "Reply *done* once linked\n"
+                    "Reply *refresh* for another new code\n"
+                    "Reply *code* to switch to a pairing code",
                 )
                 # Restart background poll for the refreshed QR
                 _qr_attempt_id_new = datetime.utcnow().isoformat()
@@ -4997,8 +5008,9 @@ class OnboardingService:
         # Anything else — remind them of their options.
         await self._send(
             phone,
-            "Reply *done* once you've scanned the QR code, *refresh* for a new one "
-            "(they expire in ~20 s), or *code* to use a pairing code instead.",
+            "Reply *done* once you've scanned the QR code\n"
+            "Reply *refresh* for a new one (they expire in ~20 s)\n"
+            "Reply *code* to use a pairing code instead",
         )
 
     async def _start_scam_warning(self, session: dict, phone: str) -> None:
@@ -5022,12 +5034,12 @@ class OnboardingService:
         db.upsert_onboarding_session(phone, {"currentStep": "pairing_scam_warning"})
         msg = (
             "Quick heads-up before we connect 💛\n\n"
-            "WhatsApp might flash a screen saying “This may be a scam.” "
+            "WhatsApp might flash a screen saying “This may be a scam.”\n"
             "Totally normal — it shows this anytime you link with a code instead of a scan.\n\n"
             "✅ Expected\n"
             "✅ Your account stays 100% yours\n"
             "✅ Unlink anytime, no stress\n\n"
-            "Reply YES and let’s go 🚀"
+            "Reply *YES* and let’s go 🚀"
         )
         msg = await self._localize_static(msg, "", session.get("language", "en"))
         await self._send(phone, msg)
@@ -5095,8 +5107,9 @@ class OnboardingService:
                 await self._send(
                     phone,
                     "⏱ QR codes refresh every ~20 seconds.\n\n"
-                    "Reply *done* once linked, *refresh* for a new QR code, or "
-                    "*code* to switch back to a pairing code.",
+                    "Reply *done* once linked\n"
+                    "Reply *refresh* for a new QR code\n"
+                    "Reply *code* to switch back to a pairing code",
                 )
             else:
                 # QR unavailable — re-send the warning so they can confirm YES.
@@ -5116,7 +5129,11 @@ class OnboardingService:
 
     async def _send_pairing_code(self, session: dict, phone: str) -> None:
         pairing_sid = session.get("pairingSessionId", f"biz-{phone}")
-        max_attempts = 2
+        # Silent retries. Showing the owner a "couldn't generate, retrying" line
+        # during onboarding erodes trust — we retry quietly and only surface a
+        # message if every attempt fails. Exponential backoff (1s, 2s) gives the
+        # bridge time to settle its QR-goroutine / websocket state between tries.
+        max_attempts = 3
         attempt = 0
         last_exc = None
 
@@ -5159,7 +5176,7 @@ class OnboardingService:
             if bridge_status == "connected":
                 await self._send(
                     phone,
-                    "Your WhatsApp is already linked and connected on this business number. "
+                    "Your WhatsApp is already linked and connected on this business number.\n\n"
                     "Reply *done* once you confirm messages are flowing here.",
                 )
             else:
@@ -5169,8 +5186,8 @@ class OnboardingService:
                     logger.warning("[PAIRING] Reconnect call failed for %s: %s", pairing_sid, _rec_exc)
                 await self._send(
                     phone,
-                    "Your WhatsApp is already linked to this business. "
-                    "I'm reconnecting the existing linked device now — no new pairing code needed. "
+                    "Your WhatsApp is already linked to this business.\n\n"
+                    "I'm reconnecting the existing linked device now — no new pairing code needed.\n\n"
                     "Reply *done* once it reconnects.",
                 )
             return
@@ -5228,7 +5245,9 @@ class OnboardingService:
                 await self.wa.reconnect_session(exc.session_id)
                 await self._send(
                     phone,
-                    "Your WhatsApp is already linked to this business. I'm reconnecting the existing linked device now, so you do not need a new pairing code. Reply *done* once it reconnects.",
+                    "Your WhatsApp is already linked to this business.\n\n"
+                    "I'm reconnecting the existing linked device now — no new pairing code needed.\n\n"
+                    "Reply *done* once it reconnects.",
                 )
                 return
             except Exception as exc:
@@ -5236,8 +5255,8 @@ class OnboardingService:
                 last_exc = exc
                 logger.error("Pair-code generation failed (attempt %s/%s) for %s: %s", attempt, max_attempts, phone, exc)
                 if attempt < max_attempts:
-                    await self._send(phone, "I couldn't generate the pairing code right now — retrying in a few seconds...")
-                    await asyncio.sleep(3)
+                    # Silent retry — do NOT message the owner. Backoff: 1s, 2s.
+                    await asyncio.sleep(2 ** (attempt - 1))
 
         # If we reach here, all attempts failed. Keep the user in pairing state and
         # surface a friendly message; do NOT complete onboarding or tell them to open the dashboard.
@@ -5342,8 +5361,8 @@ class OnboardingService:
             await self._send(
                 phone,
                 "⏱ *Pairing code expired.*\n\n"
-                "Reply *new code* to generate a fresh pairing code, "
-                "or *skip* to connect WhatsApp later.",
+                "Reply *new code* to generate a fresh pairing code\n"
+                "Reply *skip* to connect WhatsApp later",
             )
 
     async def _poll_qr_pairing_status(
@@ -5567,7 +5586,7 @@ class OnboardingService:
         if normalized in done_words:
             await self._send(
                 phone,
-                "✅ All set! You won't miss a customer again 💪\n"
+                "✅ All set! You won't miss a customer again 💪\n\n"
                 "Your AI receptionist is now fully active on WhatsApp and calls.",
             )
             await self._complete_onboarding(session, phone)
@@ -5576,7 +5595,7 @@ class OnboardingService:
         if normalized in skip_words:
             await self._send(
                 phone,
-                "No problem 👍 You can enable call forwarding anytime later.\n"
+                "No problem 👍 You can enable call forwarding anytime later.\n\n"
                 "You're all set! Your AI receptionist is now active on WhatsApp.",
             )
             await self._complete_onboarding(session, phone)
@@ -6010,7 +6029,7 @@ class OnboardingService:
         if starter_url and pro_url:
             msg = (
                 f"⚠️ *Your Recepte plan has expired* for *{biz_name}*.\n\n"
-                "To continue using the AI receptionist and all services, "
+                "To continue using the AI receptionist and all services,\n"
                 "please choose a plan below:\n\n"
                 f"*Starter Plan — €{starter_price}/month*\n"
                 "✅ AI receptionist (WhatsApp + calls)\n"
@@ -6020,7 +6039,7 @@ class OnboardingService:
                 "✅ Everything in Starter\n"
                 "✅ Win-back automation, referrals, reminders & more\n"
                 f"👉 {pro_url}\n\n"
-                "💳 Complete the payment and your service will resume *automatically* "
+                "💳 Complete the payment and your service will resume *automatically*\n"
                 "— no need to message us after paying."
             )
         else:
@@ -6066,7 +6085,7 @@ class OnboardingService:
             await self._send(
                 phone,
                 f"🎉 *Payment confirmed!* Your *{biz_name}* plan is now active.\n\n"
-                "Your AI receptionist is back online. "
+                "Your AI receptionist is back online.\n\n"
                 "Send *HELP* to see all available commands.",
             )
             logger.info(
@@ -6177,7 +6196,7 @@ class OnboardingService:
             "• *settings* — view/edit your services & hours\n"
             "• *reconnect whatsapp* — re-link your WhatsApp device\n"
             "• *help* — see all available commands\n\n"
-            "Just send any of the commands above to get started!",
+            "Just send any of the commands above to get started 👆",
         )
         logger.info("[NEW-BIZ-CONFIRM] Owner %s did not confirm new biz — restored to post_onboarding", phone)
 
@@ -6951,7 +6970,26 @@ class OnboardingService:
                 logger.debug("Onboarding AI -> %s: %s", phone, message)
             except Exception:
                 logger.exception("Onboarding AI -> (logging failed)")
-            await self.wa.send_message(phone, message)
+            try:
+                await self.wa.send_message(phone, message)
+            except ReachoutTimelocked as exc:
+                # Cold-contact rate-limit. The reply was NOT delivered. We log
+                # this distinctly so it's separable from real bridge crashes in
+                # observability dashboards, and stamp the session so a future
+                # retry worker — or the next inbound from this user — can
+                # surface that the prior turn never reached the user.
+                logger.warning(
+                    "[463] Onboarding reply NOT delivered to %s (retry_after=%ds): %s",
+                    phone, exc.retry_after_seconds, message[:120],
+                )
+                try:
+                    db.upsert_onboarding_session(phone, {
+                        "lastSendFailedAt": datetime.utcnow().isoformat(),
+                        "lastSendFailureReason": "reachout_timelocked",
+                        "lastSendPendingMessage": message,
+                    })
+                except Exception:
+                    logger.exception("Failed to persist lastSendFailed for %s", phone)
         except Exception as exc:
             logger.error("Failed to send WA message to %s: %s", phone, exc)
 

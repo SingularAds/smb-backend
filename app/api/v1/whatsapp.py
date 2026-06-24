@@ -291,6 +291,29 @@ async def _process_webhook(payload: dict) -> None:
         # our OWN API-sent replies (AI responses, owner-command replies,
         # automation notifications) since those also produce outbound echoes.
         if event == "owner_message":
+            # ── Global onboarding number guard ───────────────────────────────
+            # If this owner_message came from the Recepte global onboarding
+            # number (configured via WHATSMEOW_GLOBAL_NUMBER), do NOT run the
+            # customer-takeover path. The global number is not tied to any
+            # single SMB owner↔customer relationship, so treating an outbound
+            # from it as a "takeover" would trigger a spurious 90-minute AI
+            # pause on whichever chat happens to be the recipient. See the
+            # 11:32:34 AI-pause incident on 972547778077.
+            device_own_phone = payload.get("phone", "")
+            if device_own_phone and ai_pause_service.is_protected_number(device_own_phone):
+                logger.info(
+                    "[OWNER-TAKEOVER] skipping — device own phone=%s is the global "
+                    "onboarding number; no AI pause for global flow",
+                    device_own_phone,
+                )
+                _log_event(
+                    "skipped",
+                    phone=data.get("chat_id", ""),
+                    message_id=data.get("message_id", ""),
+                    detail=f"owner_message from global onboarding number ({device_own_phone}) — pause suppressed",
+                )
+                return
+
             owner_msg_id = data.get("message_id", "")
             if is_our_outbound_echo(owner_msg_id):
                 logger.debug(

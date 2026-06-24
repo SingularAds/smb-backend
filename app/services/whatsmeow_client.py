@@ -30,6 +30,28 @@ class PairingStateConflict(Exception):
             + f"; action={action} status={status}"
         )
 
+
+class ReachoutTimelocked(Exception):
+    """WhatsApp rejected an outbound send with server error 463.
+
+    Surfaces the bridge's HTTP 429 response. Callers must treat this as a
+    *delivery failure*, NOT a backend bug: the message text was never
+    delivered to the recipient. The recommended response is to refuse to
+    advance any state machine that assumed delivery (e.g. onboarding flow,
+    booking confirmation) and either drop the message or schedule a delayed
+    retry — the recipient's WhatsApp anti-abuse trust signals may shift over
+    minutes/hours, so a retry several minutes later sometimes succeeds.
+    """
+
+    def __init__(self, phone: str, device_id: str, retry_after_seconds: int = 300):
+        self.phone = phone
+        self.device_id = device_id
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(
+            f"WhatsApp 463 (reachout time-locked) for {phone} on device={device_id!r}; "
+            f"recipient not currently reachable via this companion device"
+        )
+
 # ── Outbound-echo suppression ─────────────────────────────────────────────────
 # The whatsmeow bridge echoes every message we send back as a webhook event.
 # We register the message_id returned by the bridge immediately after each send.
@@ -130,6 +152,23 @@ class WhatsmeowClient:
                 print("message is this: ", message)
                 logger.debug("WhatsApp bridge response status: %s", resp.status_code)
                 logger.debug("WhatsApp bridge response text: %s", (resp.text or '')[:200])
+                # Bridge maps WhatsApp's 463 (cold-contact rate-limit) to HTTP 429.
+                # This is a *delivery* failure — the message never reached the
+                # recipient — but is NOT a bridge bug. Raise a typed exception so
+                # callers can avoid advancing onboarding/booking state on a
+                # message that was never actually delivered.
+                if resp.status_code == 429:
+                    try:
+                        body = resp.json()
+                    except Exception:
+                        body = {}
+                    if body.get("code") == 463 or body.get("error") == "reachout_timelocked":
+                        retry_after = int(body.get("retry_after_seconds") or 300)
+                        logger.warning(
+                            "WhatsApp 463 reachout-timelocked for %s (device=%s); message NOT delivered, retry_after=%ds",
+                            phone, device, retry_after,
+                        )
+                        raise ReachoutTimelocked(phone, device, retry_after)
                 resp.raise_for_status()
                 resp_data = resp.json()
                 # Register the sent message_id so echoes from the bridge are ignored
