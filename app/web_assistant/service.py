@@ -118,6 +118,19 @@ async def _handle_visitor_message(inbound: InboundChatMessage) -> None:
         )
         return
 
+    # Suppress duplicate reply when the visitor's very first message is just
+    # a courtesy greeting ("hello", "hi", "olá", …) right after our automatic
+    # welcome message. The welcome already invited them to ask anything, so a
+    # second "Hi! How can I help?" from the LLM is pure noise and confuses the
+    # owner watching the conversation in Chatwoot.
+    if _is_greeting_after_welcome(doc, body):
+        store.save(conv_id, doc)
+        logger.info(
+            "[WEB-AI] Skipping LLM — visitor greeting follows auto-welcome conv=%s",
+            conv_id,
+        )
+        return
+
     language = doc.get("language") or "en"
 
     # ── LLM call ----------------------------------------------------------
@@ -350,6 +363,77 @@ def _is_escalation(text: str) -> bool:
     if not text:
         return True
     return prompt_mod.ESCALATE_TOKEN in text.strip().upper()
+
+
+# Bare greeting tokens across the languages the widget supports.
+_BARE_GREETINGS = frozenset({
+    # English
+    "hello", "hi", "hii", "hiii", "hey", "heyy", "yo", "sup", "hellow", "howdy",
+    # Portuguese
+    "olá", "ola", "oi", "oii",
+    # Spanish
+    "hola", "buenas",
+    # French
+    "bonjour", "salut", "coucou",
+    # German
+    "hallo", "moin", "servus",
+    # Italian
+    "ciao", "salve",
+    # Hindi / South Asian
+    "namaste", "namaskar",
+    # Arabic
+    "salam", "marhaba",
+    # Other
+    "ahoj",
+})
+
+_GREETING_OPENERS = (
+    "good morning", "good afternoon", "good evening", "good day",
+    "bom dia", "boa tarde", "boa noite",
+    "buenos días", "buenos dias", "buenas tardes", "buenas noches",
+    "guten morgen", "guten tag", "guten abend",
+    "bonjour", "bonsoir",
+)
+
+
+def _is_bare_greeting(text: str) -> bool:
+    """True when `text` is a pure courtesy greeting (no question, no content).
+
+    Conservative on purpose — must reject anything with question marks or more
+    than ~4 words so messages like "hello, how much does it cost?" still
+    trigger the normal LLM path.
+    """
+    if not text:
+        return False
+    if "?" in text:
+        return False
+    cleaned = text.strip().lower().rstrip("!.,;:").strip()
+    if not cleaned or len(cleaned.split()) > 4:
+        return False
+    if cleaned in _BARE_GREETINGS:
+        return True
+    return any(cleaned.startswith(opener) for opener in _GREETING_OPENERS)
+
+
+def _is_greeting_after_welcome(doc: dict[str, Any], body: str) -> bool:
+    """True when this is the visitor's first message and it is a bare greeting
+    that immediately follows our automatic welcome message.
+
+    The expected history shape is exactly two entries: our welcome (assistant)
+    and the current user message — anything more means the conversation has
+    already moved past the greeting moment.
+    """
+    if not doc.get("greetedAt"):
+        return False
+    if not _is_bare_greeting(body):
+        return False
+    messages = doc.get("messages") or []
+    if len(messages) != 2:
+        return False
+    return (
+        messages[0].get("role") == "assistant"
+        and messages[1].get("role") == "user"
+    )
 
 
 _LANG_ALIASES = {
