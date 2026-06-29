@@ -103,6 +103,7 @@ class Settings(BaseSettings):
     WHATSMEOW_DEFAULT_DEVICE_ID: str = "smba"  # Legacy default device/session ID (kept for compatibility)
     WHATSMEOW_ONBOARDING_DEVICE_ID: str = ""   # Optional explicit global/onboarding device/session ID
     WHATSMEOW_GLOBAL_NUMBER: str = ""          # Optional global onboarding WhatsApp number (digits, no +)
+    WHATSAPP_DEBOUNCE_S: float = 2.0           # Seconds to wait before flushing a rapid-message burst to the LLM
     WEBHOOK_SECRET: str = ""                 # Webhook secret for validation
     X_WEBHOOK_SECRET: str = ""               # Alias (header: X-Webhook-Secret)
 
@@ -161,7 +162,28 @@ class Settings(BaseSettings):
     CSAT_IDLE_MINUTES: int = 30
     CSAT_SWEEP_INTERVAL_MINUTES: int = 5
     CSAT_COOLDOWN_DAYS: int = 7
-    
+
+    # ── Chatwoot (Website AI Assistant) ──
+    # Independent pipeline serving the recepte.co website chat widget.
+    # Does NOT share state, prompts, or services with the WhatsApp customer AI.
+    CHATWOOT_ENABLED: bool = True
+    CHATWOOT_BASE_URL: str = "https://app.chatwoot.com"  # Chatwoot Cloud or self-hosted base URL
+    CHATWOOT_ACCOUNT_ID: str = ""                        # Numeric account ID (e.g. "169263")
+    CHATWOOT_ACCESS_TOKEN: str = ""                      # Agent/bot API access token (api_access_token)
+    CHATWOOT_HMAC_SECRET: str = ""                       # Webhook signing secret (X-Chatwoot-Signature)
+    CHATWOOT_WEBSITE_TOKEN: str = ""                     # Public website widget token (for inbox identification)
+    CHATWOOT_WEBSITE_INBOX_ID: int = 0                   # Numeric inbox ID (optional — used for safety filter)
+    CHATWOOT_SUPPORT_TEAM_ID: int = 0                    # Team ID escalations are assigned to (0 = no team assignment)
+    CHATWOOT_REQUIRE_SIGNATURE: bool = False             # Reject webhooks lacking a valid HMAC (set True in production)
+    CHATWOOT_LLM_MODEL: str = "gpt-4o-mini"              # OpenAI model used for website assistant
+    CHATWOOT_HISTORY_LIMIT: int = 10                     # Max messages kept per conversation in Firestore
+    CHATWOOT_LEARNINGS_LIMIT: int = 30                   # Max learnings injected into the prompt
+    CHATWOOT_LEARNINGS_CACHE_TTL_S: int = 300            # In-process cache TTL for learnings (seconds)
+    CHATWOOT_LEARN_COMMAND: str = "/kb-learn"            # Private-note command that saves a learning
+    CHATWOOT_PAUSE_COMMAND: str = "/ai-pause"            # Private-note command that pauses AI for this conversation
+    CHATWOOT_RESUME_COMMAND: str = "/ai-resume"          # Private-note command that re-enables the AI
+    CHATWOOT_HELP_COMMAND: str = "/ai-help"              # Private-note command that lists available agent commands
+
     class Config:
         import os as _os
         env_file = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), ".env")

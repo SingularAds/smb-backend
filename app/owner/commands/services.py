@@ -86,9 +86,9 @@ def _bookings_for_date(business: dict, offset_days: int) -> list[dict]:
 async def get_today_bookings(business: dict) -> str:
     bookings = _bookings_for_date(business, offset_days=0)
     if not bookings:
-        return "📅 *Sem marcações para hoje.*"
+        return "📅 *No bookings for today.*"
     total_people = sum(int(b.get("partySize") or 1) for b in bookings)
-    lines = [f"📅 *Marcações de hoje ({len(bookings)} marcações • {total_people} pessoas):*"]
+    lines = [f"📅 *Today's bookings ({len(bookings)} bookings • {total_people} people):*"]
     lines += [_fmt_booking(b, business) for b in bookings]
     return "\n".join(lines)
 
@@ -96,9 +96,9 @@ async def get_today_bookings(business: dict) -> str:
 async def get_tomorrow_bookings(business: dict) -> str:
     bookings = _bookings_for_date(business, offset_days=1)
     if not bookings:
-        return "📅 *Sem marcações para amanhã.*"
+        return "📅 *No bookings for tomorrow.*"
     total_people = sum(int(b.get("partySize") or 1) for b in bookings)
-    lines = [f"📅 *Marcações de amanhã ({len(bookings)} marcações • {total_people} pessoas):*"]
+    lines = [f"📅 *Tomorrow's bookings ({len(bookings)} bookings • {total_people} people):*"]
     lines += [_fmt_booking(b, business) for b in bookings]
     return "\n".join(lines)
 
@@ -127,10 +127,10 @@ async def get_summary(business: dict) -> str:
     total = sum(1 for b in all_bookings if b.get("status") not in _INACTIVE_STATUSES)
 
     lines = [
-        "📊 *Resumo do negócio:*",
-        f"  • Hoje: *{today_count}* marcações",
-        f"  • Esta semana: *{week_count}* marcações",
-        f"  • Total: *{total}* marcações",
+        "📊 *Business summary:*",
+        f"  • Today: *{today_count}* bookings",
+        f"  • This week: *{week_count}* bookings",
+        f"  • Total: *{total}* bookings",
     ]
     return "\n".join(lines)
 
@@ -140,8 +140,8 @@ async def get_vip_clients(business: dict) -> str:
     customers = db.list_customers(biz_id, limit=200)
     vip = [c for c in customers if "vip" in (c.get("flags") or [])]
     if not vip:
-        return "⭐ *Ainda não tens clientes VIP definidos.*\nPara marcar um cliente como VIP, pede ao sistema."
-    lines = ["⭐ *Clientes VIP:*"]
+        return "⭐ *No VIP clients yet.*\nTo mark a client as VIP, ask the assistant."
+    lines = ["⭐ *VIP clients:*"]
     for c in vip:
         name = c.get("name") or c.get("customerName") or c.get("id", "?")
         phone = c.get("phone") or ""
@@ -152,28 +152,28 @@ async def get_vip_clients(business: dict) -> str:
 async def view_settings(business: dict) -> str:
     name = business.get("name") or business.get("businessName") or "?"
     phone = business.get("phone") or business.get("phoneNumber") or "?"
-    language = business.get("language") or business.get("primary_language") or "pt"
+    language = business.get("language") or business.get("primary_language") or "en"
     services = business.get("services") or []
     hours = business.get("hours") or {}
 
-    service_list = "\n".join(f"  • {s.get('name', s) if isinstance(s, dict) else s}" for s in services) or "  (nenhum)"
+    service_list = "\n".join(f"  • {s.get('name', s) if isinstance(s, dict) else s}" for s in services) or "  (none)"
     hours_text = _fmt_hours(hours)
 
     return (
-        f"⚙️ *Definições — {name}*\n\n"
-        f"📞 Telefone: {phone}\n"
-        f"🌍 Idioma: {language}\n\n"
-        f"💼 *Serviços:*\n{service_list}\n\n"
-        f"🕐 *Horário:*\n{hours_text}"
+        f"⚙️ *Settings — {name}*\n\n"
+        f"📞 Phone: {phone}\n"
+        f"🌍 Language: {language}\n\n"
+        f"💼 *Services:*\n{service_list}\n\n"
+        f"🕐 *Hours:*\n{hours_text}"
     )
 
 
 def _fmt_hours(hours: dict | Any) -> str:
     if not isinstance(hours, dict):
-        return "  (não definido)"
+        return "  (not set)"
     days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-    day_names = {"monday": "Seg", "tuesday": "Ter", "wednesday": "Qua",
-                 "thursday": "Qui", "friday": "Sex", "saturday": "Sáb", "sunday": "Dom"}
+    day_names = {"monday": "Mon", "tuesday": "Tue", "wednesday": "Wed",
+                 "thursday": "Thu", "friday": "Fri", "saturday": "Sat", "sunday": "Sun"}
     lines = []
     for d in days:
         info = hours.get(d)
@@ -181,12 +181,12 @@ def _fmt_hours(hours: dict | Any) -> str:
             continue
         if isinstance(info, dict):
             if info.get("closed"):
-                lines.append(f"  {day_names[d]}: Fechado")
+                lines.append(f"  {day_names[d]}: Closed")
             else:
                 lines.append(f"  {day_names[d]}: {info.get('open', '?')} – {info.get('close', '?')}")
         else:
             lines.append(f"  {day_names[d]}: {info}")
-    return "\n".join(lines) or "  (não definido)"
+    return "\n".join(lines) or "  (not set)"
 
 
 async def cancel_booking_flow(business: dict, ref: str | None) -> str:
@@ -279,15 +279,15 @@ async def cancel_booking_flow(business: dict, ref: str | None) -> str:
 async def block_slot_flow(business: dict, slot: str | None) -> str:
     if not slot:
         return (
-            "🚫 *Bloquear horário*\n\n"
-            "Indica o horário a bloquear:\n"
-            "_Ex: bloquear 14:00_"
+            "🚫 *Block a time slot*\n\n"
+            "Specify the time to block:\n"
+            "_Ex: block 14:00_"
         )
-    # For now, inform the owner it needs calendar integration; 
+    # For now, inform the owner it needs calendar integration;
     # if calendar_config exists we could create a busy event
     return (
-        f"🚫 Horário *{slot}* marcado como bloqueado.\n"
-        "_(Para bloquear dias inteiros, usa o Google Calendar ligado ao negócio.)_"
+        f"🚫 Time *{slot}* marked as blocked.\n"
+        "_(To block whole days, use the Google Calendar linked to your business.)_"
     )
 
 

@@ -5648,14 +5648,56 @@ class OnboardingService:
         })
         name = session.get("pushName") or (session.get("businessData") or {}).get("ownerName") or ""
         name_str = f" {name}" if name else ""
-        msg = (
-            f"🎉 You’re ALL set{name_str}! Your AI receptionist is awake, working, and catching every customer — day and night 🌙☀️\n\n"
-            "More clients. More time back. Less slipping through the cracks 💪\n\n"
-            "Welcome to the new way of running your business ✨"
-        )
-        msg = await self._localize_static(msg, "", session.get("language", "en"))
+        lang = session.get("language", "en")
+
+        # Did the owner actually finish WhatsApp pairing during onboarding?
+        # If yes → ship the celebratory "AI is catching every customer" copy.
+        # If no  → ship a softer "you're live, but to handle customers on
+        #   WhatsApp send 'reconnect my whatsapp'" so we don't promise
+        #   something we can't deliver. Production showed the celebratory
+        #   copy was being sent to owners whose WA wasn't linked yet,
+        #   eroding trust on the very first impression.
+        wa_connected = False
+        biz_id = session.get("businessId")
+        biz = db.get_business_by_id(biz_id) if biz_id else None
+        wa_session_id = (biz or {}).get("waSessionId")
+        if wa_session_id:
+            try:
+                status = await self.wa.get_session_status(wa_session_id) or {}
+                wa_connected = (
+                    bool(status.get("paired"))
+                    and status.get("status") == "connected"
+                )
+            except Exception as exc:
+                # Bridge unreachable — fail open and assume connected so a
+                # bridge restart doesn't turn the celebration into a downgrade.
+                logger.warning(
+                    "[COMPLETE] Cannot verify WA status for %s (session=%s): %s — assuming connected",
+                    phone, wa_session_id, exc,
+                )
+                wa_connected = True
+
+        if wa_connected:
+            msg = (
+                f"🎉 You're ALL set{name_str}! Your AI receptionist is awake, working, and catching every customer — day and night 🌙☀️\n\n"
+                "More clients. More time back. Less slipping through the cracks 💪\n\n"
+                "Welcome to the new way of running your business ✨"
+            )
+        else:
+            msg = (
+                f"🎉 You're live{name_str}! Your business is set up and ready to grow ✨\n\n"
+                "One last thing — your *WhatsApp isn't linked yet*, so I can't reply to your customers for you. "
+                "Without that, the AI receptionist can't pick up chats on your business number.\n\n"
+                "Want me to handle WhatsApp customers too? Just send:\n"
+                "*reconnect my whatsapp*\n\n"
+                "Takes ~30 seconds 🚀"
+            )
+
+        msg = await self._localize_static(msg, "", lang)
         await self._send(phone, msg)
-        logger.info("Onboarding complete for %s", phone)
+        logger.info(
+            "Onboarding complete for %s (wa_connected=%s)", phone, wa_connected,
+        )
 
     # ── post-onboarding support ───────────────────────────────────────────
 
@@ -6620,15 +6662,25 @@ class OnboardingService:
         # ── Device-link guard: block data commands if biz device is offline ──
         # Owner commands (bookings, settings, etc.) are only useful when the
         # business WhatsApp device is linked and actively serving customers.
-        # If the device is disconnected/unpaired we send a re-link reminder
-        # instead of potentially misleading data (e.g. "3 bookings today"
-        # while customers see no replies from the AI).
-        # Fail open if the bridge is unreachable so commands still work
-        # during bridge restarts.
+        # Three blocking cases:
+        #   1. waSessionId never set — owner finished onboarding without
+        #      pairing.  Production bug: previously this code fell straight
+        #      through to the command parser and ran e.g. `today` against
+        #      a never-connected business, replying with "no bookings"
+        #      while the AI receptionist was actually unreachable.
+        #   2. waSessionId set, bridge says paired=False — pairing was
+        #      started but never finished.  Resume the pairing flow.
+        #   3. waSessionId set, bridge says paired=True but offline —
+        #      device was live and disconnected.  Prompt a reconnect.
+        # Fail open if the bridge is unreachable (allow command) so a
+        # bridge restart doesn't lock everyone out.
         _wa_session_id = biz.get("waSessionId")
-        if _wa_session_id:
+        _dev_status: dict = {}
+        if not _wa_session_id:
+            _dev_connected = False
+        else:
             try:
-                _dev_status = await self.wa.get_session_status(_wa_session_id)
+                _dev_status = await self.wa.get_session_status(_wa_session_id) or {}
                 _dev_connected = (
                     bool(_dev_status.get("paired"))
                     and _dev_status.get("status") == "connected"
@@ -6640,45 +6692,41 @@ class OnboardingService:
                 )
                 _dev_connected = True
 
-            if not _dev_connected:
-                # Distinguish: was the device NEVER paired vs. previously paired
-                # but now offline?
-                # • paired=False  → owner never completed the pairing step.
-                #   Route back into the pairing flow so they can finish setup.
-                # • paired=True but status≠connected → was live before but
-                #   went offline.  Prompt them to reconnect.
-                _was_ever_paired = bool(_dev_status.get("paired"))
-                if not _was_ever_paired:
-                    logger.info(
-                        "[POST_ONBOARDING] Device %s for biz %s was never paired"
-                        " — resuming pairing flow for %s",
-                        _wa_session_id, biz_id, phone,
-                    )
-                    _pairing_session = {
-                        "ownerPhone": phone,
-                        "currentStep": "pairing_mode_choice",
-                        "businessId": biz_id,
-                        "pairingSessionId": _wa_session_id,
-                        "language": lang,
-                        "reconnectMode": False,
-                        "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
-                    }
-                    db.upsert_onboarding_session(phone, _pairing_session)
-                    _refreshed = db.get_onboarding_session(phone) or {}
-                    _refreshed["businessId"] = biz_id
-                    _refreshed["pairingSessionId"] = _wa_session_id
-                    _refreshed["language"] = lang
-                    await self._start_pairing_mode_choice(_refreshed, phone, biz_name)
-                else:
-                    await self._send(
-                        phone,
-                        "⚠️ *Your WhatsApp is not connected to Recepte.*\n\n"
-                        "Owner commands are paused because your business number is offline "
-                        "— customers cannot receive replies right now.\n\n"
-                        "To reconnect, send:\n"
-                        "*reconnect my whatsapp*",
-                    )
-                return
+        if not _dev_connected:
+            # `paired` only reflects bridge state. If waSessionId is missing
+            # there was never a pairing handshake at all → treat as never paired.
+            _was_ever_paired = bool(_wa_session_id) and bool(_dev_status.get("paired"))
+
+            if not _was_ever_paired:
+                # Owner skipped pairing during onboarding. Don't drag them into
+                # the multi-step pairing UI on every command — surface a clear
+                # one-line CTA they can act on whenever they're ready. Same
+                # phrasing the completion message now uses so the experience
+                # is consistent.
+                logger.info(
+                    "[POST_ONBOARDING] Blocking command for %s — waSessionId=%r, bridge_paired=%s",
+                    phone, _wa_session_id, _dev_status.get("paired"),
+                )
+                _msg = (
+                    "⚠️ *Your WhatsApp isn't linked yet.*\n\n"
+                    "Owner commands are paused — your business number isn't connected, "
+                    "so customers can't reach your AI receptionist right now.\n\n"
+                    "To link it (takes ~30 seconds), send:\n"
+                    "*reconnect my whatsapp*"
+                )
+                _msg = await self._localize_static(_msg, "", lang)
+                await self._send(phone, _msg)
+            else:
+                _msg = (
+                    "⚠️ *Your WhatsApp is not connected to Recepte.*\n\n"
+                    "Owner commands are paused because your business number is offline "
+                    "— customers cannot receive replies right now.\n\n"
+                    "To reconnect, send:\n"
+                    "*reconnect my whatsapp*"
+                )
+                _msg = await self._localize_static(_msg, "", lang)
+                await self._send(phone, _msg)
+            return
 
         # ── Owner commands (booking data / settings / etc.) ───────────────
         # Before sending to generic AI, check if this is a structured owner

@@ -1343,6 +1343,96 @@ def set_global_kb(content: str) -> None:
     })
 
 
+# ── Website AI Assistant (Chatwoot) ──────────────────────────────────────────
+# Pure CRUD layer for the website chat pipeline. All higher-level logic lives
+# in app.web_assistant.*. Stored at:
+#   web_conversations/{chatwoot_conversation_id}            — per-conversation state
+#   system/web_assistant_kb/learnings/{auto_id}             — human-approved Q&A pairs
+
+def _web_conversations_col():
+    return _db().collection("web_conversations")
+
+
+def get_web_conversation(conversation_id: str) -> dict | None:
+    """Return a website-assistant conversation document.
+
+    Args:
+        conversation_id: Stringified Chatwoot conversation id.
+    Returns:
+        Document dict, or None if it does not exist.
+    """
+    doc = _web_conversations_col().document(str(conversation_id)).get()
+    if not doc.exists:
+        return None
+    return doc.to_dict()
+
+
+def save_web_conversation(conversation_id: str, data: dict) -> None:
+    """Upsert a website-assistant conversation document (merge=True)."""
+    payload = dict(data)
+    payload["updatedAt"] = _now_iso()
+    payload.setdefault("createdAt", _now_iso())
+    _web_conversations_col().document(str(conversation_id)).set(payload, merge=True)
+
+
+def _web_learnings_col():
+    return (
+        _db()
+        .collection("system")
+        .document("web_assistant_kb")
+        .collection("learnings")
+    )
+
+
+def add_web_learning(data: dict) -> dict:
+    """Persist a new human-approved Q&A learning for the website assistant.
+
+    Args:
+        data: At minimum {question, answer}. Caller adds metadata.
+    Returns:
+        The stored document including its generated `id`.
+    """
+    doc_id = data.get("id") or new_id()
+    payload = dict(data)
+    payload["id"] = doc_id
+    payload.setdefault("createdAt", _now_iso())
+    _web_learnings_col().document(doc_id).set(payload)
+    return payload
+
+
+def list_web_learnings(limit: int = 30) -> list[dict]:
+    """Return the most recently created learnings, newest first."""
+    try:
+        docs = (
+            _web_learnings_col()
+            .order_by("createdAt", direction=fb_firestore.Query.DESCENDING)
+            .limit(int(limit))
+            .stream()
+        )
+        return [d.to_dict() for d in docs]
+    except Exception as exc:
+        logger.warning("[WEB-KB] list_web_learnings failed: %s", exc)
+        return []
+
+
+def find_web_learning_by_question_hash(question_hash: str) -> dict | None:
+    """Lookup an existing learning by deterministic question hash (dedup)."""
+    if not question_hash:
+        return None
+    try:
+        docs = (
+            _web_learnings_col()
+            .where(filter=FieldFilter("questionHash", "==", question_hash))
+            .limit(1)
+            .stream()
+        )
+        for d in docs:
+            return d.to_dict()
+    except Exception as exc:
+        logger.warning("[WEB-KB] find_web_learning_by_question_hash failed: %s", exc)
+    return None
+
+
 # ── per-business knowledge base ───────────────────────────────────────────────
 # Subcollection: businesses/{businessId}/knowledge/{entryId}
 #

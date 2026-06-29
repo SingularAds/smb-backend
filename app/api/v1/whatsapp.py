@@ -854,21 +854,53 @@ async def _process_webhook(payload: dict) -> None:
                                 detail=f"audio AI reply via device {device_id!r}",
                             )
                         else:
-                            await _customer_ai.handle_customer_message(
-                                business=business,
-                                customer_phone=phone,
+                            # ── Debounce rapid-fire message bursts ────────────
+                            # When a customer sends multiple messages in quick
+                            # succession ("hello" then "how are you"), each
+                            # arrives as a separate webhook. Without debouncing
+                            # the LLM would answer each independently, flooding
+                            # the chat with fragmented replies. We buffer all
+                            # texts for WHATSAPP_DEBOUNCE_S seconds; the window
+                            # resets on every new message. Once silence is
+                            # detected, a single combined LLM call is made.
+                            from app.services.message_debouncer import debounce_message
+                            from app.config import settings as _s
+
+                            debounce_key = f"{device_id}:{phone}"
+
+                            # Capture loop variables for the closure.
+                            _biz = business
+                            _phone = phone
+                            _push_name = push_name
+                            _device_id = device_id
+                            _message_id = message_id
+
+                            async def _handle_combined(combined_body: str) -> None:
+                                t0 = time.time()
+                                await _customer_ai.handle_customer_message(
+                                    business=_biz,
+                                    customer_phone=_phone,
+                                    body=combined_body,
+                                    push_name=_push_name,
+                                    device_id=_device_id,
+                                    message_id=_message_id,
+                                )
+                                logger.info(
+                                    "[LATENCY] Customer AI Text processing for phone=%s msg_id=%s took %.3fs",
+                                    _phone, _message_id, time.time() - t0,
+                                )
+                                _log_event(
+                                    "processed",
+                                    phone=_phone,
+                                    message_id=_message_id,
+                                    detail=f"customer AI reply via device {_device_id!r}",
+                                )
+
+                            await debounce_message(
+                                key=debounce_key,
                                 body=body,
-                                push_name=push_name,
-                                device_id=device_id,
-                                message_id=message_id,
-                            )
-                            duration = time.time() - customer_ai_start
-                            logger.info("[LATENCY] Customer AI Text processing for phone=%s msg_id=%s took %.3fs", phone, message_id, duration)
-                            _log_event(
-                                "processed",
-                                phone=phone,
-                                message_id=message_id,
-                                detail=f"customer AI reply via device {device_id!r}",
+                                handler=_handle_combined,
+                                debounce_s=float(_s.WHATSAPP_DEBOUNCE_S),
                             )
             else:
                 # No business linked to this device — stay silent.

@@ -192,6 +192,11 @@ app.include_router(recepte.router, prefix="/api/v1/recepte", tags=["Recepte"])
 # Booking reminders cron endpoint
 app.include_router(reminders.router, prefix="/api/v1/reminders", tags=["Reminders"])
 
+# Website AI assistant (Chatwoot channel) — completely isolated from WhatsApp.
+# POST /webhook/chatwoot
+from app.web_assistant.webhook import router as chatwoot_router  # noqa: E402
+app.include_router(chatwoot_router, tags=["Chatwoot"])
+
 
 # ── Legacy billing redirect URLs (old Stripe sessions used /billing/*) ──
 

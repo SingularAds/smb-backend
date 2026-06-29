@@ -127,12 +127,27 @@ async def handle_owner_command(
 
     # ── Device-link guard ─────────────────────────────────────────────────────
     # Owner commands are only meaningful when the business WhatsApp device is
-    # linked and serving customers.  If the device is disconnected or unpaired,
-    # replies would be misleading (e.g. "today you have 3 bookings" while the AI
-    # is unreachable).  Block commands and prompt the owner to re-link first.
+    # linked and serving customers.  Two cases block the command:
+    #   1. waSessionId never set — owner skipped pairing during onboarding and
+    #      never connected.  Previously this code fell through and ran the
+    #      command anyway (e.g. replying with "no bookings today" while the
+    #      AI is not actually reachable on their number), which mislead owners
+    #      in production.
+    #   2. waSessionId set but bridge reports the session is disconnected /
+    #      unpaired.
+    # In both cases we prompt the owner to send "reconnect my whatsapp" before
+    # any command will run.
     target_jid = reply_jid or owner_phone
     wa_session_id = business.get("waSessionId")
-    if wa_session_id:
+
+    if not wa_session_id:
+        # Never linked — owner skipped pairing during onboarding.
+        is_connected = False
+        logger.info(
+            "[OWNER_CMD_GUARD] Blocking command for %s — business has no waSessionId (never paired)",
+            owner_phone,
+        )
+    else:
         try:
             status = await _wa.get_session_status(wa_session_id)
             is_connected = bool(status.get("paired")) and status.get("status") == "connected"
@@ -144,26 +159,36 @@ async def handle_owner_command(
             )
             is_connected = True
 
-        if not is_connected:
-            unlinked_msg = (
-                "⚠️ *Your WhatsApp is not connected to Recepte.*\n\n"
-                "Owner commands are paused because your business number is offline "
-                "— customers cannot receive replies right now.\n\n"
-                "To reconnect, send:\n"
-                "*reconnect my whatsapp*"
-            )
-            try:
-                # Always reply via the global device since the business device is offline.
-                await _wa.send_message(target_jid, unlinked_msg, device_id=_wa.default_device_id)
-            except Exception as exc:
-                logger.error("Could not send unlinked reminder to %s: %s", owner_phone, exc)
-            return
+    if not is_connected:
+        # Single shared copy for both "never paired" and "paired-but-offline".
+        # Translation uses the owner's onboarding language (NOT message detection)
+        # so a Portuguese owner who types "today" still gets a Portuguese refusal.
+        unlinked_msg = (
+            "⚠️ *Your WhatsApp is not connected to Recepte.*\n\n"
+            "Owner commands are paused because your business number is not linked "
+            "— customers cannot reach your AI receptionist right now.\n\n"
+            "To connect (or reconnect), send:\n"
+            "*reconnect my whatsapp*"
+        )
+        owner_lang = business.get("language") or business.get("primary_language")
+        unlinked_msg = await translate_reply(message, unlinked_msg, lang=owner_lang)
+        try:
+            # Always reply via the global device since the business device is offline / never paired.
+            await _wa.send_message(target_jid, unlinked_msg, device_id=_wa.default_device_id)
+        except Exception as exc:
+            logger.error("Could not send unlinked reminder to %s: %s", owner_phone, exc)
+        return
 
     command = parse_command(message)
     logger.debug("Parsed command: %s", command)
 
     reply = await _dispatch(command, business)
-    reply = await translate_reply(message, reply)
+    # Source-of-truth for the owner's language is the business doc (set during
+    # onboarding). Per-message langdetect is unreliable for short commands like
+    # "today" / "summary" / "vip" — it would either default to English (its
+    # < 3-word fallback) or guess wrong and ship the owner the wrong language.
+    owner_lang = business.get("language") or business.get("primary_language")
+    reply = await translate_reply(message, reply, lang=owner_lang)
 
     try:
         await _wa.send_message(target_jid, reply, device_id=device_id)
