@@ -36,8 +36,11 @@ logger = logging.getLogger(__name__)
 
 async def handle_event(inbound: InboundChatMessage) -> None:
     """Dispatch a normalised Chatwoot event."""
+    # CONVERSATION_CREATED is intentionally ignored — the LLM handles the
+    # first visitor message directly, so there is no separate auto-greeting
+    # step. This guarantees one message per visitor exchange and removes the
+    # ordering race that produced double-greetings in production.
     if inbound.event is WebhookEvent.CONVERSATION_CREATED:
-        await _handle_conversation_created(inbound)
         return
 
     # MESSAGE_CREATED — branch on sender role.
@@ -54,37 +57,6 @@ async def handle_event(inbound: InboundChatMessage) -> None:
         "[WEB-AI] Ignoring event=%s sender=%s conv=%s",
         inbound.event, inbound.sender_type, inbound.conversation_id,
     )
-
-
-# ── Conversation lifecycle ─────────────────────────────────────────────────
-
-
-async def _handle_conversation_created(inbound: InboundChatMessage) -> None:
-    """Send a localised greeting on the very first opening of the widget."""
-    conv_id = inbound.conversation_id
-    doc = store.load(conv_id)
-
-    # Avoid double-greeting on Chatwoot retries.
-    if doc.get("greetedAt"):
-        return
-
-    language = doc.get("language") or _normalise_language(
-        inbound.visitor_browser_language
-    )
-    doc["language"] = language
-    doc["visitorName"] = inbound.sender_name or doc.get("visitorName")
-    doc["inboxId"] = inbound.inbox_id or doc.get("inboxId")
-
-    greeting = prompt_mod.greeting_for(language)
-    sent_id = await transport.send_message(conv_id, greeting)
-
-    if sent_id:
-        store.register_bot_message(doc, sent_id)
-        store.append_message(doc, "assistant", greeting)
-        doc["greetedAt"] = _utc_now_iso()
-        _emit_analytics("web_chat.greeting_sent", conv_id, {"language": language})
-
-    store.save(conv_id, doc)
 
 
 # ── Visitor → AI path ──────────────────────────────────────────────────────
@@ -114,19 +86,6 @@ async def _handle_visitor_message(inbound: InboundChatMessage) -> None:
         store.save(conv_id, doc)
         logger.info(
             "[WEB-AI] AI is paused for conv=%s — skipping LLM reply",
-            conv_id,
-        )
-        return
-
-    # Suppress duplicate reply when the visitor's very first message is just
-    # a courtesy greeting ("hello", "hi", "olá", …) right after our automatic
-    # welcome message. The welcome already invited them to ask anything, so a
-    # second "Hi! How can I help?" from the LLM is pure noise and confuses the
-    # owner watching the conversation in Chatwoot.
-    if _is_greeting_after_welcome(doc, body):
-        store.save(conv_id, doc)
-        logger.info(
-            "[WEB-AI] Skipping LLM — visitor greeting follows auto-welcome conv=%s",
             conv_id,
         )
         return
@@ -161,13 +120,19 @@ async def _handle_visitor_message(inbound: InboundChatMessage) -> None:
     if sent_id:
         store.register_bot_message(doc, sent_id)
         store.append_message(doc, "assistant", llm_text)
+        # Persist BEFORE analytics — Chatwoot fires a message_created webhook
+        # for our outgoing reply, and that echo races against this save. If
+        # the save loses, the echo handler loads a doc that does not yet
+        # know about ``sent_id`` and treats it as a real human takeover,
+        # pausing the AI and posting the takeover hint for no reason.
+        store.save(conv_id, doc)
         _emit_analytics("web_chat.reply_sent", conv_id, {"language": language})
-    else:
-        logger.warning(
-            "[WEB-AI] Failed to deliver public reply for conv=%s — leaving history unchanged",
-            conv_id,
-        )
+        return
 
+    logger.warning(
+        "[WEB-AI] Failed to deliver public reply for conv=%s — leaving history unchanged",
+        conv_id,
+    )
     store.save(conv_id, doc)
 
 
@@ -365,77 +330,6 @@ def _is_escalation(text: str) -> bool:
     return prompt_mod.ESCALATE_TOKEN in text.strip().upper()
 
 
-# Bare greeting tokens across the languages the widget supports.
-_BARE_GREETINGS = frozenset({
-    # English
-    "hello", "hi", "hii", "hiii", "hey", "heyy", "yo", "sup", "hellow", "howdy",
-    # Portuguese
-    "olá", "ola", "oi", "oii",
-    # Spanish
-    "hola", "buenas",
-    # French
-    "bonjour", "salut", "coucou",
-    # German
-    "hallo", "moin", "servus",
-    # Italian
-    "ciao", "salve",
-    # Hindi / South Asian
-    "namaste", "namaskar",
-    # Arabic
-    "salam", "marhaba",
-    # Other
-    "ahoj",
-})
-
-_GREETING_OPENERS = (
-    "good morning", "good afternoon", "good evening", "good day",
-    "bom dia", "boa tarde", "boa noite",
-    "buenos días", "buenos dias", "buenas tardes", "buenas noches",
-    "guten morgen", "guten tag", "guten abend",
-    "bonjour", "bonsoir",
-)
-
-
-def _is_bare_greeting(text: str) -> bool:
-    """True when `text` is a pure courtesy greeting (no question, no content).
-
-    Conservative on purpose — must reject anything with question marks or more
-    than ~4 words so messages like "hello, how much does it cost?" still
-    trigger the normal LLM path.
-    """
-    if not text:
-        return False
-    if "?" in text:
-        return False
-    cleaned = text.strip().lower().rstrip("!.,;:").strip()
-    if not cleaned or len(cleaned.split()) > 4:
-        return False
-    if cleaned in _BARE_GREETINGS:
-        return True
-    return any(cleaned.startswith(opener) for opener in _GREETING_OPENERS)
-
-
-def _is_greeting_after_welcome(doc: dict[str, Any], body: str) -> bool:
-    """True when this is the visitor's first message and it is a bare greeting
-    that immediately follows our automatic welcome message.
-
-    The expected history shape is exactly two entries: our welcome (assistant)
-    and the current user message — anything more means the conversation has
-    already moved past the greeting moment.
-    """
-    if not doc.get("greetedAt"):
-        return False
-    if not _is_bare_greeting(body):
-        return False
-    messages = doc.get("messages") or []
-    if len(messages) != 2:
-        return False
-    return (
-        messages[0].get("role") == "assistant"
-        and messages[1].get("role") == "user"
-    )
-
-
 _LANG_ALIASES = {
     "pt-pt": "pt", "pt-br": "pt-br", "en-us": "en", "en-gb": "en",
     "es-es": "es", "es-mx": "es", "fr-fr": "fr", "de-de": "de",
@@ -469,11 +363,6 @@ def _guess_language_from_text(text: str) -> str:
         if any(w in lower for w in words):
             return lang
     return "en"
-
-
-def _utc_now_iso() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _emit_analytics(event: str, conv_id: str, props: dict[str, Any]) -> None:
