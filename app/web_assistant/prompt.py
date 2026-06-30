@@ -48,10 +48,10 @@ Our backend will replace this with a friendly human-handoff message.
 - Never include the {escalate_token} token in a real answer.
 
 # LANGUAGE RULE
-The visitor's locked-in language is: **{language_label}**.
-Always reply in that language, regardless of which language they switch to mid-conversation. \
-(If the visitor explicitly asks you to switch languages, reply briefly in the new \
-language and ask them to refresh the chat to confirm the change.)
+Always reply in **the same language the visitor uses in their most recent message**.
+If they write in English → reply in English. If they write in Portuguese → reply in Portuguese.
+Follow their language naturally — if they switch languages mid-conversation, switch with them immediately.
+Never tell the visitor you can only reply in a specific language.
 
 # SCOPE
 You ONLY discuss:
@@ -142,7 +142,7 @@ def _onboarding_link_section() -> str:
     )
 
 
-def build_system_prompt(language: str | None) -> str:
+def build_system_prompt() -> str:
     """Assemble the full system prompt with KB + learnings inlined."""
     # Main KB ships pre-formatted with section markers from global_kb_service.
     main_kb_text = global_kb_service.build_kb_prompt_section()
@@ -153,7 +153,6 @@ def build_system_prompt(language: str | None) -> str:
 
     return _SYSTEM_PROMPT_TEMPLATE.format(
         escalate_token=ESCALATE_TOKEN,
-        language_label=language_label(language),
         main_kb_header="MAIN KNOWLEDGE BASE (curated)",
         main_kb_body=main_kb_text,
         onboarding_link_block=_onboarding_link_section(),

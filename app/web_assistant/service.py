@@ -240,7 +240,7 @@ async def _ask_llm(
     from app.config import settings as _settings
     from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
 
-    system_prompt = prompt_mod.build_system_prompt(language)
+    system_prompt = prompt_mod.build_system_prompt()
 
     # Convert our compact history to the adapter format (which mirrors
     # Anthropic's). The newest visitor message is already inside history.
