@@ -126,6 +126,10 @@ async def _handle_visitor_message(inbound: InboundChatMessage) -> None:
         # know about ``sent_id`` and treats it as a real human takeover,
         # pausing the AI and posting the takeover hint for no reason.
         store.save(conv_id, doc)
+        # When an AgentBot is connected to the inbox, Chatwoot puts new
+        # conversations in "pending" state. Move to "open" so agents can
+        # see the conversation in their normal inbox view.
+        await transport.toggle_status(conv_id, "open")
         _emit_analytics("web_chat.reply_sent", conv_id, {"language": language})
         return
 
