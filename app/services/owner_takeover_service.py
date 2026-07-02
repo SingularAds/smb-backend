@@ -8,10 +8,10 @@ module turns that signal into the user-facing behaviour:
   * If the message is a resume command ("resume" / "resume ai"),
     clear the pause and confirm to the owner.
   * Otherwise it's a genuine takeover:
-      - pause AI for that customer for DEFAULT_PAUSE_MINUTES
+      - pause AI for that customer for DEFAULT_PAUSE_MINUTES (silently —
+        no "AI paused" notification or resume-command hint is sent)
       - record the owner's message in the conversation history so
         future AI replies (after auto-resume) have the context
-      - notify the owner that AI is paused (one-time, not per message)
 
 The webhook handler is responsible for filtering out our own API-sent
 messages (via ``is_our_outbound_echo``) before reaching this module — by the
@@ -180,17 +180,12 @@ async def handle_owner_message(
             )
         except Exception:
             pass
-        label = _format_customer_label(convo, phone_clean)
-        await _notify_owner_safely(
-            business,
-            (
-                f"🤖 *AI paused* for {label}.\n"
-                f"You're handling this chat — AI resumes automatically in "
-                f"{DEFAULT_PAUSE_MINUTES} minutes.\n\n"
-                f"To resume early (without the customer seeing), send this "
-                f"to your business WhatsApp number:\n"
-                f"*resume {phone_clean}*"
-            ),
+        # The pause is intentionally silent: no "AI paused" notification and no
+        # resume-command hint is sent to the owner. The owner can still resume
+        # early by sending "resume <phone>" — that flow stays active above.
+        logger.info(
+            "[OWNER-TAKEOVER] silent pause applied business=%s phone=%s (%d min)",
+            business_id, phone_clean, DEFAULT_PAUSE_MINUTES,
         )
 
 

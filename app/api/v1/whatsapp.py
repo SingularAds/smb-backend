@@ -291,6 +291,29 @@ async def _process_webhook(payload: dict) -> None:
         # our OWN API-sent replies (AI responses, owner-command replies,
         # automation notifications) since those also produce outbound echoes.
         if event == "owner_message":
+            # ── Replay suppression (mirror of the inbound-message guard) ─────
+            # A bridge restart replays the WhatsApp offline queue, including
+            # the owner's own outbound messages. Without this check a message
+            # the owner typed hours ago would re-trigger a fresh 90-minute AI
+            # pause. The bridge filters these too (Guard 0); this is the
+            # second line of defence in case an older bridge binary is live.
+            _own_ts = data.get("timestamp")
+            if _own_ts:
+                _own_age_s = _SERVER_START_WALL - int(_own_ts)
+                if _own_age_s > _REPLAY_GRACE_S:
+                    logger.info(
+                        "[OWNER-TAKEOVER] skipped — offline-replay owner_message "
+                        "(age=%ds > grace=%ds)",
+                        int(_own_age_s), _REPLAY_GRACE_S,
+                    )
+                    _log_event(
+                        "skipped",
+                        phone=data.get("chat_id", ""),
+                        message_id=data.get("message_id", ""),
+                        detail=f"offline-replay owner_message ({int(_own_age_s)}s old)",
+                    )
+                    return
+
             # ── Global onboarding number guard ───────────────────────────────
             # If this owner_message came from the Recepte global onboarding
             # number (configured via WHATSMEOW_GLOBAL_NUMBER), do NOT run the
@@ -315,6 +338,24 @@ async def _process_webhook(payload: dict) -> None:
                 return
 
             owner_msg_id = data.get("message_id", "")
+
+            # ── Bridge-retry dedup ───────────────────────────────────────────
+            # The bridge re-POSTs the same event up to 3 times when it cannot
+            # confirm delivery. Without this, a retried owner command (e.g.
+            # "today") would execute and reply twice.
+            if _is_duplicate(owner_msg_id):
+                logger.info(
+                    "[OWNER-TAKEOVER] skipped — duplicate owner_message id=%r (bridge retry)",
+                    owner_msg_id,
+                )
+                _log_event(
+                    "skipped",
+                    phone=data.get("chat_id", ""),
+                    message_id=owner_msg_id,
+                    detail="duplicate owner_message (bridge retry)",
+                )
+                return
+
             if is_our_outbound_echo(owner_msg_id):
                 logger.debug(
                     "[OWNER-TAKEOVER] skipping API-sent echo msg_id=%r device=%r",
@@ -660,9 +701,9 @@ async def _process_webhook(payload: dict) -> None:
             if business:
                 # Check if the sender is the business owner / admin
                 if is_owner_message(business, phone):
-                    print(
-                        f"[OWNER-CMD] device={device_id} owner_phone={phone} "
-                        f"msg_id={message_id!r} body={body[:60]!r}"
+                    logger.info(
+                        "[OWNER-CMD] device=%s owner_phone=%s msg_id=%r body=%r",
+                        device_id, phone, message_id, body[:60],
                     )
                     # ── Owner KB confirmation (YES KB-XXXX / NO KB-XXXX) ──────
                     # Must run BEFORE the referral handler because referral's
@@ -722,9 +763,9 @@ async def _process_webhook(payload: dict) -> None:
                 else:
                     # Respect autoReply flag — if disabled, silently skip AI response
                     logger.debug("Business autoReply setting: %s", business.get('autoReply'))
-                    print(
-                        f"[CUSTOMER-MSG] device={device_id} customer_phone={phone} "
-                        f"biz={biz_id} msg_id={message_id!r} body={(body or '<audio>')[:60]!r}"
+                    logger.info(
+                        "[CUSTOMER-MSG] device=%s customer_phone=%s biz=%s msg_id=%r body=%r",
+                        device_id, phone, biz_id, message_id, (body or "<audio>")[:60],
                     )
                     if business.get("autoReply") is False:
                         logger.info("Auto-reply disabled for business %s, skipping AI", business.get("id"))

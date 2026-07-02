@@ -148,8 +148,7 @@ class WhatsmeowClient:
                     headers={"X-Device-Id": device},
                 )
                 process_time = time.time() - start_time
-                logging.info(f"[LATENCY] WhatsApp OUT (whatsmeow) to {jid} took {process_time:.3f}s")
-                print("message is this: ", message)
+                logger.info("[LATENCY] WhatsApp OUT (whatsmeow) to %s took %.3fs", jid, process_time)
                 logger.debug("WhatsApp bridge response status: %s", resp.status_code)
                 logger.debug("WhatsApp bridge response text: %s", (resp.text or '')[:200])
                 # Bridge maps WhatsApp's 463 (cold-contact rate-limit) to HTTP 429.
@@ -312,45 +311,50 @@ class WhatsmeowClient:
 
         async with self._client(timeout=60.0) as client:
             try:
+                # The bridge transcodes whatever we send (MP3, WAV, …) to
+                # OGG/Opus before uploading, so the message is always stamped
+                # "audio/ogg; codecs=opus" regardless of the input mime_type.
+                # `mime_type` here only describes the bytes we're handing over.
                 resp = await client.post(
-                "/send/message",
-                json={
-                    "phone": jid,
-                    "type": "audio",
-                    "audio": {
-                        "data": audio_b64,
-                        "mimetype": "audio/ogg; codecs=opus"
+                    "/send/message",
+                    json={
+                        "phone": jid,
+                        "type": "audio",
+                        "audio": {
+                            "data": audio_b64,
+                            "mimetype": "audio/ogg; codecs=opus",
+                        },
+                        "ptt": ptt,
                     },
-                    "ptt": True
-                },
-                headers={"X-Device-Id": device},
-            )
+                    headers={"X-Device-Id": device},
+                )
                 logger.debug("Audio payload size: %d (base64 len: %d)", len(audio_bytes), len(audio_b64))
                 logger.debug("Audio send response status: %s", resp.status_code)
                 logger.debug("Audio send response text: %s", (resp.text or '')[:200])
                 resp.raise_for_status()
-                # Print delivery outcome for quick visibility (success)
                 try:
                     result = resp.json()
                 except Exception:
                     result = {"status_code": resp.status_code, "text": (resp.text or "")[:200]}
-                print(f"[AUDIO] Sent audio to {phone} (device={device}) status={resp.status_code} success=True")
+                # Register the sent message_id so the bridge's echo of this audio
+                # (an is_from_me event) is never mistaken for an owner takeover.
+                if isinstance(result, dict):
+                    _register_sent_id(result.get("message_id", ""))
+                logger.info(
+                    "[AUDIO] sent to %s (device=%s) status=%s", phone, device, resp.status_code
+                )
                 return result
             except httpx.ConnectError as exc:
                 logger.error(
                     "WhatsApp bridge unreachable for audio to %s (device=%s): %s",
                     phone, device, exc,
                 )
-                # Print failure for quick visibility
-                print(f"[AUDIO] Failed to send audio to {phone} (device={device}): ConnectError: {exc}")
                 raise
             except httpx.HTTPStatusError as exc:
                 logger.error(
                     "WhatsApp bridge returned %s for audio to %s (device=%s): %s",
                     exc.response.status_code, phone, device, exc.response.text[:200],
                 )
-                # Print failure for quick visibility
-                print(f"[AUDIO] Failed to send audio to {phone} (device={device}): HTTP {exc.response.status_code} {exc.response.text[:200]}")
                 raise
 
     async def generate_pair_code(

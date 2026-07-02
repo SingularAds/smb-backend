@@ -1892,7 +1892,6 @@ class CustomerAIService:
                     final_reply = _bk_pattern.sub(_true_id, final_reply)
 
             try:
-                print("AI (customer) generated reply:", final_reply)
                 logger.debug("AI (customer) generated reply: %s", final_reply)
             except Exception:
                 logger.exception("AI (customer) generated reply (logging failed)")
