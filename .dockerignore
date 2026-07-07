@@ -1,0 +1,54 @@
+# Python virtual environment (huge, host-specific, never needed in the image)
+env/
+venv/
+.venv/
+ENV/
+
+# Python bytecode / caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Git
+.git/
+.gitignore
+
+# Node — frontend deps are installed fresh in the Docker build stage;
+# host node_modules/dist must never leak into the build context
+dashboard/node_modules/
+dashboard/dist/
+node_modules/
+
+# Secrets — production reads these from Cloud Run env vars / mounted
+# Secret Manager volumes, never from files baked into the image
+.env
+.env.*
+serviceAccount.json
+credentials.json
+firebase-secret.json
+*.pem
+*.key
+
+# Runtime data regenerated on start / local-only artifacts
+media/
+scratch/
+*.log
+
+# Docs, reports, and test files not needed at runtime
+*.md
+tests/
+test_*.py
+*_report.txt
+e2e_results.txt
+guimas_check.json
+ov_check.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
