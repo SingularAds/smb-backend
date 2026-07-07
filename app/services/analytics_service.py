@@ -1,0 +1,1157 @@
+"""Internal analytics service — platform overview + per-business drill-down.
+
+Read-only aggregation layer for the internal (team-only) analytics dashboard.
+It NEVER writes to Firestore and never touches the live message pipeline
+(customer_ai_service / onboarding_service) — everything is derived from data
+the pipeline already persists.
+
+Field names and shapes here were verified against production data
+(2026-07-03 audit), which diverges from FIRESTORE_DB_STRUCTURE.md in several
+places the normalizers below account for:
+
+  • createdAt / trialEndsAt / booking datetime are a MIX of native Firestore
+    timestamps, ISO strings, and missing values           → _parse_dt()
+  • bookings use `service` OR `serviceName` (zero overlap) → _booking_service()
+  • complaints use `complaint` + `customer{phone,name}`, not the documented
+    `message` + `customerPhone`                            → normalize_complaint()
+  • conversations (the "legacy" subcollection) is the REAL conversation log:
+    transcript[{ts,role,text}] for voice, messages[{role,content}] for
+    WhatsApp, plus status/outcome/duration/summary.
+  • customer_conversations holds the live WhatsApp AI context (messages[])
+    and the CSAT markers. No csatRating exists in production yet — the
+    CSAT aggregates are built to return honest empty values.
+  • onboarding_sessions.currentStep spans TWO state machines (the current
+    conversational one and the retired awaiting_* one)     → funnel_stage()
+  • Businesses can be deleted while their subcollections remain (orphans) —
+    collection-group scans skip docs whose parent business is unknown.
+
+Range semantics: bookings / conversations / CSAT / growth / funnel are scoped
+to the requested date range; open complaints, pending knowledge gaps and
+account health flags are point-in-time (current state).
+
+`get_business_detail` is intentionally self-contained and auth-agnostic so it
+can later back an SMB-owner-facing endpoint under different auth without a
+rearchitecture.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Iterable
+
+from app import firestore as fs
+
+logger = logging.getLogger(__name__)
+
+# Firestore reads dominate request latency and are independent of each other —
+# run them concurrently (the google-cloud-firestore sync client is thread-safe
+# for reads). Wall time drops from the SUM of the scans to the slowest one.
+_io_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="analytics-io")
+
+
+def _parallel(tasks: dict[str, Callable[[], Any]]) -> dict[str, Any]:
+    """Run independent read tasks concurrently; raises the first failure."""
+    futures = {name: _io_pool.submit(fn) for name, fn in tasks.items()}
+    return {name: fut.result() for name, fut in futures.items()}
+
+# Caps so a single dashboard request can't run away on a large tenant.
+# _FETCH limits bound the Firestore reads; the table _LIMITs bound the rows
+# returned to the UI. Summary counts are computed on everything fetched
+# in-range (before the table cap) and a truncated flag is set when either
+# cap was hit.
+_GROUP_SCAN_LIMIT = 5000
+_DETAIL_FETCH_LIMIT = 2000
+_DETAIL_BOOKINGS_LIMIT = 300
+_DETAIL_CONVERSATIONS_LIMIT = 200
+_DETAIL_COMPLAINTS_LIMIT = 100
+_DETAIL_KB_LIMIT = 100
+
+_CACHE_TTL_S = 60
+_CACHE_MAX_ENTRIES = 64
+_overview_cache: dict[tuple, tuple[float, dict]] = {}
+_detail_cache: dict[tuple, tuple[float, dict]] = {}
+
+
+def _cache_get(cache: dict, key: tuple) -> dict | None:
+    hit = cache.get(key)
+    if hit and time.monotonic() - hit[0] < _CACHE_TTL_S:
+        return hit[1]
+    return None
+
+
+def _cache_put(cache: dict, key: tuple, value: dict) -> None:
+    if len(cache) >= _CACHE_MAX_ENTRIES:
+        # Drop the oldest entries (dict preserves insertion order)
+        for stale_key in list(cache)[: _CACHE_MAX_ENTRIES // 2]:
+            cache.pop(stale_key, None)
+    cache[key] = (time.monotonic(), value)
+
+
+# ── Date handling ─────────────────────────────────────────────────────────────
+
+def _parse_dt(value: Any) -> datetime | None:
+    """Normalize any production date representation to a UTC-aware datetime.
+
+    Handles native Firestore timestamps (datetime subclass), ISO strings
+    (aware or naive — naive is treated as UTC), and returns None for
+    anything unparseable.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        raw = value.strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _iso(dt: datetime | None) -> str | None:
+    return dt.isoformat() if dt else None
+
+
+def _in_range(dt: datetime | None, start: datetime, end: datetime) -> bool:
+    return dt is not None and start <= dt < end
+
+
+def resolve_range(
+    days: int | None,
+    date_from: str | None,
+    date_to: str | None,
+) -> tuple[datetime, datetime]:
+    """Resolve query params into a [start, end) UTC window.
+
+    Explicit from/to wins; otherwise `days` back from now (default 30).
+    `now` is truncated to the minute so preset windows produce IDENTICAL
+    (start, end) keys within the same minute — without this the response
+    caches key on a microsecond timestamp and never hit.
+    """
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    if date_from:
+        start = _parse_dt(date_from)
+        end = _parse_dt(date_to) if date_to else now
+        if start is None:
+            raise ValueError(f"Unparseable 'from' date: {date_from!r}")
+        if end is None:
+            raise ValueError(f"Unparseable 'to' date: {date_to!r}")
+        # A bare YYYY-MM-DD 'to' means "through the end of that day".
+        if date_to and len(date_to.strip()) == 10:
+            end = end + timedelta(days=1)
+        if end <= start:
+            raise ValueError("'to' must be after 'from'")
+        return start, end
+    span = days if days and days > 0 else 30
+    return now - timedelta(days=span), now
+
+
+# ── Test/demo account detection ───────────────────────────────────────────────
+
+_TEST_ID_MARKERS = ("client-test", "demo", "test")
+_TEST_NAME_MARKERS = ("test", "teste", "qa salon", "salão teste", "salao teste")
+
+
+def is_test_business(biz_id: str, biz: dict) -> bool:
+    """Heuristic flag for QA / demo / load-test accounts.
+
+    Verified against production: explicit isQABusiness/isDemoBusiness flags
+    exist on 8 docs; the other ~200 QA docs are identifiable by doc-id
+    prefixes (QA_*, client-test-*, *demo*) and names ("Salão Teste QA",
+    "Test Biz"). Heuristic by necessity — the dashboard exposes it as a
+    toggle, never silently.
+    """
+    if biz.get("isQABusiness") or biz.get("isDemoBusiness"):
+        return True
+    bid = (biz_id or "").lower()
+    if bid.startswith("qa_") or any(m in bid for m in _TEST_ID_MARKERS):
+        return True
+    name = str(biz.get("name") or "").lower()
+    return any(m in name for m in _TEST_NAME_MARKERS)
+
+
+def is_test_session(session_id: str, session: dict) -> bool:
+    """QA/test onboarding session detector — the funnel's include_test toggle
+    only filtered the businesses collection, so QA session docs
+    (``client-test-*``, ``qa_*``, ``*demo*``) leaked into the funnel as real
+    onboarders. onboarding_sessions doc ids are the owner phone/JID for real
+    users, or a synthetic QA id for test fixtures.
+    """
+    if session.get("isQABusiness") or session.get("isDemoBusiness") or session.get("isTest"):
+        return True
+    sid = (session_id or "").lower()
+    if sid.startswith("qa_") or any(m in sid for m in _TEST_ID_MARKERS):
+        return True
+    return False
+
+
+# ── Onboarding funnel ─────────────────────────────────────────────────────────
+
+# Ordered funnel stages. A session counts in the deepest stage it has reached;
+# funnel counts are cumulative (stage N includes everyone at stage >= N).
+FUNNEL_STAGES = ("started", "details_collected", "whatsapp_paired", "completed")
+
+# currentStep → stage, covering BOTH state machines seen in production
+# (current conversational machine + retired awaiting_* machine).
+_STEP_STAGE = {
+    # current machine
+    "conversing": "started",
+    "location_request": "started",
+    "places_pick": "started",
+    "website_confirm": "started",
+    "recepte_confirm": "started",
+    "referral_offer": "details_collected",
+    "pairing": "details_collected",
+    "pairing_mode_choice": "details_collected",
+    "pairing_qr_active": "details_collected",
+    "pairing_scam_warning": "details_collected",
+    "calendar_setup": "whatsapp_paired",
+    "call_forwarding": "whatsapp_paired",
+    "complete": "completed",
+    "post_onboarding": "completed",
+    # retired machine (docs still exist in production)
+    "awaiting_website": "started",
+    "awaiting_business_name": "started",
+    "awaiting_services": "started",
+    "awaiting_confirm": "details_collected",
+    "awaiting_pairing_done": "details_collected",
+    "awaiting_calendar": "whatsapp_paired",
+    "awaiting_forwarding": "whatsapp_paired",
+}
+
+
+def funnel_stage(session: dict) -> str:
+    """Deepest funnel stage an onboarding session has reached."""
+    step = (session.get("currentStep") or "").strip()
+    stage = _STEP_STAGE.get(step, "started")
+    # A session that already produced a business doc has at least collected
+    # the details, whatever step it is parked on.
+    if stage == "started" and session.get("businessId"):
+        stage = "details_collected"
+    return stage
+
+
+def is_registration_session(session: dict) -> bool:
+    """True when the session belongs to a prospective SMB owner actually
+    REGISTERING — the population the onboarding funnel measures.
+
+    onboarding_sessions also holds demo sessions (``mode``/``temporaryMode``/
+    ``salesPhase`` == "demo"): the AI roleplays a customer BOOKING conversation
+    so the visitor can see the product. Those are end-customer simulations,
+    not registrations, and must not inflate the funnel. A session currently in
+    demo mode still counts when it shows real registration progress — an owner
+    who paused onboarding to try the demo (``resumeOnboardingAfterDemo``/
+    ``onboardingContextBeforeDemo``), has extracted ``businessData``, created
+    a business, or already advanced past the conversational stage.
+    """
+    in_demo = (
+        session.get("mode") == "demo"
+        or session.get("temporaryMode") == "demo"
+        or session.get("salesPhase") == "demo"
+    )
+    if not in_demo:
+        return True
+    if session.get("businessId") or session.get("businessData"):
+        return True
+    if session.get("resumeOnboardingAfterDemo") or session.get("onboardingContextBeforeDemo"):
+        return True
+    step = (session.get("currentStep") or "").strip()
+    return _STEP_STAGE.get(step, "started") != "started"
+
+
+def _session_activity_dt(session: dict) -> datetime | None:
+    ts = session.get("timestamps") or {}
+    return _parse_dt(ts.get("lastActivityAt")) or _parse_dt(ts.get("startedAt"))
+
+
+def _session_started_dt(session: dict) -> datetime | None:
+    ts = session.get("timestamps") or {}
+    return _parse_dt(ts.get("startedAt")) or _parse_dt(ts.get("lastActivityAt"))
+
+
+# ── Normalizers ───────────────────────────────────────────────────────────────
+
+def _booking_service(b: dict) -> str | None:
+    # Production split: 246 docs use `service`, 163 use `serviceName`, 0 both.
+    return b.get("serviceName") or b.get("service") or None
+
+
+def _booking_dt(b: dict) -> datetime | None:
+    return _parse_dt(b.get("datetime") or b.get("dateTime") or b.get("date"))
+
+
+def normalize_booking(raw: dict, doc_id: str, business_id: str) -> dict:
+    dt = _booking_dt(raw)
+    return {
+        "id": doc_id,
+        "businessId": business_id,
+        "customerName": raw.get("customerName") or raw.get("customer_name") or None,
+        "customerPhone": raw.get("customerPhone") or raw.get("customer_phone") or None,
+        "service": _booking_service(raw),
+        "partySize": raw.get("partySize") or raw.get("party_size") or None,
+        "datetime": _iso(dt),
+        "status": raw.get("status") or "unknown",
+        "source": raw.get("source") or raw.get("channel") or None,
+        "notes": raw.get("notes") or raw.get("specialRequests") or None,
+        "createdAt": _iso(_parse_dt(raw.get("createdAt")) or dt),
+    }
+
+
+def _normalize_transcript(raw: dict) -> list[dict]:
+    """Return [{role, text, ts?}] from any production transcript shape.
+
+    Voice logs: transcript = [{ts, role, text}] (or a raw "AI: … Customer: …"
+    string on 3 legacy docs). WhatsApp logs: messages = [{role, content}].
+    """
+    transcript = raw.get("transcript")
+    if isinstance(transcript, list) and transcript:
+        out = []
+        for turn in transcript:
+            if not isinstance(turn, dict):
+                continue
+            out.append({
+                "role": turn.get("role") or "user",
+                "text": turn.get("text") or turn.get("content") or "",
+                "ts": _iso(_parse_dt(turn.get("ts"))),
+            })
+        return out
+    if isinstance(transcript, str) and transcript.strip():
+        out = []
+        for chunk in transcript.replace("Customer:", "\nCustomer:").replace("AI:", "\nAI:").split("\n"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            role = "assistant" if chunk.startswith(("AI:", "Assistant:")) else "user"
+            out.append({"role": role, "text": chunk.split(":", 1)[-1].strip(), "ts": None})
+        return out
+    messages = raw.get("messages")
+    if isinstance(messages, list):
+        return [
+            {
+                "role": m.get("role") or "user",
+                "text": m.get("content") or m.get("text") or "",
+                "ts": None,
+            }
+            for m in messages
+            if isinstance(m, dict)
+        ]
+    return []
+
+
+def _conversation_channel(raw: dict) -> str:
+    if raw.get("channel"):
+        return raw["channel"]
+    source = raw.get("source") or ""
+    if "voice" in source or raw.get("callSid"):
+        return "voice"
+    return "unknown"
+
+
+def normalize_conversation(raw: dict, doc_id: str, business_id: str) -> dict:
+    started = _parse_dt(raw.get("startedAt") or raw.get("createdAt"))
+    return {
+        "id": doc_id,
+        "businessId": business_id,
+        "channel": _conversation_channel(raw),
+        "customerPhone": raw.get("customerPhone") or None,
+        "customerName": raw.get("callerName") or raw.get("customerName") or None,
+        "startedAt": _iso(started),
+        "endedAt": _iso(_parse_dt(raw.get("endedAt"))),
+        "durationSeconds": raw.get("duration") if isinstance(raw.get("duration"), (int, float)) else None,
+        "status": raw.get("status") or None,
+        "outcome": raw.get("outcome") or None,
+        "summary": raw.get("summary") or None,
+        "bookingId": raw.get("bookingId") or None,
+        "messageCount": len(raw.get("transcript") or raw.get("messages") or []) or None,
+        "live": False,
+    }
+
+
+def normalize_live_conversation(raw: dict, doc_id: str, business_id: str) -> dict:
+    """A customer_conversations doc (live WhatsApp AI context) shaped like a
+    conversation row so both sources can share one table."""
+    last = _parse_dt(raw.get("lastMessageAt"))
+    return {
+        "id": f"live-{doc_id}",
+        "businessId": business_id,
+        "channel": "whatsapp",
+        "customerPhone": raw.get("customerPhone") or doc_id,
+        "customerName": raw.get("customerName") or None,
+        "startedAt": _iso(last),  # only the last-activity timestamp is stored
+        "endedAt": None,
+        "durationSeconds": None,
+        "status": "active",
+        "outcome": None,
+        "summary": None,
+        "bookingId": None,
+        "messageCount": len(raw.get("messages") or []) or None,
+        "live": True,
+        "aiPaused": bool(raw.get("aiPaused")),
+    }
+
+
+def normalize_complaint(raw: dict, doc_id: str, business_id: str) -> dict:
+    customer = raw.get("customer") if isinstance(raw.get("customer"), dict) else {}
+    return {
+        "id": doc_id,
+        "businessId": business_id,
+        "text": raw.get("complaint") or raw.get("message") or "",
+        "type": raw.get("complaintType") or None,
+        "customerPhone": customer.get("phone") or raw.get("customerPhone") or None,
+        "customerName": customer.get("name") or None,
+        "bookingId": raw.get("bookingId") or None,
+        "status": raw.get("status") or "open",
+        "createdAt": _iso(_parse_dt(raw.get("createdAt"))),
+    }
+
+
+def normalize_kb_entry(raw: dict, doc_id: str, business_id: str) -> dict:
+    return {
+        "id": doc_id,
+        "businessId": business_id,
+        "shortCode": raw.get("shortCode") or None,
+        "question": raw.get("question") or "",
+        "answer": raw.get("answer") or None,
+        "status": raw.get("status") or "pending_review",
+        "useCount": raw.get("useCount") or 0,
+        "createdAt": _iso(_parse_dt(raw.get("createdAt"))),
+        "confirmedAt": _iso(_parse_dt(raw.get("confirmedAt"))),
+    }
+
+
+def _csat_points(customer_convos: Iterable[dict], customers: Iterable[dict]) -> list[dict]:
+    """CSAT data points from both persistence spots (verified empty in
+    production today — this returns [] until ratings arrive)."""
+    points: list[dict] = []
+    for c in customer_convos:
+        rating = c.get("csatRating")
+        if isinstance(rating, (int, float)) and 1 <= rating <= 5:
+            points.append({
+                "rating": float(rating),
+                "at": _iso(_parse_dt(c.get("csatRatedAt"))),
+                "customerPhone": c.get("customerPhone") or c.get("id"),
+            })
+    for cust in customers:
+        for h in cust.get("csatHistory") or []:
+            if isinstance(h, dict) and isinstance(h.get("rating"), (int, float)):
+                points.append({
+                    "rating": float(h["rating"]),
+                    "at": _iso(_parse_dt(h.get("at"))),
+                    "customerPhone": cust.get("phone") or cust.get("id"),
+                })
+    # Dedupe (same rating event can exist in both spots), newest last.
+    seen: set[tuple] = set()
+    unique = []
+    for p in sorted(points, key=lambda p: p["at"] or ""):
+        key = (p["customerPhone"], p["at"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(p)
+    return unique
+
+
+def _avg(values: list[float]) -> float | None:
+    return round(sum(values) / len(values), 2) if values else None
+
+
+def _daily_series(
+    start: datetime,
+    end: datetime,
+    series: dict[str, dict[str, int]],
+) -> list[dict]:
+    """Expand per-day counters into a dense day-by-day list over [start, end].
+
+    ``series`` maps output field name -> {"YYYY-MM-DD": count}. Days with no
+    events are emitted as 0 so charts get a continuous axis.
+    """
+    out: list[dict] = []
+    day = start.date()
+    last = end.date()
+    while day <= last:
+        key = day.isoformat()
+        row: dict = {"date": key}
+        for name, counts in series.items():
+            row[name] = counts.get(key, 0)
+        out.append(row)
+        day += timedelta(days=1)
+    return out
+
+
+# ── Business profile row ──────────────────────────────────────────────────────
+
+def _trial_days_left(biz: dict, now: datetime) -> int | None:
+    ends = _parse_dt(biz.get("trialEndsAt"))
+    if ends is None:
+        return None
+    return (ends - now).days
+
+
+def business_profile(biz_id: str, biz: dict, now: datetime) -> dict:
+    """Normalized profile fields shared by the accounts table and the
+    detail header. Only fields verified to exist in production."""
+    created = _parse_dt(biz.get("createdAt"))
+    return {
+        "id": biz_id,
+        "name": biz.get("name") or "(unnamed)",
+        "ownerName": biz.get("ownerName") or None,
+        "ownerPhone": biz.get("ownerPhone") or None,
+        "businessType": biz.get("businessType") or None,
+        "plan": biz.get("plan") or None,
+        "status": biz.get("status") or None,
+        "primaryLanguage": biz.get("primaryLanguage") or None,
+        "createdAt": _iso(created),
+        "trialEndsAt": _iso(_parse_dt(biz.get("trialEndsAt"))),
+        "trialDaysLeft": _trial_days_left(biz, now),
+        "whatsappPaired": bool(biz.get("waSessionId")),
+        "waPhoneNumber": biz.get("waPhoneNumber") or None,
+        "isTest": is_test_business(biz_id, biz),
+    }
+
+
+# ── Firestore reads (all read-only) ──────────────────────────────────────────
+
+def _stream_collection(name: str) -> list[tuple[str, dict]]:
+    return [(doc.id, doc.to_dict() or {}) for doc in fs._db().collection(name).stream()]
+
+
+def _stream_group(
+    sub: str,
+    limit: int = _GROUP_SCAN_LIMIT,
+    fields: list[str] | None = None,
+) -> list[tuple[str, str, dict]]:
+    """Collection-group scan → [(business_id, doc_id, data)].
+
+    Only docs directly under businesses/{id}/{sub} are returned; anything
+    else (or malformed paths) is skipped. Pass ``fields`` to run a
+    PROJECTION query — aggregates only need a handful of fields, and
+    skipping heavyweight payloads (conversation transcripts especially)
+    cuts transfer time by an order of magnitude.
+    """
+    query = fs._db().collection_group(sub)
+    if fields:
+        query = query.select(fields)
+    out: list[tuple[str, str, dict]] = []
+    for doc in query.limit(limit).stream():
+        parts = doc.reference.path.split("/")
+        if len(parts) == 4 and parts[0] == "businesses" and parts[2] == sub:
+            out.append((parts[1], doc.id, doc.to_dict() or {}))
+    return out
+
+
+def _stream_subcollection(
+    business_id: str,
+    sub: str,
+    limit: int,
+    fields: list[str] | None = None,
+    order_desc_by: str | None = None,
+) -> list[tuple[str, dict]]:
+    query = (
+        fs._db().collection("businesses").document(business_id).collection(sub)
+    )
+    if fields:
+        query = query.select(fields)
+    if order_desc_by:
+        query = query.order_by(
+            order_desc_by, direction=fs.fb_firestore.Query.DESCENDING,
+        )
+    return [(doc.id, doc.to_dict() or {}) for doc in query.limit(limit).stream()]
+
+
+# ── Platform overview ─────────────────────────────────────────────────────────
+
+def get_platform_overview(
+    start: datetime,
+    end: datetime,
+    include_test: bool = False,
+) -> dict:
+    """Funnel + growth + aggregate KPIs + accounts table for Screen 1."""
+    cache_key = (start.isoformat(), end.isoformat(), include_test)
+    cached = _cache_get(_overview_cache, cache_key)
+    if cached is not None:
+        return cached
+
+    now = datetime.now(timezone.utc)
+
+    # All reads are independent — fetch them concurrently, and as PROJECTION
+    # queries wherever the overview only aggregates (it never renders
+    # transcripts, messages, or profile blobs from these scans).
+    fetch_start = time.monotonic()
+    loaded = _parallel({
+        "businesses": lambda: _stream_collection("businesses"),
+        "sessions": lambda: _stream_collection("onboarding_sessions"),
+        "bookings": lambda: _stream_group(
+            "bookings",
+            fields=["createdAt", "datetime", "dateTime", "date", "status"],
+        ),
+        "conversations": lambda: _stream_group(
+            "conversations",
+            fields=["startedAt", "createdAt", "outcome"],
+        ),
+        "complaints": lambda: _stream_group("complaints", fields=["status"]),
+        "kb_entries": lambda: _stream_group("knowledge", fields=["status"]),
+        "live_convos": lambda: _stream_group(
+            "customer_conversations",
+            fields=["lastMessageAt", "csatRating", "csatRatedAt"],
+        ),
+        "customers": lambda: _stream_group(
+            "customers", fields=["lastSeen", "csatHistory"],
+        ),
+    })
+    logger.info(
+        "[ANALYTICS] overview parallel fetch took %.2fs",
+        time.monotonic() - fetch_start,
+    )
+
+    # Businesses + profiles
+    all_businesses = loaded["businesses"]
+    profiles: dict[str, dict] = {bid: business_profile(bid, b, now) for bid, b in all_businesses}
+    if include_test:
+        visible_ids = set(profiles)
+    else:
+        visible_ids = {bid for bid, p in profiles.items() if not p["isTest"]}
+
+    def _visible(biz_id: str) -> bool:
+        return biz_id in visible_ids
+
+    # Onboarding sessions → funnel (sessions started in range; when a session
+    # has no startedAt at all we include it rather than lose it). ONLY owner
+    # registration sessions count — demo/booking-roleplay sessions are the
+    # end-customer simulation and are excluded (tracked separately).
+    biz_by_owner: dict[str, dict] = {}
+    for bid, p in profiles.items():
+        if p.get("ownerPhone") and not p.get("isTest"):
+            biz_by_owner[p["ownerPhone"]] = p
+
+    sessions = loaded["sessions"]
+    stage_counts = {s: 0 for s in FUNNEL_STAGES}
+    # Per-stage session detail lists for the drill-down modal.
+    # Each entry holds enough info to identify and contact the owner.
+    stage_sessions: dict[str, list[dict]] = {s: [] for s in FUNNEL_STAGES}
+    active_sessions = 0
+    excluded_demo_sessions = 0
+    for doc_id, sess in sessions:
+        # A date-ranged funnel must be built from DATED activity only. A session
+        # with no startedAt/lastActivityAt cannot be attributed to any window, so
+        # it must NOT be counted "today" (or in every range). Previously the guard
+        # was `started is not None and not _in_range(...)`, which let null-timestamp
+        # docs fall through into every range and inflate the count (e.g. "5 started
+        # today" when only 1 person actually started — the other 4 were timeless
+        # QA/legacy docs). `_in_range(None, ...)` is False, so this skips both
+        # out-of-range and timeless docs.
+        started = _session_started_dt(sess)
+        if not _in_range(started, start, end):
+            continue
+        # QA/test onboarding sessions (client-test-*, qa_*, *demo*) are not real
+        # onboarders; the include_test toggle only filtered businesses before, so
+        # these leaked into the funnel. Always exclude them here.
+        if is_test_session(doc_id, sess):
+            continue
+        if not is_registration_session(sess):
+            excluded_demo_sessions += 1
+            continue
+        active_sessions += 1
+        stage = funnel_stage(sess)
+
+        # Cross-reference with business collection: if a business exists for this owner phone,
+        # the onboarding is authoritatively "completed" for this cohort member.
+        owner_phone = sess.get("ownerPhone")
+        biz_data = biz_by_owner.get(owner_phone or "")
+        if owner_phone and biz_data:
+            stage = "completed"
+
+        # cumulative: reaching a deep stage counts for all earlier stages
+        for s in FUNNEL_STAGES[: FUNNEL_STAGES.index(stage) + 1]:
+            stage_counts[s] += 1
+
+        # Record owner in their deepest stage bucket for the drill-down modal.
+        # The onboarding_sessions DOC ID is the owner phone/JID — use it as the
+        # identifier fallback (previously the loop discarded doc_id and read a
+        # non-existent sess['id'] field, rendering these rows as "unknown").
+        biz_name = (biz_data or {}).get("name") or (
+            (sess.get("businessData") or {}).get("businessName")
+        )
+        stage_sessions[stage].append({
+            "phone": owner_phone or sess.get("id") or doc_id,
+            "name": sess.get("pushName") or (biz_data or {}).get("ownerName"),
+            "businessName": biz_name,
+            "currentStep": sess.get("currentStep"),
+            "startedAt": started.isoformat() if started else None,
+            "businessId": (biz_data or {}).get("id"),
+        })
+
+    # "Completed" is authoritative from businesses created in range (sessions
+    # may be deleted after onboarding finishes). The funnel ALWAYS excludes
+    # test businesses regardless of the include_test toggle: bulk-created QA
+    # accounts never went through the onboarding pipeline, and counting them
+    # here would show a completed stage larger than the stages before it.
+    businesses_created = [
+        p for bid, p in profiles.items()
+        if _visible(bid) and _in_range(_parse_dt(p["createdAt"]), start, end)
+    ]
+    non_test_created = sum(
+        1 for p in profiles.values()
+        if not p["isTest"] and _in_range(_parse_dt(p["createdAt"]), start, end)
+    )
+    stage_counts["completed"] = max(stage_counts["completed"], non_test_created)
+
+    # Ensure standard funnel monotonicity (Started >= Details Collected >= WhatsApp Paired >= Completed)
+    # to prevent funnel inversion when completed sessions were deleted.
+    stage_counts["whatsapp_paired"] = max(stage_counts["whatsapp_paired"], stage_counts["completed"])
+    stage_counts["details_collected"] = max(stage_counts["details_collected"], stage_counts["whatsapp_paired"])
+    stage_counts["started"] = max(stage_counts["started"], stage_counts["details_collected"])
+
+    # Per-stage completion (% of everyone who started) and drop-off (how many
+    # left between this stage and the previous one) — the "who is leaving and
+    # where" view. Drops are clamped at 0: "completed" can legitimately exceed
+    # a session-derived stage when finished sessions were already deleted.
+    started_total = stage_counts["started"]
+    labels = {
+        "started": "Started chatting",
+        "details_collected": "Business details collected",
+        "whatsapp_paired": "WhatsApp paired",
+        "completed": "Fully onboarded (business created)",
+    }
+    # Make stage_sessions cumulative to match stage_counts.
+    # A session in the "completed" bucket must also appear when the user clicks
+    # "WhatsApp paired", "Business details collected", or "Started chatting"
+    # because stage_counts is cumulative too. Build a new dict so we don't
+    # mutate the deepest-bucket data while iterating.
+    cumulative_stage_sessions: dict[str, list[dict]] = {}
+    for i, stage_key in enumerate(FUNNEL_STAGES):
+        merged: list[dict] = []
+        for s in FUNNEL_STAGES[i:]:      # this stage + every deeper stage
+            merged.extend(stage_sessions[s])
+        cumulative_stage_sessions[stage_key] = sorted(
+            merged, key=lambda x: x["startedAt"] or "", reverse=True
+        )
+    stage_sessions = cumulative_stage_sessions
+
+    funnel = []
+    prev_count: int | None = None
+    for stage_key in FUNNEL_STAGES:
+        count = stage_counts[stage_key]
+        dropped = max(prev_count - count, 0) if prev_count is not None else 0
+        funnel.append({
+            "stage": stage_key,
+            "label": labels[stage_key],
+            "count": count,
+            "pctOfStarted": round(count / started_total, 4) if started_total else None,
+            "dropped": dropped,
+            "dropPct": (
+                round(dropped / prev_count, 4)
+                if prev_count not in (None, 0) else None
+            ),
+            # Per-user details for the dashboard drill-down modal.
+            # Already sorted most-recent first by the cumulative merge above.
+            "sessions": stage_sessions.get(stage_key, []),
+        })
+        prev_count = count
+
+    # Growth: new businesses per day across the range
+    day_counts: dict[str, int] = defaultdict(int)
+    for p in businesses_created:
+        day_counts[p["createdAt"][:10]] += 1
+    growth = _daily_series(start, end, {"newBusinesses": day_counts})
+
+    # Collection-group scans (prefetched above), bucketed per business
+    bookings = loaded["bookings"]
+    conversations = loaded["conversations"]
+    complaints = loaded["complaints"]
+    kb_entries = loaded["kb_entries"]
+    live_convos = loaded["live_convos"]
+    customers = loaded["customers"]
+
+    per_biz: dict[str, dict] = defaultdict(lambda: {
+        "bookings": 0, "conversations": 0, "openComplaints": 0,
+        "pendingKnowledgeGaps": 0, "lastCustomerActivityAt": None,
+    })
+
+    def _bump_activity(biz_id: str, dt: datetime | None) -> None:
+        if dt is None:
+            return
+        cur = per_biz[biz_id]["lastCustomerActivityAt"]
+        if cur is None or dt.isoformat() > cur:
+            per_biz[biz_id]["lastCustomerActivityAt"] = dt.isoformat()
+
+    conv_by_day: dict[str, int] = defaultdict(int)
+    book_by_day: dict[str, int] = defaultdict(int)
+
+    total_bookings = 0
+    bookings_by_status: dict[str, int] = defaultdict(int)
+    for biz_id, _, b in bookings:
+        if biz_id not in profiles or not _visible(biz_id):
+            continue
+        created = _parse_dt(b.get("createdAt")) or _booking_dt(b)
+        _bump_activity(biz_id, created)
+        if _in_range(created, start, end):
+            per_biz[biz_id]["bookings"] += 1
+            total_bookings += 1
+            bookings_by_status[b.get("status") or "unknown"] += 1
+            book_by_day[created.date().isoformat()] += 1
+
+    total_conversations = 0
+    outcomes: dict[str, int] = defaultdict(int)
+    for biz_id, _, c in conversations:
+        if biz_id not in profiles or not _visible(biz_id):
+            continue
+        started = _parse_dt(c.get("startedAt") or c.get("createdAt"))
+        _bump_activity(biz_id, started)
+        if _in_range(started, start, end):
+            per_biz[biz_id]["conversations"] += 1
+            total_conversations += 1
+            conv_by_day[started.date().isoformat()] += 1
+            if c.get("outcome"):
+                outcomes[c["outcome"]] += 1
+
+    for biz_id, doc_id, c in live_convos:
+        if biz_id not in profiles or not _visible(biz_id):
+            continue
+        last = _parse_dt(c.get("lastMessageAt"))
+        _bump_activity(biz_id, last)
+        # Live WhatsApp chats have no closed conversation log yet — count the
+        # ones active in range so WhatsApp activity isn't invisible.
+        if _in_range(last, start, end):
+            per_biz[biz_id]["conversations"] += 1
+            total_conversations += 1
+            conv_by_day[last.date().isoformat()] += 1
+
+    open_complaints = 0
+    for biz_id, _, comp in complaints:
+        if biz_id not in profiles or not _visible(biz_id):
+            continue
+        if (comp.get("status") or "open") == "open":
+            per_biz[biz_id]["openComplaints"] += 1
+            open_complaints += 1
+
+    pending_gaps = 0
+    for biz_id, _, entry in kb_entries:
+        if biz_id not in profiles or not _visible(biz_id):
+            continue
+        if entry.get("status") in ("pending_review", "awaiting_answer"):
+            per_biz[biz_id]["pendingKnowledgeGaps"] += 1
+            pending_gaps += 1
+
+    # CSAT (verified empty in production today — stays honest when it fills up)
+    csat_values = []
+    for biz_id, doc_id, c in live_convos:
+        if not _visible(biz_id):
+            continue
+        rated = _parse_dt(c.get("csatRatedAt"))
+        if isinstance(c.get("csatRating"), (int, float)) and _in_range(rated, start, end):
+            csat_values.append(float(c["csatRating"]))
+    for biz_id, _, cust in customers:
+        if not _visible(biz_id):
+            continue
+        _bump_activity(biz_id, _parse_dt(cust.get("lastSeen")))
+        for h in cust.get("csatHistory") or []:
+            if isinstance(h, dict) and isinstance(h.get("rating"), (int, float)):
+                if _in_range(_parse_dt(h.get("at")), start, end):
+                    csat_values.append(float(h["rating"]))
+
+    outcome_total = sum(outcomes.values())
+    booked = outcomes.get("booked", 0)
+
+    # Owner-activity proxy: last message the owner sent on the platform
+    # onboarding number (onboarding_sessions doc id == owner phone).
+    owner_activity: dict[str, str] = {}
+    for phone, sess in sessions:
+        dt = _session_activity_dt(sess)
+        if dt:
+            owner_activity[phone] = dt.isoformat()
+
+    accounts = []
+    for bid, p in profiles.items():
+        if not _visible(bid):
+            continue
+        counts = per_biz.get(bid) or {
+            "bookings": 0, "conversations": 0, "openComplaints": 0,
+            "pendingKnowledgeGaps": 0, "lastCustomerActivityAt": None,
+        }
+        accounts.append({
+            **p,
+            "bookingsInRange": counts["bookings"],
+            "conversationsInRange": counts["conversations"],
+            "openComplaints": counts["openComplaints"],
+            "pendingKnowledgeGaps": counts["pendingKnowledgeGaps"],
+            "lastCustomerActivityAt": counts["lastCustomerActivityAt"],
+            "lastOwnerActivityAt": owner_activity.get(p["ownerPhone"] or ""),
+        })
+    accounts.sort(key=lambda a: a["createdAt"] or "", reverse=True)
+
+    result = {
+        "range": {"from": _iso(start), "to": _iso(end)},
+        "includeTest": include_test,
+        "funnel": funnel,
+        "activeOnboardingSessions": active_sessions,
+        "excludedDemoSessions": excluded_demo_sessions,
+        "growth": growth,
+        "activity": _daily_series(
+            start, end,
+            {"conversations": conv_by_day, "bookings": book_by_day},
+        ),
+        "aggregate": {
+            "totalBusinesses": len(accounts),
+            "newBusinessesInRange": len(businesses_created),
+            "whatsappPaired": sum(1 for a in accounts if a["whatsappPaired"]),
+            "totalConversations": total_conversations,
+            "totalBookings": total_bookings,
+            "bookingsByStatus": dict(bookings_by_status),
+            "conversationOutcomes": dict(outcomes),
+            # booked conversations ÷ conversations with a recorded outcome
+            "bookingConversion": round(booked / outcome_total, 4) if outcome_total else None,
+            "avgCsat": _avg(csat_values),
+            "csatResponses": len(csat_values),
+            "openComplaints": open_complaints,
+            "pendingKnowledgeGaps": pending_gaps,
+        },
+        "accounts": accounts,
+    }
+    _cache_put(_overview_cache, cache_key, result)
+    return result
+
+
+# ── Business detail (Screen 2) ────────────────────────────────────────────────
+
+def get_business_detail(
+    business_id: str,
+    start: datetime,
+    end: datetime,
+) -> dict | None:
+    """Everything the drill-down screen needs for one business.
+
+    Auth-agnostic and self-contained on purpose: a future SMB-owner-facing
+    endpoint can call this under its own auth without changes here.
+    Returns None when the business doc does not exist.
+    """
+    cache_key = (business_id, start.isoformat(), end.isoformat())
+    cached = _cache_get(_detail_cache, cache_key)
+    if cached is not None:
+        return cached
+
+    # The business doc and all subcollections are independent reads — fetch
+    # them concurrently. Conversations use a TWO-TIER fetch: a projection
+    # query (no transcripts) over everything for counts/outcomes/daily
+    # activity, and full docs for only the newest ~300 — all the table can
+    # ever show — so transcripts for a 1,000-conversation tenant no longer
+    # ride along just to be counted.
+    fetch_start = time.monotonic()
+    loaded = _parallel({
+        "biz": lambda: fs.get_business_by_id(business_id),
+        "bookings_raw": lambda: _stream_subcollection(business_id, "bookings", _DETAIL_FETCH_LIMIT),
+        "convos_meta": lambda: _stream_subcollection(
+            business_id, "conversations", _DETAIL_FETCH_LIMIT,
+            fields=["startedAt", "createdAt", "outcome"],
+        ),
+        "convos_recent": lambda: _stream_subcollection(
+            business_id, "conversations", _DETAIL_CONVERSATIONS_LIMIT + 100,
+            order_desc_by="startedAt",
+        ),
+        "live_raw": lambda: _stream_subcollection(business_id, "customer_conversations", 200),
+        "customers_raw": lambda: _stream_subcollection(business_id, "customers", 500),
+        "complaints_raw": lambda: _stream_subcollection(business_id, "complaints", _DETAIL_COMPLAINTS_LIMIT),
+        "kb_raw": lambda: _stream_subcollection(business_id, "knowledge", _DETAIL_KB_LIMIT),
+    })
+    logger.info(
+        "[ANALYTICS] detail parallel fetch (%s) took %.2fs",
+        business_id, time.monotonic() - fetch_start,
+    )
+    biz = loaded["biz"]
+    if biz is None:
+        return None
+    now = datetime.now(timezone.utc)
+    profile = business_profile(business_id, biz, now)
+
+    # Owner-activity proxy (see overview) + onboarding session state if present
+    session = fs.get_onboarding_session(profile["ownerPhone"]) if profile["ownerPhone"] else None
+    if session:
+        profile["lastOwnerActivityAt"] = _iso(_session_activity_dt(session))
+        profile["onboardingStep"] = session.get("currentStep") or None
+    else:
+        profile["lastOwnerActivityAt"] = None
+        profile["onboardingStep"] = None
+
+    # Extra header facts (verified fields only)
+    profile["address"] = biz.get("address") or None
+    profile["timezone"] = biz.get("timezone") or None
+    profile["services"] = [
+        {
+            "name": s.get("name"),
+            "price": s.get("price"),
+            "duration": s.get("duration") or s.get("durationMinutes"),
+        }
+        for s in (biz.get("services") or [])
+        if isinstance(s, dict)
+    ]
+    # hours: hoursRaw is free text, hoursText (seen on Guimas) is a list of
+    # per-day strings — normalize both to list[str] for one frontend shape.
+    hours_raw = biz.get("hoursRaw") or biz.get("hoursText") or None
+    if isinstance(hours_raw, str):
+        profile["hours"] = [hours_raw]
+    elif isinstance(hours_raw, list):
+        profile["hours"] = [str(h) for h in hours_raw if h]
+    else:
+        profile["hours"] = None
+    profile["openingDays"] = biz.get("openingDays") or None
+    profile["automations"] = biz.get("automations") or None
+
+    # Bookings (range-scoped by booking datetime, newest first)
+    bookings_raw = loaded["bookings_raw"]
+    bookings = []
+    status_counts: dict[str, int] = defaultdict(int)
+    for doc_id, b in bookings_raw:
+        norm = normalize_booking(b, doc_id, business_id)
+        ref_dt = _parse_dt(norm["datetime"]) or _parse_dt(norm["createdAt"])
+        if not _in_range(ref_dt, start, end):
+            continue
+        bookings.append(norm)
+        status_counts[norm["status"]] += 1
+    bookings.sort(key=lambda b: b["datetime"] or b["createdAt"] or "", reverse=True)
+    bookings_in_range = len(bookings)
+    bookings_truncated = (
+        bookings_in_range > _DETAIL_BOOKINGS_LIMIT
+        or len(bookings_raw) >= _DETAIL_FETCH_LIMIT
+    )
+    # Daily series over everything in range (before the table cap)
+    book_by_day: dict[str, int] = defaultdict(int)
+    for b in bookings:
+        ref = b["datetime"] or b["createdAt"]
+        if ref:
+            book_by_day[ref[:10]] += 1
+    bookings = bookings[:_DETAIL_BOOKINGS_LIMIT]
+
+    # Conversations — counts/outcomes/daily activity from the projection scan
+    # (covers EVERYTHING in range), table rows + transcripts from the full
+    # fetch of the newest ~300. Legacy docs with no startedAt (a few dozen)
+    # are still counted via the meta scan but can't appear in the table
+    # (order_by drops docs missing the field) — an accepted trade-off.
+    convos_meta = loaded["convos_meta"]
+    live_raw = loaded["live_raw"]
+
+    conversations_in_range = 0
+    outcome_counts: dict[str, int] = defaultdict(int)
+    conv_by_day: dict[str, int] = defaultdict(int)
+    for _, c in convos_meta:
+        started = _parse_dt(c.get("startedAt") or c.get("createdAt"))
+        if not _in_range(started, start, end):
+            continue
+        conversations_in_range += 1
+        conv_by_day[started.date().isoformat()] += 1
+        if c.get("outcome"):
+            outcome_counts[c["outcome"]] += 1
+
+    conversations = []
+    transcripts: dict[str, list[dict]] = {}
+    for doc_id, c in loaded["convos_recent"]:
+        norm = normalize_conversation(c, doc_id, business_id)
+        if not _in_range(_parse_dt(norm["startedAt"]), start, end):
+            continue
+        conversations.append(norm)
+        transcripts[norm["id"]] = _normalize_transcript(c)
+
+    for doc_id, c in live_raw:
+        norm = normalize_live_conversation(c, doc_id, business_id)
+        last = _parse_dt(norm["startedAt"])
+        if not _in_range(last, start, end):
+            continue
+        conversations.append(norm)
+        transcripts[norm["id"]] = _normalize_transcript(c)
+        # live chats have no closed log — count them alongside the meta scan
+        conversations_in_range += 1
+        conv_by_day[last.date().isoformat()] += 1
+
+    # All-time context so the UI can say "data exists outside this range"
+    # instead of showing a bare empty state (counts are bounded by the fetch
+    # cap, which is far above current per-business volumes).
+    _all_booking_dts = [
+        d for _, b in bookings_raw
+        if (d := (_parse_dt(b.get("createdAt")) or _booking_dt(b))) is not None
+    ]
+    _all_conv_dts = [
+        d for _, c in convos_meta
+        if (d := _parse_dt(c.get("startedAt") or c.get("createdAt"))) is not None
+    ] + [
+        d for _, c in live_raw
+        if (d := _parse_dt(c.get("lastMessageAt"))) is not None
+    ]
+    all_time = {
+        "bookings": len(bookings_raw),
+        "conversations": len(convos_meta) + len(live_raw),
+        "lastBookingAt": _iso(max(_all_booking_dts)) if _all_booking_dts else None,
+        "lastConversationAt": _iso(max(_all_conv_dts)) if _all_conv_dts else None,
+    }
+
+    conversations.sort(key=lambda c: c["startedAt"] or "", reverse=True)
+    conversations_truncated = (
+        conversations_in_range > _DETAIL_CONVERSATIONS_LIMIT
+        or len(convos_meta) >= _DETAIL_FETCH_LIMIT
+    )
+    outcome_total = sum(outcome_counts.values())
+    conversations = conversations[:_DETAIL_CONVERSATIONS_LIMIT]
+    transcripts = {c["id"]: transcripts.get(c["id"], []) for c in conversations}
+
+    # CSAT trend (both persistence spots)
+    customers_raw = [c for _, c in loaded["customers_raw"]]
+    live_dicts = [dict(c, id=doc_id) for doc_id, c in live_raw]
+    csat_all = _csat_points(live_dicts, customers_raw)
+    csat_in_range = [
+        p for p in csat_all
+        if _in_range(_parse_dt(p["at"]), start, end)
+    ]
+
+    # Complaints + knowledge gaps: point-in-time (not range-filtered)
+    complaints = [
+        normalize_complaint(c, doc_id, business_id)
+        for doc_id, c in loaded["complaints_raw"]
+    ]
+    complaints.sort(key=lambda c: c["createdAt"] or "", reverse=True)
+
+    kb = [
+        normalize_kb_entry(e, doc_id, business_id)
+        for doc_id, e in loaded["kb_raw"]
+    ]
+    kb.sort(key=lambda e: e["createdAt"] or "", reverse=True)
+    kb_by_status: dict[str, int] = defaultdict(int)
+    for e in kb:
+        kb_by_status[e["status"]] += 1
+
+    result = {
+        "range": {"from": _iso(start), "to": _iso(end)},
+        "profile": profile,
+        "activity": _daily_series(
+            start, end,
+            {"conversations": conv_by_day, "bookings": book_by_day},
+        ),
+        "allTime": all_time,
+        "summary": {
+            "bookingsInRange": bookings_in_range,
+            "bookingsTruncated": bookings_truncated,
+            "bookingsByStatus": dict(status_counts),
+            "conversationsInRange": conversations_in_range,
+            "conversationsTruncated": conversations_truncated,
+            "conversationOutcomes": dict(outcome_counts),
+            "bookingConversion": (
+                round(outcome_counts.get("booked", 0) / outcome_total, 4)
+                if outcome_total else None
+            ),
+            "avgCsat": _avg([p["rating"] for p in csat_in_range]),
+            "csatResponses": len(csat_in_range),
+            "openComplaints": sum(1 for c in complaints if c["status"] == "open"),
+            "pendingKnowledgeGaps": kb_by_status.get("pending_review", 0) + kb_by_status.get("awaiting_answer", 0),
+            "totalCustomers": len(customers_raw),
+        },
+        "bookings": bookings,
+        "conversations": conversations,
+        "transcripts": transcripts,
+        "csatTrend": csat_in_range,
+        "complaints": complaints,
+        "knowledgeGaps": kb,
+        "knowledgeByStatus": dict(kb_by_status),
+    }
+    _cache_put(_detail_cache, cache_key, result)
+    return result

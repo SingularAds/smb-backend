@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     API_SECRET: str = ""  # Set in .env — used for x-api-key / Authorization: Bearer <key>
+    ANALYTICS_ADMIN_KEY: str = ""  # Set in .env — internal analytics dashboard access (x-admin-key header)
     
     # CORS
     ALLOWED_ORIGINS: List[str] = [

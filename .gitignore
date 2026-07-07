@@ -88,3 +88,5 @@ firebase-secret.json
 node_modules/
 *.md
 tests/
+dashboard/node_modules/
+dashboard/dist/

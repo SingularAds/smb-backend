@@ -975,6 +975,28 @@ _STATIC_TRANSLATION_CACHE: dict[tuple[str, str], str] = {}
 _LANGUAGE_DETECTION_CACHE: dict[str, tuple[str, float]] = {}
 
 
+def _has_language_signal(text: str) -> bool:
+    """True when a message carries enough linguistic content to re-detect language.
+
+    Guards the mid-conversation language re-check: short commands, times,
+    numbers, URLs and emoji-only messages ("Yes", "3pm", "ok 👍") must never
+    trigger re-detection — they are ambiguous across languages and would make
+    the conversation language flip-flop.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    # Non-Latin script is an unambiguous signal regardless of length
+    for pattern in _LANG_SCRIPT_PATTERNS.values():
+        if pattern.search(stripped):
+            return True
+    if "http" in stripped.lower() or "www." in stripped.lower():
+        return False
+    words = [w for w in re.split(r"\s+", stripped) if any(c.isalpha() for c in w)]
+    alpha_chars = sum(1 for c in stripped if c.isalpha())
+    return len(words) >= 3 and alpha_chars >= 12
+
+
 def _language_key_from_text(text: str, fallback: str = "en") -> str:
     if text:
         for lang, pattern in _LANG_SCRIPT_PATTERNS.items():
@@ -1208,6 +1230,69 @@ def _extract_stated_business_name(text: str) -> str | None:
 # Demo-request detection helpers
 # ---------------------------------------------------------------------------
 
+# Acquisition / UTM parameter parsing helpers
+# ---------------------------------------------------------------------------
+
+def _parse_acquisition_source(body: str, lead: dict | None = None) -> dict:
+    """Extract UTM/campaign analytics parameters from lead data or user greeting."""
+    # 1. Start with values from website/recepte lead if present
+    l = lead or {}
+    source = l.get("utm_source") or l.get("source")
+    campaign = l.get("utm_campaign") or l.get("campaign")
+    medium = l.get("utm_medium")
+    content = l.get("utm_content")
+    term = l.get("utm_term")
+    gclid = l.get("gclid")
+    fbclid = l.get("fbclid")
+    click_id = l.get("clickId") or l.get("click_id")
+
+    # 2. If lead is missing tracking, parse the WhatsApp greeting text (e.g. wa.me/?text=...)
+    if not (source or campaign or gclid or fbclid or click_id) and body:
+        text = body.strip()
+        # Find key=val or key:val
+        keys = [
+            "utm_source", "utm_campaign", "utm_medium", "utm_content", "utm_term",
+            "gclid", "fbclid", "clickId", "click_id", "source", "campaign"
+        ]
+        pattern = re.compile(
+            r"\b(" + "|".join(keys) + r")\s*[:=]\s*([^\s&]+)",
+            re.IGNORECASE
+        )
+        matches = pattern.findall(text)
+        params = {}
+        for key, val in matches:
+            k = key.lower()
+            if k == "source":
+                k = "utm_source"
+            elif k == "campaign":
+                k = "utm_campaign"
+            elif k in ("clickid", "click_id"):
+                k = "clickId"
+            params[k] = val
+
+        if params:
+            source = params.get("utm_source", source)
+            campaign = params.get("utm_campaign", campaign)
+            medium = params.get("utm_medium", medium)
+            content = params.get("utm_content", content)
+            term = params.get("utm_term", term)
+            gclid = params.get("gclid", gclid)
+            fbclid = params.get("fbclid", fbclid)
+            click_id = params.get("clickId", click_id)
+
+    # 3. Fall back to Organic/Direct defaults
+    return {
+        "utm_source": source or "Organic",
+        "utm_campaign": campaign or "Direct",
+        "utm_medium": medium or "referral",
+        "utm_content": content or None,
+        "utm_term": term or None,
+        "gclid": gclid or None,
+        "fbclid": fbclid or None,
+        "clickId": click_id or None,
+    }
+
+
 _DEMO_REQUEST_RE = re.compile(
     r"\b("
     r"demo|d[eé]mo"
@@ -1279,6 +1364,44 @@ def _is_onboarding_start_intent(text: str) -> bool:
     if not stripped:
         return False
     return bool(_ONBOARDING_WORD_RE.search(stripped) and _ONBOARDING_START_RE.search(stripped))
+
+
+# ── Onboarding call-to-action (sales phase) ─────────────────────────────────
+# Appended in bold to every sales-phase reply while the owner has not yet
+# started onboarding.  When the owner answers with a bare affirmation, the
+# normal onboarding flow starts (same path as an explicit "start onboarding").
+# English template — localized per conversation language via _localize_static.
+_ONBOARDING_CTA = (
+    "👉 *Ready to get your own AI receptionist? Just reply YES and "
+    "I'll set everything up for you!*"
+)
+
+# Bare affirmations across the languages we actively support. Anchored to the
+# WHOLE message (after stripping punctuation/emojis) so sentences that merely
+# contain "yes" ("yes but how much is it?") are NOT treated as consent.
+_AFFIRMATIVE_RE = re.compile(
+    r"^(?:"
+    r"yes|yeah|yep|yup|ya|sure|ok|okay|okey|alright|absolutely|definitely"
+    r"|yes\s+please|lets\s+go|lets\s+do\s+it|go\s+ahead|start|im\s+ready|ready"
+    r"|sim|claro|vamos|bora|pode\s+ser"          # Portuguese
+    r"|si|sí|dale|vale|de\s+acuerdo"             # Spanish
+    r"|oui|daccord|allons\s*y"                   # French
+    r"|ja|haan|han|theek\s+hai|chalo"            # German / Hindi
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _is_affirmative(text: str) -> bool:
+    """True when the ENTIRE message is a bare 'yes' in a supported language."""
+    if not text:
+        return False
+    # Strip punctuation, emojis and apostrophes; collapse whitespace
+    normalized = re.sub(r"[^\w\sÀ-ÿ]", "", text, flags=re.UNICODE)
+    normalized = re.sub(r"\s+", " ", normalized).strip().lower()
+    if not normalized:
+        return False
+    return bool(_AFFIRMATIVE_RE.match(normalized))
 
 
 _CONVERSATIONAL_NOISE_RE = re.compile(
@@ -1774,10 +1897,24 @@ class OnboardingService:
         if override:
             return override, True
 
-        # 2. If the session already has a saved language, reuse it — no LLM call needed.
-        #    The user can still change language via explicit override (step 1 above).
+        # 2. If the session already has a saved language, verify it still matches
+        #    when the message carries enough linguistic signal. Owners DO switch
+        #    language mid-conversation (e.g. greet in English, continue in
+        #    Portuguese) and a stale saved language must not pin every reply to
+        #    the wrong one. Short replies ("Yes", "3pm", "ok") never re-detect —
+        #    they carry no signal and must not flip the conversation language.
         if session and session.get("language"):
-            return session["language"], False
+            saved = session["language"]
+            if _has_language_signal(body):
+                detected, confidence = await self._detect_language_llm(body)
+                if detected and detected != saved and confidence >= 0.8:
+                    logger.info(
+                        "[LANG] Conversation language switch detected for %s: %s -> %s "
+                        "(confidence=%.2f)",
+                        phone, saved, detected, confidence,
+                    )
+                    return detected, True  # True -> caller persists the new language
+            return saved, False
 
         # 3. First message (no session or no language saved yet) — run LLM detection
         detected, confidence = await self._detect_language_llm(body)
@@ -2839,8 +2976,17 @@ class OnboardingService:
             await self._send(phone, clean_reply)
             return
 
-        # Explicit onboarding-start intent: reset phase and ask for link first
-        if _is_onboarding_start_intent(body) and not session.get("askedForLink"):
+        # Explicit onboarding-start intent OR a bare "yes" answering the
+        # onboarding CTA appended to a previous sales reply: reset phase and
+        # ask for the link first — the same entry point the demo flow uses to
+        # hand the owner back into onboarding. The demo roleplay also uses
+        # bare "Yes" answers, so CTA consent is ignored while a roleplay runs.
+        _cta_yes = bool(
+            session.get("onboardingCtaOffered")
+            and _is_affirmative(body)
+            and session.get("salesPhase", "discovery") != "demo"
+        )
+        if (_is_onboarding_start_intent(body) or _cta_yes) and not session.get("askedForLink"):
             history = session.get("conversationHistory", [])
             history.append({"role": "user", "content": body})
             reply = _link_request_message(session.get("language", "en"))
@@ -2855,6 +3001,7 @@ class OnboardingService:
                 "temporaryMode": None,
                 "resumeOnboardingAfterDemo": False,
                 "justResumedFromDemo": False,
+                "onboardingCtaOffered": False,
             })
             session.update({
                 "conversationHistory": history,
@@ -2866,9 +3013,13 @@ class OnboardingService:
                 "temporaryMode": None,
                 "resumeOnboardingAfterDemo": False,
                 "justResumedFromDemo": False,
+                "onboardingCtaOffered": False,
             })
             await self._send(phone, reply)
-            logger.info("[ONBOARDING] Link request sent for %s (reset start intent)", phone)
+            logger.info(
+                "[ONBOARDING] Link request sent for %s (%s)",
+                phone, "CTA consent" if _cta_yes else "reset start intent",
+            )
             return
 
         # Google Places fast-path: if the message looks like a bare business name
@@ -3114,6 +3265,29 @@ class OnboardingService:
                 _od_check = _merged_check.get("openingDays") or []
                 if not (isinstance(_od_check, list) and any(str(d).strip() for d in _od_check)):
                     _merged_check["openingDays"] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+        # ── Onboarding CTA (sales phase) ─────────────────────────────────────
+        # While the owner is still a prospect (no link asked, no business data
+        # collected, not mid-demo-roleplay), every sales reply ends with a bold
+        # invitation to start onboarding. A bare "yes" on the next turn enters
+        # the normal onboarding flow (handled at the top of this method).
+        _demo_roleplay_running = (
+            sales_phase == "demo" and int(session.get("demoMessageCount", 0)) < 4
+        )
+        _cta_eligible = (
+            not confirmed
+            and not _demo_roleplay_running
+            and not session.get("askedForLink")
+            and not session.get("websiteExtractedData")
+            and not session.get("mandatoryFieldsRequired")
+            and not session.get("resumeOnboardingAfterDemo")
+            and not session.get("justResumedFromDemo")
+        )
+        if _cta_eligible:
+            _cta_text = await self._localize_static(_ONBOARDING_CTA, body, lang)
+            clean_reply = f"{clean_reply}\n\n{_cta_text}"
+            db.upsert_onboarding_session(phone, {"onboardingCtaOffered": True})
+            session["onboardingCtaOffered"] = True
 
         # Store updated history
         history.append({"role": "assistant", "content": clean_reply})
@@ -3700,6 +3874,41 @@ class OnboardingService:
 
                 extracted.setdefault("name", place_name)
                 extracted["mapsUrl"] = url
+
+                # Enrich from the resolved Google search / knowledge-panel page.
+                # share.google links resolve to google.com/search?...&kgmid=...
+                # pages that list the business's SERVICES and hours — data the
+                # Places Text Search response never includes. Reuses the same
+                # fetch+extract helper and prompt as the rest of this flow.
+                # Best-effort: any failure leaves the Places result untouched.
+                if not extracted.get("services") or not extracted.get("hours"):
+                    enrich_start = time.time()
+                    try:
+                        page_data = await asyncio.wait_for(
+                            _extract_from_url(
+                                final_url,
+                                prompt=GOOGLE_MAPS_EXTRACTION_PROMPT,
+                                snippet_limit=6000,
+                            ),
+                            timeout=25,
+                        )
+                        _merged_fields = []
+                        for _key in (
+                            "services", "hours", "openingDays", "phone",
+                            "description", "website",
+                        ):
+                            if not extracted.get(_key) and page_data.get(_key):
+                                extracted[_key] = page_data[_key]
+                                _merged_fields.append(_key)
+                        logger.info(
+                            "[ONBOARDING][MAPS] Knowledge-panel enrichment merged=%s in %.3fs (url=%s)",
+                            _merged_fields or "nothing", time.time() - enrich_start, final_url,
+                        )
+                    except Exception as enrich_exc:
+                        logger.info(
+                            "[ONBOARDING][MAPS] Knowledge-panel enrichment skipped (%.3fs): %s",
+                            time.time() - enrich_start, enrich_exc,
+                        )
                 extracted.setdefault("website", url)
 
                 db_start = time.time()

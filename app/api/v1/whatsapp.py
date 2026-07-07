@@ -53,25 +53,37 @@ _REPLAY_GRACE_S: int = 120
 _events: deque[dict[str, Any]] = deque(maxlen=50)
 
 # ── message deduplication cache ───────────────────────────────────────────────
-# Maps message_id -> expiry_monotonic_time.  Entries live for 60 seconds which
-# is long enough to cover any bridge retry window without growing unbounded.
-# Cleaned up lazily (purge on every insert).
+# Maps "event:device_id:message_id" -> expiry_monotonic_time.  Entries live for
+# 60 seconds which is long enough to cover any bridge retry window without
+# growing unbounded.  Cleaned up lazily (purge on every insert).
 _DEDUP_TTL_S = 60
 _seen_message_ids: dict[str, float] = {}
 
 
-def _is_duplicate(message_id: str) -> bool:
-    """Return True if this message_id was already processed within the TTL."""
+def _is_duplicate(message_id: str, *, event: str, device_id: str) -> bool:
+    """Return True if this (event, device, message_id) triple was already
+    processed within the TTL; otherwise register it and return False.
+
+    Keyed on the full triple — NOT the bare message_id — because the same
+    WhatsApp message legitimately reaches us more than once: after the owner
+    links their personal WhatsApp as a biz device, a message they send to the
+    global onboarding number arrives BOTH as event=owner_message on the biz
+    session AND as event=message on the global session, carrying the same
+    sender-assigned message ID.  Only a true bridge retry repeats the same
+    triple; cross-device suppression must never ride on this cache (it was
+    dropping the owner's Done/Skip onboarding replies).
+    """
     if not message_id:
         return False
+    key = f"{event}:{device_id}:{message_id}"
     now = time.monotonic()
     # Lazy purge of expired entries
     expired = [k for k, exp in _seen_message_ids.items() if now > exp]
     for k in expired:
         del _seen_message_ids[k]
-    if message_id in _seen_message_ids:
+    if key in _seen_message_ids:
         return True
-    _seen_message_ids[message_id] = now + _DEDUP_TTL_S
+    _seen_message_ids[key] = now + _DEDUP_TTL_S
     return False
 
 
@@ -342,8 +354,10 @@ async def _process_webhook(payload: dict) -> None:
             # ── Bridge-retry dedup ───────────────────────────────────────────
             # The bridge re-POSTs the same event up to 3 times when it cannot
             # confirm delivery. Without this, a retried owner command (e.g.
-            # "today") would execute and reply twice.
-            if _is_duplicate(owner_msg_id):
+            # "today") would execute and reply twice. Keyed per event+device so
+            # it never suppresses the same message arriving as event=message on
+            # the global onboarding session.
+            if _is_duplicate(owner_msg_id, event="owner_message", device_id=device_id):
                 logger.info(
                     "[OWNER-TAKEOVER] skipped — duplicate owner_message id=%r (bridge retry)",
                     owner_msg_id,
@@ -405,7 +419,6 @@ async def _process_webhook(payload: dict) -> None:
                 )
                 and _is_owner_own_phone(owner_chat, business)
             ):
-                _is_duplicate(owner_msg_id)
                 _sc_owner_phone = (
                     business.get("ownerPhone")
                     or business.get("owner_phone")
@@ -448,7 +461,6 @@ async def _process_webhook(payload: dict) -> None:
                     handle_owner_kb_reply as _kb_handle_owner_reply,
                 )
                 if _kb_parse_owner_reply(owner_body) is not None:
-                    _is_duplicate(owner_msg_id)
                     _sc_owner_phone = (
                         business.get("ownerPhone")
                         or business.get("owner_phone")
@@ -499,10 +511,6 @@ async def _process_webhook(payload: dict) -> None:
                     detail="owner_message in protected (global/owner/admin) chat",
                 )
                 return
-
-            # Register this message_id so the onboarding device doesn't
-            # re-process the same message when it arrives as a regular echo.
-            _is_duplicate(owner_msg_id)
 
             # If the owner typed a reporting/config command while viewing a
             # customer chat (e.g. "Today", "Summary"), execute it as an owner
@@ -662,7 +670,7 @@ async def _process_webhook(payload: dict) -> None:
         )
 
         # ── Deduplication: drop bridge retries for the same message ──────────
-        if _is_duplicate(message_id):
+        if _is_duplicate(message_id, event="message", device_id=device_id):
             logger.info("[WEBHOOK] skipped — duplicate message_id=%r from %s", message_id, phone)
             _log_event("skipped", phone=phone, message_id=message_id, detail="duplicate (bridge retry)")
             return
@@ -761,6 +769,33 @@ async def _process_webhook(payload: dict) -> None:
                         detail=f"owner command reply via device {device_id!r}",
                     )
                 else:
+                    # ── Protected-number guard: never treat Recepte as a customer ──
+                    # The biz device (the owner's own WhatsApp) receives every
+                    # message the global onboarding number sends to the owner
+                    # (onboarding steps, announcements, support). Those normally
+                    # die at the outbound-echo check, but the echo registry is
+                    # only populated when our /send call RETURNS — a webhook
+                    # that races ahead of the send response slips through and
+                    # would route the global number into the customer-AI path
+                    # (wasted classifier calls; worst case the biz AI replies
+                    # to Recepte and the two bots loop). Owner/admin phones
+                    # never reach this branch — is_owner_message() above
+                    # matches them first — so this only ever drops our own
+                    # global/Recepte numbers.
+                    if ai_pause_service.is_protected_number(phone, business):
+                        logger.info(
+                            "[WEBHOOK] skipped — chat=%s is a protected number "
+                            "(global/Recepte); never a customer (biz=%s)",
+                            phone, biz_id,
+                        )
+                        _log_event(
+                            "skipped",
+                            phone=phone,
+                            message_id=message_id,
+                            detail="protected number on biz device — not a customer",
+                        )
+                        return
+
                     # Respect autoReply flag — if disabled, silently skip AI response
                     logger.debug("Business autoReply setting: %s", business.get('autoReply'))
                     logger.info(

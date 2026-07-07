@@ -49,3 +49,29 @@ async def get_current_business(
             detail="No business found for this account.",
         )
     return business
+
+
+def require_admin_key(request: Request) -> None:
+    """Gate for the internal (team-only) analytics dashboard.
+
+    Accepts the key from x-admin-key header, Authorization: Bearer, or ?key=.
+    Distinct from API_SECRET so dashboard access can be rotated independently
+    of any per-business API integrations.
+    """
+    key = (
+        request.headers.get("x-admin-key")
+        or request.headers.get("authorization", "").replace("Bearer ", "").strip() or None
+        or request.query_params.get("key")
+    )
+    admin_key = settings.ANALYTICS_ADMIN_KEY
+    if not admin_key:
+        # No key configured — refuse by default (internal dashboard must not be open by accident).
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Analytics dashboard is not configured (ANALYTICS_ADMIN_KEY unset).",
+        )
+    if not key or not secrets.compare_digest(key, admin_key):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized",
+        )

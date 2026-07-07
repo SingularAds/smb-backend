@@ -146,6 +146,16 @@ FLAGS (independent of intent — set true when applicable):
                  X?", "do you serve X?", "is X available?" — regardless of
                  whether X is a dish, drink, service, treatment, or product —
                  are availability FAQs. Classify as BUSINESS with out_of_scope=false.
+                 ⚠️ GENERIC INFORMATION REQUESTS are always FAQ (in-scope), NEVER
+                 out_of_scope: "can I get more information?", "tell me more",
+                 "more details please", "what else do you offer?", "mais
+                 informações", "más información". These are answerable from the
+                 business profile (services, prices, hours, location) — especially
+                 mid-booking, where they continue the business conversation.
+                 Classify as BUSINESS with out_of_scope=false. Reserve
+                 out_of_scope for questions that genuinely need the human owner's
+                 expertise or judgment (post-service advice, product usage,
+                 medical/technical questions, dispute resolution).
 
 Rules:
 - Respond ONLY with valid JSON. No markdown, no explanation outside JSON.
@@ -206,7 +216,18 @@ Output: {"intent": "BUSINESS", "score": 70, "reason": "Angry refund demand",
 
 User: "Whats happening i am asking for menu"
 Output: {"intent": "BUSINESS", "score": 70, "reason": "Customer chasing for the menu — impatient but not angry",
-         "frustrated": false, "abusive": false, "out_of_scope": true}
+         "frustrated": false, "abusive": false, "out_of_scope": false}
+
+Recent context:
+  USER: hey can we do the booking
+  ASSISTANT: Of course! What service would you like, and for what date and time?
+User: "can i get more information"
+Output: {"intent": "BUSINESS", "score": 85, "reason": "Customer asking for details mid-booking — in-scope FAQ",
+         "frustrated": false, "abusive": false, "out_of_scope": false}
+
+User: "Can you tell me more about your services?"
+Output: {"intent": "BUSINESS", "score": 90, "reason": "Generic information request about the business — FAQ",
+         "frustrated": false, "abusive": false, "out_of_scope": false}
 
 User: "hello?? anyone there?"
 Output: {"intent": "GREETING", "score": 20, "reason": "Customer checking if anyone is online — not angry",

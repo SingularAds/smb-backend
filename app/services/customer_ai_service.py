@@ -80,6 +80,44 @@ _BOOKING_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── Availability hallucination guard ──────────────────────────────────────────
+# Detects when a customer asks whether a SPECIFIC time/slot is open, and when
+# the AI's reply ASSERTS a slot's availability status. If the reply makes such
+# an assertion without having called get_available_slots this turn, the answer
+# is unverified (it came from stale history or the model's guess) — we force a
+# get_available_slots call, exactly like the booking hallucination guard forces
+# create_booking. This is the production bug behind "8pm not available" then
+# "actually 3pm is free": the model answered availability from a stale/truncated
+# slot list instead of re-checking live capacity.
+_AVAILABILITY_QUESTION_RE = re.compile(
+    r"(\b\d{1,2}\s*(?::\d{2})?\s*(?:am|pm)\b"          # a clock time: 8pm, 3:30 pm
+    r"|\b\d{1,2}\s*o'?clock\b"
+    r"|\bavailab|\bavailability\b|\bfree\b|\bslot|\bopening"
+    r"|\bopen\s+at\b|\bany\s+time\b|\bwhat\s+time)",
+    re.IGNORECASE,
+)
+_AVAILABILITY_CLAIM_RE = re.compile(
+    r"(not\s+available|isn'?t\s+available|no\s+availabilit|unavailable"
+    r"|fully\s+booked|no\s+(?:free\s+)?slots?|no\s+openings?|all\s+booked"
+    r"|that\s+(?:time|slot)\s+is\s+(?:taken|booked|available|free|open)"
+    r"|is\s+available|is\s+free\b|we\s+have\s+(?:a\s+)?(?:slot|opening)"
+    r"|slots?\s+available|can\s+book\s+you\s+at|that\s+(?:time|slot)\s+works)",
+    re.IGNORECASE,
+)
+
+# The AI legitimately ASKS the customer for their booking id ("Could you provide
+# your booking ID?"). That is a clarifying question, not a claim that a booking
+# action completed — the hallucination guard must not fire on it. Matches a
+# request verb near "booking id", or "booking id" directly followed by a "?".
+_ASKS_FOR_BOOKING_ID_RE = re.compile(
+    r"((?:provide|share|send|give|tell\s+me|confirm|have|know|what'?s|what\s+is|"
+    r"could\s+you|can\s+you|may\s+i|please)\b[^.?!]{0,40}\bbooking\s*id"
+    r"|\bbooking\s*id\b[^.?!]{0,20}\?)",
+    re.IGNORECASE,
+)
+# Booking-id claim phrases that are ONLY hallucinations when ASSERTED (not asked).
+_BOOKING_ID_CLAIM_PHRASES = ("your booking id is", "booking id:", "booking id =")
+
 
 # ── Language detection ────────────────────────────────────────────────────────
 # We use langdetect (already in requirements.txt) on the incoming message so
@@ -136,7 +174,11 @@ def _detect_language(text: str) -> tuple[str, str] | None:
     if len(stripped) < 35 and word_count < 7:
         return None
     try:
-        from langdetect import detect_langs  # type: ignore
+        from langdetect import DetectorFactory, detect_langs  # type: ignore
+        # langdetect is stochastic by default — the same text can yield
+        # different codes across calls. Pin the seed so detections are
+        # reproducible (and borderline bugs debuggable from logs).
+        DetectorFactory.seed = 0
         results = detect_langs(stripped)
         if not results:
             return None
@@ -149,6 +191,78 @@ def _detect_language(text: str) -> tuple[str, str] | None:
         return None
     name = _LANG_NAMES.get(code, code.upper())
     return code, name
+
+
+# A different language becomes the conversation language only after this many
+# consecutive confident detections. Protects an established conversation from
+# a single langdetect false positive (e.g. the English "Can you tell me next
+# available slot" scoring ≥0.90 as French) flipping the reply language.
+LANG_SWITCH_CONFIRMATIONS = 2
+
+
+def _resolve_conversation_language(
+    detected: tuple[str, str] | None,
+    convo: dict | None,
+    has_prior_history: bool,
+) -> tuple[tuple[str, str] | None, dict | None]:
+    """Anchor the reply language to the conversation, not a single detection.
+
+    Returns ``(effective_signal, state_update)``:
+    - *effective_signal* — the ``(code, name)`` to use for the hard language
+      directive, or None to fall back to the soft "mirror the customer" rule.
+    - *state_update* — conversation fields to persist when the sticky state
+      changed, or None when nothing needs writing.
+
+    Rules:
+    - The stored conversation language (``languageCode``) stays active until
+      the customer sends LANG_SWITCH_CONFIRMATIONS consecutive confidently-
+      detected messages in the same different language.
+    - A fresh conversation (no prior history) adopts the first confident
+      detection immediately — there is no established language to protect.
+    - No detection (short/ambiguous message) anchors to the stored language
+      when one exists and leaves any pending switch untouched.
+    """
+    state = convo or {}
+    stored: str | None = state.get("languageCode")
+    candidate: str | None = state.get("languageCandidate")
+    candidate_count: int = int(state.get("languageCandidateCount") or 0)
+
+    def _signal(code: str) -> tuple[str, str]:
+        return code, _LANG_NAMES.get(code, code.upper())
+
+    if detected is None:
+        return (_signal(stored) if stored else None), None
+
+    code, _ = detected
+
+    if stored == code:
+        # Detection agrees with the established language — clear any pending switch.
+        if candidate:
+            return detected, {"languageCandidate": None, "languageCandidateCount": 0}
+        return detected, None
+
+    if not stored and not has_prior_history:
+        # First message of a conversation — adopt immediately.
+        return detected, {
+            "languageCode": code,
+            "languageCandidate": None,
+            "languageCandidateCount": 0,
+        }
+
+    count = candidate_count + 1 if candidate == code else 1
+    if count >= LANG_SWITCH_CONFIRMATIONS:
+        return detected, {
+            "languageCode": code,
+            "languageCandidate": None,
+            "languageCandidateCount": 0,
+        }
+
+    # Unconfirmed switch — keep the established language (or stay soft: with
+    # no directive the LLM reads the history and mirrors it naturally).
+    return (_signal(stored) if stored else None), {
+        "languageCandidate": code,
+        "languageCandidateCount": count,
+    }
 
 
 def _local_date_str(timezone_name: str) -> str:
@@ -349,6 +463,26 @@ _BUSINESS_KEYWORDS = re.compile(
     r"service|price|cost|hour|open|time|today|tomorrow|tonight|monday|tuesday|"
     r"wednesday|thursday|friday|saturday|sunday|am|pm|people|person|table|seat|"
     r"party|guest|haircut|massage|trim|colour|color|treatment|consult)\b",
+    re.IGNORECASE,
+)
+
+# Generic "tell me more" requests. These are answerable from the business
+# profile / KB and must NEVER take the out-of-scope path (AI silent + owner
+# ping) — especially mid-booking, where they continue the business thread.
+# Deterministic backstop for the classifier, which occasionally flags them
+# as out_of_scope because they don't name a concrete topic.
+_GENERIC_INFO_REQUEST_RE = re.compile(
+    r"\b("
+    r"more\s+(?:info|information|details?)"
+    r"|(?:tell|know|learn)\s+(?:me\s+|us\s+)?more"
+    r"|further\s+(?:info|information|details?)"
+    r"|(?:some|any)\s+more\s+details?"
+    r"|what\s+else\s+do\s+you"
+    r"|mais\s+informa\w*"                              # Portuguese: mais informações/informação
+    r"|m[áa]s\s+informaci[óo]n"                        # Spanish: más información
+    r"|plus\s+d.informations?"                         # French: plus d'informations
+    r"|mehr\s+informationen"                           # German
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -746,6 +880,14 @@ WORKING HOURS & BACKEND AUTHORITY RULES:
 - Example: Customer asks "Are you open at 8pm?" → You say "No, we close at 5pm. Would you like to book before then?"
 - Example: Customer asks "Can you check the calendar for tomorrow?" → Call get_available_slots to show actual slots.
 
+AVAILABILITY — ZERO TOLERANCE ANTI-HALLUCINATION RULES:
+- ⚠️ You must NEVER state that a specific time/slot IS or IS NOT available unless get_available_slots (or a booking tool result) returned that information IN THIS TURN.
+- Customer asks "Is 3pm free?" / "Do you have anything tomorrow?" / "What times do you have?" → you MUST call get_available_slots FIRST, then answer strictly from the returned list. No exceptions.
+- The tool result is the COMPLETE list of available times for that date. A time IN the list is available; a time NOT in the list is not. Do not add, remove, or guess times.
+- NEVER answer availability from conversation history or an earlier tool call — availability changes constantly; a list from a previous turn is stale. Re-call get_available_slots.
+- NEVER say "that time is not available" as a guess. If you have not called the tool in this turn, you do not know — call it.
+- When presenting many slots, you may summarize (e.g. "We're free from 9 AM to 8 PM — what time suits you?") but every specific time you mention MUST come from the tool result of this turn.
+
 REPLY COMPOSITION RULES — NO MIXED MESSAGES:
 - NEVER write "Perfect! Let me book..." or any optimistic confirmation language before you have called the booking tool and received its result.
 - When calling create_booking, do NOT prefix the conversation with any text about what you're about to do. Just call the tool silently.
@@ -860,12 +1002,14 @@ class CustomerAIService:
         except Exception:
             pass
 
-        # ── Language detection (used later to anchor the LLM reply language) ─
-        _lang_signal = _detect_language(body)
-        if _lang_signal:
+        # ── Language detection (raw per-message signal) ──────────────────────
+        # Resolved against the sticky conversation language once history is
+        # loaded — a lone detection never flips an established conversation.
+        _lang_detected = _detect_language(body)
+        if _lang_detected:
             logger.info(
                 "[LANG] detected business=%s phone=%s code=%s name=%s",
-                business_id, phone_clean, _lang_signal[0], _lang_signal[1],
+                business_id, phone_clean, _lang_detected[0], _lang_detected[1],
             )
 
         # ── Voice params (only used when voice_mode=True) ─────────────────────
@@ -949,6 +1093,31 @@ class CustomerAIService:
                 )
                 return
 
+        # ── Sticky conversation language ─────────────────────────────────────
+        # Resolve the effective reply language from the conversation state.
+        # A single langdetect result never flips an established conversation;
+        # switching requires LANG_SWITCH_CONFIRMATIONS consecutive confident
+        # detections (see _resolve_conversation_language).
+        _lang_signal, _lang_state = _resolve_conversation_language(
+            _lang_detected, convo, has_prior_history=bool(prior_history),
+        )
+        if _lang_state is not None:
+            try:
+                db.upsert_customer_conversation(business_id, phone_clean, _lang_state)
+            except Exception as exc:
+                logger.warning(
+                    "[LANG] failed to persist language state business=%s phone=%s: %s",
+                    business_id, phone_clean, exc,
+                )
+        if _lang_detected and _lang_signal != _lang_detected:
+            logger.info(
+                "[LANG] anchored business=%s phone=%s effective=%s detected=%s pending_count=%s",
+                business_id, phone_clean,
+                _lang_signal[0] if _lang_signal else None,
+                _lang_detected[0],
+                (_lang_state or {}).get("languageCandidateCount"),
+            )
+
         # ── Typing indicator (fire-and-forget) ───────────────────────────────
         # Show the recipient a "typing…" bubble while we classify + call the
         # LLM. WhatsApp auto-expires the bubble after ~10s; that lines up with
@@ -1018,6 +1187,20 @@ class CustomerAIService:
             classification.out_of_scope, classification.reason,
         )
 
+        # ── Deterministic override: generic info requests are in-scope FAQ ──
+        # "Can I get more information?" mid-booking must get an AI reply, not
+        # the out-of-scope silence + owner ping. The classifier prompt teaches
+        # this, but LLM classification can drift — this backstop guarantees it.
+        if classification.out_of_scope and _GENERIC_INFO_REQUEST_RE.search(body or ""):
+            logger.info(
+                "[OOS-OVERRIDE] business=%s phone=%s — generic info request detected; "
+                "treating as in-scope FAQ (classifier reason=%r)",
+                business_id, phone_clean, classification.reason,
+            )
+            classification.out_of_scope = False
+            if classification.intent in (Intent.PERSONAL, Intent.GREETING):
+                classification.intent = Intent.MIXED  # let the LLM read history and decide
+
         # ── Safety flag: abuse → pause + notify owner ────────────────────────
         # ONLY abuse triggers an auto-pause.  Frustration is forwarded to the
         # LLM with an empathy hint so the AI can still attempt a helpful reply
@@ -1037,14 +1220,51 @@ class CustomerAIService:
             )
             return
 
-        # ── Bare greeting: stay silent (no KB check, no LLM call) ────────────
+        # ── Determine whether an active business conversation is in progress ──
+        # This is a pure-Python, zero-cost check.  When True, even a GREETING/
+        # PERSONAL-classified message is allowed through to the LLM so a
+        # customer who sends a casual follow-up mid-booking ("yes", "ok",
+        # "I don't understand") doesn't get silently dropped.
+        active_biz_context: bool = _has_active_business_context(prior_history)
+
+        # ── Deterministic override: explicit booking keyword on a FIRST-EVER
+        # message ─────────────────────────────────────────────────────────────
+        # Bug found while verifying the Issue-2 fix against a real business:
+        # a casually-phrased opener like "hey can we do the booking" was
+        # classified PERSONAL ("social invitation") by the LLM classifier
+        # purely from tone, with score too low to be BUSINESS. With no prior
+        # history, active_biz_context is False, so the PERSONAL hard-block
+        # below silently dropped the customer's FIRST message — before the
+        # system prompt's own "booking keyword always wins" rule ever got a
+        # chance to run, since that rule only applies once the LLM sees the
+        # message at all. The word "booking"/"appointment"/"available" etc.
+        # is an unambiguous business signal regardless of how casual the
+        # phrasing is; treat it exactly like active_biz_context, EXCEPT when
+        # the personal-relationship guard applies (a partner joking about
+        # "booking" a table on a purely social thread must still stay silent).
+        if (
+            not active_biz_context
+            and _BOOKING_INTENT_RE.search(body or "")
+            and not _has_personal_relationship_markers(prior_history)
+        ):
+            logger.info(
+                "[BOOKING-KEYWORD-OVERRIDE] business=%s phone=%s — explicit booking "
+                "keyword on first-context message (classifier said %s) — forwarding to LLM",
+                business_id, phone_clean, classification.intent.value,
+            )
+            active_biz_context = True
+
+        # ── Bare greeting with NO active context: stay silent ────────────────
         # A bare "Hi" / "Hello" with no business context is noise.  The
         # customer will follow up with an actual question and the next message
         # will wake the AI.  We persist the message so the classifier sees it
-        # as history on the next turn.
-        if classification.intent == Intent.GREETING:
+        # as history on the next turn.  Mid-conversation, GREETING is often a
+        # misread clarification ("I don't understand", "Why can you tell me")
+        # — those must reach the LLM, which reads the history and decides.
+        if classification.intent == Intent.GREETING and not active_biz_context:
             logger.info(
-                "[INTENT-SILENT] business=%s phone=%s intent=GREETING — staying silent",
+                "[INTENT-SILENT] business=%s phone=%s intent=GREETING active_ctx=False"
+                " — staying silent",
                 business_id, phone_clean,
             )
             db.upsert_customer_conversation(business_id, phone_clean, {
@@ -1055,13 +1275,6 @@ class CustomerAIService:
                 "lastMessageAt": datetime.utcnow().isoformat(),
             })
             return
-
-        # ── Determine whether an active business conversation is in progress ──
-        # This is a pure-Python, zero-cost check.  When True, even a PERSONAL-
-        # classified message is allowed through to the LLM so a customer who
-        # sends a casual follow-up mid-booking ("yes", "ok", "so do you have")
-        # doesn't get silently dropped.
-        active_biz_context: bool = _has_active_business_context(prior_history)
 
         # ── Hard-block: PERSONAL with NO active business context ──────────────
         # Only drop PERSONAL messages when there is zero evidence of an ongoing
@@ -1203,10 +1416,11 @@ class CustomerAIService:
                 )
             return
 
-        # ── MIXED with PERSONAL-mid-booking: log and fall through ─────────────
+        # ── MIXED / PERSONAL / GREETING mid-booking: log and fall through ─────
         # MIXED always reaches the LLM (the LLM reads the full history and
-        # decides).  PERSONAL-with-active-context also falls through here.
-        if classification.intent in (Intent.MIXED, Intent.PERSONAL):
+        # decides).  PERSONAL- and GREETING-with-active-context also fall
+        # through here.
+        if classification.intent in (Intent.MIXED, Intent.PERSONAL, Intent.GREETING):
             logger.info(
                 "[INTENT-PASSTHROUGH] business=%s phone=%s intent=%s active_ctx=%s"
                 " — forwarding to LLM",
@@ -1262,7 +1476,7 @@ class CustomerAIService:
                 f"Do NOT translate or mix languages. Do NOT mention the language "
                 f"at all — just answer naturally in {_name}."
             )
-        if classification.intent in (Intent.MIXED, Intent.PERSONAL) and active_biz_context:
+        if classification.intent in (Intent.MIXED, Intent.PERSONAL, Intent.GREETING) and active_biz_context:
             context_note += (
                 "\n\nNOTE: The intent classifier flagged this message as "
                 f"{classification.intent.value} but an active business conversation "
@@ -1324,6 +1538,7 @@ class CustomerAIService:
             customer_phone=phone_clean,
             push_name=push_name,
             trace_metadata=ai_trace_meta,
+            user_message=body,
         )
 
         if reply.strip() == "[SILENT_IGNORE]":
@@ -1368,6 +1583,7 @@ class CustomerAIService:
                     customer_phone=phone_clean,
                     push_name=push_name,
                     trace_metadata=_override_meta,
+                    user_message=body,
                 )
 
             # Absolute last resort: classifier said BUSINESS + booking keyword
@@ -1680,8 +1896,14 @@ class CustomerAIService:
         customer_phone: str,
         push_name: str,
         trace_metadata: dict | None = None,
+        user_message: str = "",
     ) -> str:
-        """Send conversation to Claude with tools and handle tool calls."""
+        """Send conversation to Claude with tools and handle tool calls.
+
+        ``user_message`` is the customer's raw inbound text for this turn; the
+        availability hallucination guard needs it to tell a genuine "is 3pm
+        free?" question apart from unrelated replies.
+        """
         try:
             _create_kwargs = dict(
                 model=self.model,
@@ -1694,90 +1916,115 @@ class CustomerAIService:
                 _create_kwargs["trace_metadata"] = trace_metadata
             response = await self.client.messages.create(**_create_kwargs)
 
-            # Process the response
-            # NOTE: pre_tool_text_parts collects any text Claude emits BEFORE the tool call
-            # (e.g. "Perfect! Let me book..."). We intentionally DISCARD this when a tool is
-            # called, because the final reply must come entirely from the follow-up response
-            # that has the actual tool result — preventing "Perfect! ... Sorry, only 3 seats."
-            pre_tool_text_parts: list[str] = []
+            # ── Iterative (agentic) tool loop ──────────────────────────────────
+            # Some requests need MULTIPLE rounds of tool calls: reschedule /
+            # cancel / update MUST call check_booking FIRST (see the tool docs),
+            # then act on that result in a SECOND round. The previous single-round
+            # implementation ran the first batch of tools and then only harvested
+            # TEXT from the follow-up — silently discarding any second-round
+            # tool_use. So reschedule/cancel/update could never actually execute:
+            # the model kept re-running check_booking every turn while the
+            # customer repeated "reschedule" forever.
+            #
+            # We now loop: execute each round's tool calls, feed the results back,
+            # and repeat until the model returns a final answer with NO tool calls
+            # (or we hit a safety cap). Intermediate text (emitted alongside a
+            # tool_use) is discarded — only the final, tool-free response becomes
+            # the customer reply (preserving the old "no Perfect!... then Sorry"
+            # behaviour). `tool_results` accumulates across ALL rounds so the
+            # hallucination guard and booking-id correction below see every tool
+            # that actually ran.
+            _MAX_TOOL_ROUNDS = 6
             final_text_parts: list[str] = []
-            tool_results = []
-            _booking_created_this_turn = False  # guard: only one create_booking per turn
+            tool_results: list[dict] = []          # accumulated across ALL rounds
+            _booking_created_this_turn = False     # guard: only one create_booking per turn
+            working_messages = list(history)
+            round_text_parts: list[str] = []
 
-            for block in response.content:
-                if block.type == "text":
-                    pre_tool_text_parts.append(block.text)
-                elif block.type == "tool_use":
-                    # Guard: prevent Claude emitting two create_booking blocks in one turn
+            for _round in range(_MAX_TOOL_ROUNDS):
+                round_text_parts = []
+                round_tool_uses = []
+                for block in response.content:
+                    if block.type == "text":
+                        round_text_parts.append(block.text)
+                    elif block.type == "tool_use":
+                        round_tool_uses.append(block)
+
+                if not round_tool_uses:
+                    # Model produced its final answer — no more tools requested.
+                    final_text_parts = round_text_parts
+                    break
+
+                # Execute this round's tool calls.
+                round_results: list[dict] = []
+                for block in round_tool_uses:
+                    # Guard: prevent the model emitting two create_booking calls this turn.
                     if block.name == "create_booking" and _booking_created_this_turn:
                         logger.warning(
                             "[DUPLICATE-BOOKING-GUARD] Skipping extra create_booking call "
                             "in the same turn for customer=%s", customer_phone,
                         )
-                        tool_results.append({
+                        round_results.append({
                             "tool_use_id": block.id,
                             "name": block.name,
                             "result": "Booking already created this turn — do not call create_booking again.",
                         })
                         continue
-                    # Execute the tool call
                     result = self._execute_tool(
                         block.name, block.input, business, customer_phone, push_name,
                     )
                     if block.name == "create_booking":
                         _booking_created_this_turn = True
-                    tool_results.append({
+                    round_results.append({
                         "tool_use_id": block.id,
                         "name": block.name,
                         "result": result,
                     })
+                tool_results.extend(round_results)
 
-            # If there were tool calls, send results back to Claude for final response
-            history_with_tools: list[dict] | None = None
-            if tool_results:
-                # Build tool result messages
-                history_with_tools = list(history)
-                history_with_tools.append({
-                    "role": "assistant",
-                    "content": response.content,
-                })
-
-                tool_result_content = []
-                for tr in tool_results:
-                    tool_result_content.append({
-                        "type": "tool_result",
-                        "tool_use_id": tr["tool_use_id"],
-                        "content": tr["result"],
-                    })
-
-                history_with_tools.append({
+                # Feed the assistant turn + tool results back for the next round.
+                working_messages.append({"role": "assistant", "content": response.content})
+                working_messages.append({
                     "role": "user",
-                    "content": tool_result_content,
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": tr["tool_use_id"], "content": tr["result"]}
+                        for tr in round_results
+                    ],
                 })
 
-                # Get final response after tool execution.
-                # We do NOT include pre_tool_text_parts here — the complete reply
-                # must be derived from the tool result only.
-                _follow_kwargs = dict(
+                _next_kwargs = dict(
                     model=self.model,
                     max_tokens=1000,
                     system=system,
-                    messages=history_with_tools,
+                    messages=working_messages,
                     tools=CUSTOMER_TOOLS,
                 )
                 if trace_metadata:
                     _fm = dict(trace_metadata)
-                    _fm["name"] = (trace_metadata.get("name") or "customer_ai_reply") + ":after_tools"
+                    _fm["name"] = (trace_metadata.get("name") or "customer_ai_reply") + f":round{_round + 1}"
                     _fm["called_tools"] = sorted({tr["name"] for tr in tool_results})
-                    _follow_kwargs["trace_metadata"] = _fm
-                follow_up = await self.client.messages.create(**_follow_kwargs)
-
-                for block in follow_up.content:
-                    if block.type == "text":
-                        final_text_parts.append(block.text)
+                    _next_kwargs["trace_metadata"] = _fm
+                response = await self.client.messages.create(**_next_kwargs)
             else:
-                # No tool calls — use the pre-tool text directly
-                final_text_parts = pre_tool_text_parts
+                # Safety cap reached: the model kept requesting tools. Force ONE
+                # final text answer without tools so the customer still gets a
+                # coherent reply instead of silence or a dropped tool call.
+                logger.warning(
+                    "[TOOL-LOOP] Max rounds (%d) reached for customer=%s — forcing "
+                    "a final tool-free response.", _MAX_TOOL_ROUNDS, customer_phone,
+                )
+                try:
+                    _final_resp = await self.client.messages.create(
+                        model=self.model,
+                        max_tokens=1000,
+                        system=system,
+                        messages=working_messages,
+                    )
+                    final_text_parts = [b.text for b in _final_resp.content if b.type == "text"]
+                except Exception as _cap_exc:
+                    logger.error("[TOOL-LOOP] Forced final response failed for customer=%s: %s",
+                                 customer_phone, _cap_exc)
+                    final_text_parts = round_text_parts
 
             final_reply = "\n".join(final_text_parts).strip() or "I'm here to help! How can I assist you?"
             
@@ -1807,7 +2054,7 @@ class CustomerAIService:
                         "booking confirmed", "reservation confirmed",
                         "your table is confirmed",
                         "booking is confirmed", "reservation is confirmed",
-                        "your booking id", "booking id:", "booking id =",
+                        "your booking id is", "booking id:", "booking id =",
                     ],
                     {"create_booking", "check_booking", "reschedule_booking", "cancel_booking", "update_booking"},
                 ),
@@ -1844,18 +2091,48 @@ class CustomerAIService:
 
             called_tools = {tr["name"] for tr in tool_results}
             hallucination_detected = False
+            _retry_kind = "booking"
+            # A reply that ASKS the customer for their booking id is a question,
+            # not a completion claim — never treat it as a hallucination.
+            _asks_for_booking_id = bool(_ASKS_FOR_BOOKING_ID_RE.search(_reply_lower))
             for claim_phrases, required_tools in _action_checks:
-                if any(phrase in _reply_lower for phrase in claim_phrases):
-                    if not called_tools & required_tools:
-                        hallucination_detected = True
-                        logger.error(
-                            "[HALLUCINATION-DETECTED] Customer %s business %s: "
-                            "AI claimed completed action without calling required tool(s) %s. "
-                            "Called tools: %s. Blocked response: %s",
-                            customer_phone, business["id"], required_tools, called_tools,
-                            final_reply[:200],
-                        )
-                        break
+                matched = [p for p in claim_phrases if p in _reply_lower]
+                if not matched:
+                    continue
+                # Suppress false positives: if the only phrases that matched are
+                # booking-id mentions AND the reply is requesting the id, skip.
+                if _asks_for_booking_id and all(m in _BOOKING_ID_CLAIM_PHRASES for m in matched):
+                    continue
+                if not called_tools & required_tools:
+                    hallucination_detected = True
+                    logger.error(
+                        "[HALLUCINATION-DETECTED] Customer %s business %s: "
+                        "AI claimed completed action without calling required tool(s) %s. "
+                        "Called tools: %s. Blocked response: %s",
+                        customer_phone, business["id"], required_tools, called_tools,
+                        final_reply[:200],
+                    )
+                    break
+
+            # ── Availability hallucination: asserted a slot's status without checking ──
+            # Fires only when (a) the customer actually asked about a specific
+            # time/slot, (b) the reply asserts availability, and (c) the live
+            # get_available_slots tool was NOT called this turn. This is the
+            # "8pm not available" bug: answered from a stale/truncated list.
+            if (
+                not hallucination_detected
+                and "get_available_slots" not in called_tools
+                and _AVAILABILITY_CLAIM_RE.search(_reply_lower)
+                and _AVAILABILITY_QUESTION_RE.search(user_message or "")
+            ):
+                hallucination_detected = True
+                _retry_kind = "availability"
+                logger.error(
+                    "[HALLUCINATION-DETECTED] Customer %s business %s: AI asserted "
+                    "slot availability without calling get_available_slots. "
+                    "Called tools: %s. Blocked response: %s",
+                    customer_phone, business["id"], called_tools, final_reply[:200],
+                )
 
             if hallucination_detected:
                 # Retry: force the AI to actually call the required tool using full conversation context.
@@ -1866,6 +2143,7 @@ class CustomerAIService:
                     business=business,
                     customer_phone=customer_phone,
                     push_name=push_name,
+                    kind=_retry_kind,
                 )
 
             # ── BOOKING ID CORRECTION ────────────────────────────────────────
@@ -1911,21 +2189,38 @@ class CustomerAIService:
         business: dict,
         customer_phone: str,
         push_name: str,
+        kind: str = "booking",
     ) -> str:
-        """Called when hallucination guard fires. Forces Claude to actually call the booking
-        tool instead of fabricating a confirmation. Preserves full conversation context so
-        the customer does not have to repeat service/date/time/party.
+        """Called when the hallucination guard fires. Forces the model to actually
+        call the required tool instead of answering from memory. Preserves full
+        conversation context so the customer does not have to repeat themselves.
+
+        ``kind`` selects the override wording so the model is pushed toward the
+        RIGHT tool: "booking" → create_booking; "availability" → get_available_slots.
+        Using the booking wording for an availability miss would wrongly nudge the
+        model to create a booking instead of checking slots.
         """
-        override_system = (
-            system
-            + "\n\n"
-            "⚠️ SYSTEM OVERRIDE — READ THIS BEFORE RESPONDING:\n"
-            "You previously attempted to confirm a booking without calling the create_booking tool. "
-            "That response was BLOCKED. You must now call create_booking with the details already "
-            "established in this conversation. Do NOT write any confirmation text — call the tool "
-            "first, then respond based on its result. If the booking details are unclear, ask ONE "
-            "specific clarifying question (do NOT ask for everything again)."
-        )
+        if kind == "availability":
+            override_note = (
+                "⚠️ SYSTEM OVERRIDE — READ THIS BEFORE RESPONDING:\n"
+                "You previously answered a customer's availability/slot question WITHOUT "
+                "calling get_available_slots. That response was BLOCKED because you cannot "
+                "know whether a time is available without checking live capacity. You MUST "
+                "now call get_available_slots for the date the customer asked about, then "
+                "answer STRICTLY from its result — a time is available only if it appears in "
+                "the returned list. Never state a time as available or unavailable from memory "
+                "or an earlier list. Do NOT create a booking; only check availability."
+            )
+        else:
+            override_note = (
+                "⚠️ SYSTEM OVERRIDE — READ THIS BEFORE RESPONDING:\n"
+                "You previously attempted to confirm a booking without calling the create_booking tool. "
+                "That response was BLOCKED. You must now call create_booking with the details already "
+                "established in this conversation. Do NOT write any confirmation text — call the tool "
+                "first, then respond based on its result. If the booking details are unclear, ask ONE "
+                "specific clarifying question (do NOT ask for everything again)."
+            )
+        override_system = f"{system}\n\n{override_note}"
         try:
             retry_response = await self.client.messages.create(
                 model=self.model,
@@ -1980,6 +2275,11 @@ class CustomerAIService:
             logger.error("[HALLUCINATION-RETRY] Retry failed for customer=%s: %s", customer_phone, retry_exc)
 
         # Final fallback: minimal context-preserving message
+        if kind == "availability":
+            return (
+                "Let me double-check the available times for you — "
+                "which date and time were you interested in?"
+            )
         return (
             "I need to verify the booking details with the system. "
             "Could you confirm the time you'd like? (with AM/PM please)"
@@ -2045,15 +2345,22 @@ class CustomerAIService:
                 slots = payload.get("slots", [])
                 if not slots:
                     return f"No available slots on {tool_input.get('date', 'the requested date')}."
+                # Give the LLM the FULL day's availability (max ~24 hourly slots).
+                # Truncating made the AI claim later times were unavailable when
+                # they were simply cut off the list.
                 readable = []
-                for s in slots[:8]:
+                for s in slots[:24]:
                     try:
                         readable.append(
                             datetime.fromisoformat(s).strftime("%I:%M %p").lstrip("0")
                         )
                     except ValueError:
                         readable.append(s)
-                return f"Available slots on {payload.get('date', '')}: {', '.join(readable)}"
+                return (
+                    f"Available slots on {payload.get('date', '')} "
+                    f"(complete list — do not offer or deny any time not based on this list): "
+                    f"{', '.join(readable)}"
+                )
 
             elif tool_name == "check_booking":
                 args = {

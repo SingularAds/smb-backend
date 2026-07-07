@@ -63,7 +63,7 @@ from app.firebase import init_firebase
 from app.services.automation.scheduler import start_scheduler, stop_scheduler
 
 # Import routers
-from app.api.v1 import businesses, billing, bookings, calendar, customers, health, recepte, reminders, vapi, voice, webhooks, whatsapp
+from app.api.v1 import analytics, businesses, billing, bookings, calendar, customers, health, recepte, reminders, vapi, voice, webhooks, whatsapp
 
 # ── Configure logging to console ──────────────────────────────────────────────
 _log_level = getattr(logging, (settings.LOG_LEVEL or "INFO").upper(), logging.INFO)
@@ -94,9 +94,20 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("Global KB seeding failed: %s", exc)
-    start_scheduler()
+    # DISABLE_SCHEDULER lets a second local instance run side-by-side with the
+    # live process (e.g. for testing against the same Firestore project)
+    # without double-firing booking reminders / daily summaries / CSAT sweeps —
+    # those are wall-clock triggers, so two live schedulers would each send
+    # every automated WhatsApp message twice. Default (unset) preserves
+    # today's behaviour exactly: the scheduler always starts.
+    _disable_scheduler = _truthy(_os.environ.get("DISABLE_SCHEDULER"))
+    if not _disable_scheduler:
+        start_scheduler()
+    else:
+        logger.warning("[STARTUP] DISABLE_SCHEDULER=true — automation scheduler NOT started")
     yield
-    stop_scheduler()
+    if not _disable_scheduler:
+        stop_scheduler()
     # Flush any queued PostHog events before the worker exits so we don't
     # drop the last batch of analytics on graceful shutdown.
     try:
@@ -125,6 +136,21 @@ if settings.ENVIRONMENT.lower() == "production":
 _media_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "media")
 _os.makedirs(_media_dir, exist_ok=True)
 app.mount("/media", StaticFiles(directory=_media_dir), name="media")
+
+# ── Internal analytics dashboard (built React/Vite app) ───────────────────────
+# Served at /dashboard/ — build it first with: cd dashboard && npm run build
+# html=True enables SPA fallback: unknown sub-paths return index.html so
+# React Router handles client-side navigation.
+_dashboard_dist = _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+    "dashboard", "dist",
+)
+if _os.path.isdir(_dashboard_dist):
+    app.mount("/dashboard", StaticFiles(directory=_dashboard_dist, html=True), name="dashboard")
+    logger.info("[STARTUP] Dashboard served at /dashboard/ from %s", _dashboard_dist)
+else:
+    logger.warning("[STARTUP] Dashboard dist not found at %s — run: cd dashboard && npm run build", _dashboard_dist)
+
 import time
 from fastapi import Request
 
@@ -186,6 +212,9 @@ app.include_router(whatsapp.router, tags=["WhatsApp"])
 app.include_router(calendar.router, prefix="/api/v1/calendar", tags=["Calendar"])
 app.include_router(calendar.router, prefix="/oauth", tags=["Calendar-OAuth"])
 app.include_router(calendar.router, prefix="/auth/google", tags=["Calendar-OAuth-Google"])
+
+# Internal analytics dashboard (team-only — x-admin-key / ANALYTICS_ADMIN_KEY)
+app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["Analytics"])
 
 # Recepte.co lead ingestion
 app.include_router(recepte.router, prefix="/api/v1/recepte", tags=["Recepte"])

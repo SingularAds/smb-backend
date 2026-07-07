@@ -2273,9 +2273,13 @@ def _resolve_earliest_slot_datetime(args: dict[str, Any], target_date: str) -> d
     if earliest_dt and earliest_dt.date().isoformat() == target_date:
         return earliest_dt
 
-    today = datetime.now().date().isoformat()
-    if target_date == today:
-        return datetime.now()
+    # Compare in the SAME reference frame as the candidate slots: naive local
+    # time in BUSINESS_TIMEZONE (what _parse_slot_datetime produces). Using the
+    # server's local clock here shifted "now" by the server/business timezone
+    # difference and wrongly filtered valid slots (or exposed past ones).
+    now_local = datetime.now(ZoneInfo(settings.BUSINESS_TIMEZONE)).replace(tzinfo=None)
+    if target_date == now_local.date().isoformat():
+        return now_local
 
     return None
 
@@ -2343,7 +2347,13 @@ def get_available_slots_payload(args: dict[str, Any], call_info: dict) -> dict[s
         }
 
     # ── Step 3: Generate candidate slots from business hours ─────────────────
-    candidate_slots = _default_slots(date, business.get("hours"))
+    # Fall back to hoursRaw — SAME fallback _is_within_business_hours already
+    # uses. Onboarding stores the configured hours string in hoursRaw for many
+    # businesses while `hours` stays None; without this fallback the slot
+    # LIST silently used the 09:00-18:00 default while booking VALIDATION
+    # (which already had the fallback) checked the real hours — the exact
+    # mismatch that made the AI reject/accept times inconsistently.
+    candidate_slots = _default_slots(date, business.get("hours") or business.get("hoursRaw"))
     slot_source = "default-hours"
 
     # parallelCapacity = max simultaneous bookings (any event on calendar = 1 booking).
@@ -2538,8 +2548,11 @@ def tool_get_available_slots(args: dict[str, Any], call_info: dict) -> str:
     if not slots:
         return _ok(f"No available slots on {date}. Please try another date.")
 
+    # Return the FULL day's availability (a day has at most ~24 hourly slots).
+    # Truncating here made the AI claim times were unavailable when they were
+    # simply cut off the list — the model must always see the whole truth.
     readable = []
-    for s in slots[:6]:
+    for s in slots[:24]:
         try:
             time_str = datetime.fromisoformat(s).strftime("%I:%M %p").lstrip("0")
             if show_remaining and s in slot_remaining:
@@ -2549,34 +2562,48 @@ def tool_get_available_slots(args: dict[str, Any], call_info: dict) -> str:
         except ValueError:
             readable.append(s)
 
-    return _ok(f"Available times on {date}: {', '.join(readable)}.")
+    return _ok(
+        f"Available times on {date} (complete list — do not offer any other time): "
+        f"{', '.join(readable)}."
+    )
 
 def _default_slots(date: str, hours: dict | str | None) -> list[str]:
-    """Generate one candidate slot per hour within business operating hours.
+    """Generate hourly candidate slots within business operating hours.
+
+    Uses ``_parse_hours_range`` — the SAME parser ``_is_within_business_hours``
+    (create_booking validation) uses — so the slot list and the booking
+    validator can never disagree about the opening hours. Previously this
+    function had its own weaker regex that only understood "9:00-18:00";
+    hours like "Mon–Sun 9am–9pm" silently fell back to 09:00–18:00 and the
+    AI offered slots that stopped hours before closing time.
 
     Accepts hours as:
-      - str  e.g. "Mon-Thu 9:00-18:00" — the time range is parsed via regex
+      - str  e.g. "Mon-Thu 9:00-18:00", "9am-9pm", "Mon–Sun 9am–9pm"
       - dict e.g. {"start": "09:00", "end": "18:00"} — legacy format
-      - None — defaults to 09:00-18:00
+      - None / unparseable — defaults to 09:00–18:00
+
+    Slots start at the exact opening time (minutes preserved, e.g. 11:30,
+    12:30, …) and the last slot ends no later than closing time.
     """
-    _DEFAULT_START, _DEFAULT_END = 9, 18
+    from datetime import time as dt_time
+
     day = datetime.strptime(date, "%Y-%m-%d")
 
-    if isinstance(hours, str) and hours:
-        # Parse time range from strings like "Mon-Thu 9:00-18:00"
-        m = re.search(r'(\d+):\d+\s*-\s*(\d+):\d+', hours)
-        if m:
-            start_h, end_h = int(m.group(1)), int(m.group(2))
-        else:
-            start_h, end_h = _DEFAULT_START, _DEFAULT_END
-    elif isinstance(hours, dict):
-        start_h = int((hours.get("start") or "09:00").split(":")[0])
-        end_h   = int((hours.get("end")   or "18:00").split(":")[0])
-    else:
-        start_h, end_h = _DEFAULT_START, _DEFAULT_END
+    open_t, close_t = _parse_hours_range(hours)
+    if open_t is None or close_t is None:
+        open_t, close_t = dt_time(9, 0), dt_time(18, 0)
 
-    return [day.replace(hour=h_, minute=0, second=0, microsecond=0).isoformat()
-            for h_ in range(start_h, end_h)]
+    slot_dt = day.replace(hour=open_t.hour, minute=open_t.minute, second=0, microsecond=0)
+    close_dt = day.replace(hour=close_t.hour, minute=close_t.minute, second=0, microsecond=0)
+    if close_dt <= slot_dt:
+        # Overnight hours (e.g. 6pm–2am): generate until end of the requested date.
+        close_dt = day.replace(hour=23, minute=59, second=59, microsecond=0)
+
+    slots: list[str] = []
+    while slot_dt + timedelta(minutes=60) <= close_dt:
+        slots.append(slot_dt.isoformat())
+        slot_dt += timedelta(minutes=60)
+    return slots
 
 
 # ── Tool: checkPhone ─────────────────────────────────────────────────────────
@@ -2830,8 +2857,11 @@ def build_assistant_config(call_info: dict) -> dict:
     effective_opening_days = opening_days if opening_days else _DEFAULT_OPENING_DAYS
     opening_days_text = "Open on: " + ", ".join(effective_opening_days) + "."
 
-    # Opening hours — string ("Mon-Thu 9:00-18:00") or absent → default
-    hours_raw = business.get("hours")
+    # Opening hours — string ("Mon-Thu 9:00-18:00") or absent → default.
+    # Falls back to hoursRaw like _is_within_business_hours / _default_slots —
+    # `hours` is None for businesses onboarded through the flow that only
+    # populates hoursRaw.
+    hours_raw = business.get("hours") or business.get("hoursRaw")
     if isinstance(hours_raw, str) and hours_raw.strip():
         opening_hours_text = f"Opening hours: {hours_raw.strip()}."
     elif isinstance(hours_raw, dict):

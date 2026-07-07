@@ -250,6 +250,27 @@ WhatsApp bridge  →  audio voice note to customer
 
 ---
 
+## 📊 Internal Analytics Dashboard (team-only)
+
+A standalone internal dashboard for the platform team — onboarding funnel,
+growth, per-business AI performance (bookings, conversations + transcripts,
+CSAT, complaints, knowledge gaps), and an accounts table with drill-down.
+**Never expose it to SMB owners** — it is cross-tenant.
+
+- Backend: `GET /api/v1/analytics/overview` and
+  `GET /api/v1/analytics/businesses/{business_id}`
+  (router `app/api/v1/analytics.py`, logic `app/services/analytics_service.py`,
+  read-only — it never touches the message pipeline).
+- Auth: `x-admin-key` header checked against the **`ANALYTICS_ADMIN_KEY`** env
+  var (`require_admin_key` in `app/api/deps.py`). Unset ⇒ endpoints return 503.
+- Frontend: `dashboard/` (React + TypeScript + Vite + Tailwind + Recharts) —
+  `npm install && npm run dev` in `dashboard/`, proxies `/api` to
+  `http://127.0.0.1:8000` (override with `VITE_PROXY_TARGET`).
+- Full docs, response shapes, data caveats and deferred items:
+  **[dashboard/README.md](dashboard/README.md)**.
+
+---
+
 ## 🧪 Testing with cURL
 
 > **Pre-requisite**: FastAPI must be running.
