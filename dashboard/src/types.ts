@@ -14,6 +14,33 @@ export interface FunnelSessionEntry {
   currentStep: string | null;
   startedAt: string | null;
   businessId: string | null;
+  /** acquisition context — present only on attributed (ad/website) sessions */
+  channel?: string | null;
+  adId?: string | null;
+  campaign?: string | null;
+}
+
+export interface AcquisitionStage {
+  stage: "started" | "details_collected" | "whatsapp_paired" | "completed";
+  label: string;
+  count: number;
+}
+
+export interface AcquisitionChannel {
+  /** canonical channel id, e.g. "meta_ads" | "website" | "organic" */
+  channel: string;
+  /** human label, e.g. "Meta Ads" */
+  label: string;
+  /** everyone who started onboarding via this channel in range */
+  total: number;
+  /** cumulative funnel steps (started → … → completed) */
+  stages: AcquisitionStage[];
+  /** per-prospect details for the drill-down modal, most-recent first */
+  sessions: FunnelSessionEntry[];
+}
+
+export interface Acquisition {
+  byChannel: AcquisitionChannel[];
 }
 
 export interface FunnelStage {
@@ -83,6 +110,8 @@ export interface Overview {
   range: DateRange;
   includeTest: boolean;
   funnel: FunnelStage[];
+  /** onboarding prospects grouped by acquisition channel (Meta ads, website…) */
+  acquisition: Acquisition;
   activeOnboardingSessions: number;
   /** demo/booking-roleplay sessions excluded from the funnel */
   excludedDemoSessions: number;

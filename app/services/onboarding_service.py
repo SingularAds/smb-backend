@@ -22,7 +22,7 @@ import io
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
@@ -30,6 +30,7 @@ from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
 from app.config import settings
 from app import firestore as db
 from app.integrations import posthog_client
+from app.services.attribution import build_attribution, is_ad_channel
 from app.services.whatsmeow_client import PairingStateConflict, ReachoutTimelocked, WhatsmeowClient
 from app.services.ai_service import AIService
 from app.services.onboarding_plan_info import (
@@ -1134,6 +1135,13 @@ def _link_request_message(lang: str, name: str = None) -> str:
         return msg
 
 
+# Deterministic CTA appended to every ad-intro reply so the "reply YES to start"
+# invitation is always present (the LLM is also told to include it, but this is
+# the guaranteed fallback). English source; localized to the owner's language via
+# _localize_static at send time.
+_AD_INTRO_CTA_EN = "👉 Reply *YES* whenever you're ready and I'll set up your own AI receptionist."
+
+
 def _infer_timezone_from_phone(phone: str) -> str:
     """Infer an IANA timezone from a phone number's country calling code.
 
@@ -1166,6 +1174,30 @@ def _looks_like_business_name(text: str) -> bool:
     }
     if lower in _skip:
         return False
+    # ── Greeting-first-word rule (prod audit 2026-07-13) ──────────────────
+    # 48 of 49 sessions jailed in location_request had a pendingPlacesQuery
+    # that was plain pt/es small talk ("Bom dia", "Oi boa tarde", "Olá,
+    # quero explorar mais" — the ad CTA prefill). Business names essentially
+    # never START with a greeting word, so a greeting first-word disqualifies
+    # the message from the Places fast-path. Leading emoji/punctuation are
+    # stripped first ("👍👍👍Olá…" must still be caught).
+    _first_alpha = ""
+    for _tok in lower.split():
+        _clean_tok = "".join(ch for ch in _tok if ch.isalpha())
+        if _clean_tok:
+            _first_alpha = _clean_tok
+            break
+    _greeting_words = {
+        # pt
+        "oi", "oie", "oiê", "oia", "olá", "ola", "opa", "salve", "bom",
+        "boa", "tudo", "td", "eai", "eaí",
+        # es
+        "hola", "buenos", "buenas",
+        # en
+        "hello", "hi", "hey", "good",
+    }
+    if _first_alpha in _greeting_words:
+        return False
     # Exclude sentence starters that indicate a full sentence
     _sentence_starters = (
         "what", "how", "why", "when", "where", "can ", "could",
@@ -1178,6 +1210,18 @@ def _looks_like_business_name(text: str) -> bool:
         "interested", "just ", "only ", "please ", "need ", "trying ",
         # Prevent yes/no phrases from being treated as business names
         "yes ", "no ", "yeah ", "nah ", "nope ", "yep ",
+        # Portuguese sentence starters (prod audit 2026-07-13: "Meu nome ê
+        # Kleber", "Não quero mais", "eu já trabalho ok", "Manda foto",
+        # "Mensagem de texto whatsapp" all reached the Places fast-path)
+        "eu ", "meu ", "minha ", "você ", "voce ", "vc ", "não ", "nao ",
+        "quero ", "queria ", "manda ", "mandar ", "me ", "como ", "quem ",
+        "onde ", "quando ", "porque ", "por que", "isso ", "esse ", "essa ",
+        "está ", "esta ", "tá ", "ta ", "sim ", "já ", "ja ", "uma ", "um ",
+        "obrigad", "mensagem ", "muito ", "tão ", "tao ", "que ", "qual ",
+        "cadê", "cade ", "cd ", "aqui ",
+        # Spanish sentence starters
+        "yo ", "mi ", "quiero ", "cómo", "como está", "dónde", "donde ",
+        "cuándo", "cuando ", "gracias",
     )
     if any(lower.startswith(s) for s in _sentence_starters):
         return False
@@ -1980,6 +2024,7 @@ class OnboardingService:
         push_name: str,
         message_id: str,
         message_type: str = "text",
+        referral: dict | None = None,
     ) -> None:
         import time
         db_lookup_start = time.time()
@@ -2048,6 +2093,55 @@ class OnboardingService:
 
         if session:
             step = session.get("currentStep", "conversing")
+
+            # ── Stale-gate TTL (sessions are now kept forever for analytics) ──
+            # Onboarding sessions are no longer deleted, so a session parked in
+            # a transient gate step (location_request, places_pick, …) would
+            # otherwise stay locked there FOREVER — an owner coming back days
+            # later gets the stale gate prompt instead of a conversation
+            # (prod bug 2026-07-13: "ola" → location-prompt loop). If the gate
+            # has been idle longer than the TTL, downgrade to "conversing" and
+            # let the AI handle the message with full history. All data
+            # collected so far (history, attribution, askedForLocation, …) is
+            # preserved — only the step lock is released.
+            # Pairing / billing steps are intentionally excluded: they have
+            # their own expiry flows and must not silently downgrade.
+            _TRANSIENT_GATE_STEPS = {
+                "location_request", "places_pick", "website_confirm",
+                "referral_offer", "referral_confirm", "recepte_confirm",
+            }
+            if step in _TRANSIENT_GATE_STEPS:
+                _last_raw = (
+                    (session.get("timestamps") or {}).get("lastActivityAt")
+                    or session.get("lastActivityAt")
+                    or session.get("createdAt")
+                )
+                _last_dt = None
+                if _last_raw:
+                    try:
+                        _last_dt = datetime.fromisoformat(
+                            str(_last_raw).replace("Z", "+00:00")
+                        )
+                    except (ValueError, TypeError):
+                        _last_dt = None
+                if _last_dt is not None:
+                    _now_cmp = (
+                        datetime.now(timezone.utc)
+                        if _last_dt.tzinfo is not None
+                        else datetime.utcnow()
+                    )
+                    if _now_cmp - _last_dt > timedelta(hours=12):
+                        logger.info(
+                            "[ONBOARDING] Stale gate step %r (idle since %s) for %s "
+                            "— downgrading to conversing (anti-stale-lock)",
+                            step, _last_raw, phone,
+                        )
+                        db.upsert_onboarding_session(phone, {
+                            "currentStep": "conversing",
+                            "locationPromptCount": 0,
+                        })
+                        session["currentStep"] = "conversing"
+                        step = "conversing"
 
             # Already completed or post-onboarding support request?
             if step in ("complete", "post_onboarding"):
@@ -2151,9 +2245,21 @@ class OnboardingService:
                 if message_type == "location":
                     await self._handle_location_share(session, phone, body, push_name)
                     return
-                # Allow escape: if user says no/skip/none, fall back to text search
+                # Allow escape: if user says no/skip/none, fall back to text search.
+                # Escape words MUST cover pt/es — most owners reply in Portuguese
+                # ("não", "pular"…); an English-only list caused an infinite
+                # re-prompt loop for any non-English reply (prod bug 2026-07-13).
                 _loc_escape = body.strip().lower()
-                if _loc_escape in ("no", "nope", "nah", "skip", "none", "no thanks", "don't have", "dont have", "cancel"):
+                if _loc_escape in (
+                    "no", "nope", "nah", "skip", "none", "no thanks",
+                    "don't have", "dont have", "cancel",
+                    # Portuguese
+                    "não", "nao", "não tenho", "nao tenho", "pular", "cancelar",
+                    "depois", "mais tarde", "agora não", "agora nao",
+                    # Spanish
+                    "no tengo", "saltar", "más tarde", "mas tarde", "ahora no",
+                    "luego", "omitir",
+                ):
                     _pending_query = session.get("pendingPlacesQuery", "")
                     db.upsert_onboarding_session(phone, {"currentStep": "conversing"})
                     session["currentStep"] = "conversing"
@@ -2180,9 +2286,40 @@ class OnboardingService:
                         session, phone, body, push_name, message_id
                     )
                     return
+                # ── Anti-loop guard (prod bug 2026-07-13) ─────────────────────
+                # The user replied with something that is neither a location
+                # share nor an escape word (e.g. "ola", a question, small talk).
+                # Old behaviour re-sent the same static location prompt forever.
+                # New behaviour: re-prompt AT MOST ONCE, then release the gate
+                # and let the AI answer the actual message (dynamic onboarding).
+                # askedForLocation stays True, so a later Places search falls
+                # back to global text search instead of re-asking — the gate
+                # can never re-trap this session.
+                _loc_prompts = int(session.get("locationPromptCount") or 0)
+                if _loc_prompts >= 1:
+                    logger.info(
+                        "[ONBOARDING] location_request released after %d re-prompts "
+                        "for %s — routing message to AI (anti-loop)",
+                        _loc_prompts, phone,
+                    )
+                    db.upsert_onboarding_session(phone, {
+                        "currentStep": "conversing",
+                        "locationPromptCount": 0,
+                        "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
+                    })
+                    session["currentStep"] = "conversing"
+                    await self._handle_conversation(session, phone, body, push_name, message_id)
+                    return
+
+                db.upsert_onboarding_session(phone, {
+                    "locationPromptCount": _loc_prompts + 1,
+                    "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
+                })
+                session["locationPromptCount"] = _loc_prompts + 1
                 loc_msg = (
                     "Perfect! 📍 Let’s find you on the map. "
-                    "Tap 📎 → Location → Send Your Current Location. Takes 2 seconds 🙌"
+                    "Tap 📎 → Location → Send Your Current Location. Takes 2 seconds 🙌\n\n"
+                    "_(Or just reply *skip* and we'll continue without it.)_"
                 )
                 loc_msg = await self._localize_static(loc_msg, body, session.get("language", "en"))
                 await self._send(phone, loc_msg)
@@ -2266,12 +2403,16 @@ class OnboardingService:
                 message_id,
                 lead,
                 lang_override=lang_for_message,
+                referral=referral,
             )
             return
 
         print(f"[LEAD-LOOKUP] No lead found for {phone} — starting normal cold-start onboarding")
         logger.info("[LEAD-LOOKUP] No lead found for %s — starting normal onboarding", phone)
-        await self._start_new(phone, body, push_name, message_id, lang_override=lang_for_message)
+        await self._start_new(
+            phone, body, push_name, message_id,
+            lang_override=lang_for_message, referral=referral,
+        )
 
     # ── new session ───────────────────────────────────────────────────────
 
@@ -2283,11 +2424,18 @@ class OnboardingService:
         message_id: str,
         *,
         lang_override: str | None = None,
+        referral: dict | None = None,
     ) -> None:
         lang = lang_override
         if not lang:
             lang, _ = await self._resolve_message_language(body, phone, None)
         now = datetime.utcnow().isoformat()
+
+        # Canonical acquisition attribution for this brand-new prospect (organic,
+        # or ad-sourced via a CTWA referral / UTM-tagged prefilled message). One
+        # object, persisted here and later copied onto the business doc.
+        attribution = build_attribution(referral=referral, body=body, lead=None)
+        ad_sourced = is_ad_channel(attribution)
 
         # Build initial conversation with the user's first message
         conversation_history = [
@@ -2304,8 +2452,11 @@ class OnboardingService:
             "pairingSessionId": None,
             "businessId": None,
             "lastMessageId": message_id,
-            # Sales-phase tracking
-            "salesPhase": "discovery",
+            # Acquisition attribution (canonical — see app/services/attribution.py)
+            "attribution": attribution,
+            # Sales-phase tracking. Ad-sourced leads first go through a Global-KB
+            # Q&A gate ("ad_intro") and must reply YES before onboarding begins.
+            "salesPhase": "ad_intro" if ad_sourced else "discovery",
             "demoMessageCount": 0,
             "senderIdentity": "sofia",
             # Interruptible-onboarding state
@@ -2320,6 +2471,17 @@ class OnboardingService:
             },
         }
         db.upsert_onboarding_session(phone, session_data)
+
+        # ── Ad-sourced pre-onboarding gate ───────────────────────────────────
+        # A prospect who arrived from a Meta/Google ad first gets a Global-KB
+        # powered Q&A: we answer their question and invite them to reply YES to
+        # start setting up their own AI receptionist. Real onboarding only
+        # begins once they confirm (handled in the "ad_intro" conversation
+        # branch). Organic/website leads skip this entirely.
+        if ad_sourced:
+            session_data["currentStep"] = "conversing"
+            await self._handle_ad_intro(session_data, phone, body, push_name, message_id)
+            return
 
         # Fast-path: if first message is a website URL, extract info from it
         url = _extract_url(body)
@@ -2429,6 +2591,7 @@ class OnboardingService:
         lead: dict,
         *,
         lang_override: str | None = None,
+        referral: dict | None = None,
     ) -> None:
         """Create a ``recepte_confirm`` session and send the pre-filled data card.
 
@@ -2458,6 +2621,11 @@ class OnboardingService:
         msg = await self._localize_static(msg, body, lang)
         await self._send(phone, msg)
 
+        # Canonical attribution: a matched website_leads/recepte_leads doc means
+        # the "website" channel; if the same first message also carried an ad
+        # referral, build_attribution still records the ad ids under raw for audit.
+        attribution = build_attribution(referral=referral, body=body, lead=lead)
+
         session_data = {
             "ownerPhone": phone,
             "pushName": owner_name,
@@ -2470,6 +2638,7 @@ class OnboardingService:
             "lastMessageId": message_id,
             "recepteLeadData": lead,
             "registrationSource": "recepte.co",
+            "attribution": attribution,
             "timestamps": {
                 "startedAt": now,
                 "lastActivityAt": now,
@@ -2847,6 +3016,56 @@ class OnboardingService:
 
     # ── conversation handler ──────────────────────────────────────────────
 
+    async def _handle_ad_intro(
+        self, session: dict, phone: str, body: str, push_name: str, message_id: str
+    ) -> None:
+        """Pre-onboarding Q&A for an ad-sourced prospect.
+
+        Answers the prospect's question using the Global KB (no business-detail
+        collection yet) and invites them to reply YES to begin setting up their
+        own AI receptionist. Stays in salesPhase="ad_intro" until they confirm
+        (the affirmative branch in _handle_conversation moves them forward).
+        """
+        lang = session.get("language", "en")
+        name = push_name or session.get("pushName", "")
+        history = session.get("conversationHistory", [])
+
+        # The prospect's first message is already in history (added by _start_new);
+        # only append when this is a follow-up turn to avoid duplicating it.
+        if not (
+            history
+            and history[-1].get("role") == "user"
+            and history[-1].get("content") == body
+        ):
+            history.append({"role": "user", "content": body})
+
+        extra_context = (
+            "PRE-ONBOARDING MODE. The owner just arrived from a paid ad and may have "
+            "questions about Recepte. Answer their question concisely and warmly using "
+            "ONLY the Recepte knowledge base above. Do NOT ask for their website, "
+            "location, or business details yet, do NOT start onboarding, and do NOT "
+            "output [CONFIRMED]. Keep it to 2-4 short sentences. Finish by inviting them "
+            "to reply YES when they're ready to set up their own AI receptionist."
+        )
+        ai_reply = await self._get_ai_response(history, name, lang, extra_context=extra_context)
+        _, clean_reply = self._check_confirmed(ai_reply)
+
+        # Guarantee the YES invitation is present (localized), even if the model
+        # phrased its close differently or omitted it.
+        cta = await self._localize_static(_AD_INTRO_CTA_EN, body, lang)
+        if "yes" not in clean_reply.lower() and cta.lower() not in clean_reply.lower():
+            clean_reply = f"{clean_reply}\n\n{cta}"
+
+        history.append({"role": "assistant", "content": clean_reply})
+        db.upsert_onboarding_session(phone, {
+            "conversationHistory": history,
+            "salesPhase": "ad_intro",
+            "lastMessageId": message_id,
+            "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
+        })
+        await self._send(phone, clean_reply)
+        logger.info("[AD-INTRO] answered KB question for %s (awaiting YES)", phone)
+
     async def _handle_conversation(
         self, session: dict, phone: str, body: str, push_name: str, message_id: str
     ) -> None:
@@ -2855,6 +3074,33 @@ class OnboardingService:
             "lastMessageId": message_id,
             "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
         })
+
+        # ── Ad-sourced pre-onboarding gate ────────────────────────────────
+        # A prospect who arrived from a paid ad first gets a Global-KB powered
+        # Q&A. Onboarding proper (collecting business details) only starts once
+        # they reply YES. Organic/website leads never have salesPhase=="ad_intro"
+        # so they skip this entirely.
+        if session.get("salesPhase") == "ad_intro":
+            if _is_affirmative(body):
+                # They confirmed — begin real onboarding: ask for their
+                # website/Maps/Instagram link (the standard start-intent flow).
+                lang = session.get("language", "en")
+                reply = _link_request_message(lang, push_name or session.get("pushName", ""))
+                history = session.get("conversationHistory", [])
+                history.append({"role": "user", "content": body})
+                history.append({"role": "assistant", "content": reply})
+                db.upsert_onboarding_session(phone, {
+                    "salesPhase": "discovery",
+                    "conversationHistory": history,
+                    "askedForLink": True,
+                    "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
+                })
+                await self._send(phone, reply)
+                logger.info("[AD-INTRO] %s confirmed — starting onboarding (link request)", phone)
+                return
+            # Not confirmed yet — answer from the KB and re-invite.
+            await self._handle_ad_intro(session, phone, body, push_name, message_id)
+            return
 
         # ── Demo-request interruption ─────────────────────────────────────
         # If the owner asks for a demo, pause onboarding, run the demo, then
@@ -3603,6 +3849,10 @@ class OnboardingService:
                     "currentStep": "location_request",
                     "pendingPlacesQuery": query,
                     "askedForLocation": True,
+                    # Reset the anti-loop counter on every fresh gate entry so
+                    # the "max one static re-prompt" rule applies per visit.
+                    "locationPromptCount": 0,
+                    "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
                 })
                 loc_msg = (
                     "Perfect! 📍 Let’s find you on the map. "
@@ -3662,6 +3912,8 @@ class OnboardingService:
             "currentStep": "places_pick",
             "placesPickResults": results,
             "placesPickQuery": query,
+            "placesPickPromptCount": 0,
+            "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
         })
         lines = [f"I found {len(results)} businesses matching *{query}*. Which one is yours?\n"]
         for i, place in enumerate(results, 1):
@@ -3688,13 +3940,28 @@ class OnboardingService:
         query: str = session.get("placesPickQuery") or ""
         normalized = body.strip().lower()
 
-        # "none" / "no" / "none of these"
-        _none_words = {"none", "no", "nope", "nah", "neither", "not any", "none of these", "not mine"}
-        if any(w in normalized for w in _none_words):
+        # "none" / "no" / "none of these" (+ pt/es — most owners reply in
+        # Portuguese; an English-only list makes this step an infinite jail,
+        # same failure class as the location_request loop fixed 2026-07-13)
+        _none_words = {
+            "none", "no", "nope", "nah", "neither", "not any", "none of these", "not mine",
+            # Portuguese
+            "não", "nao", "nenhum", "nenhuma", "nenhuma dessas", "nenhum desses",
+            "não é", "nao e", "não sei", "nao sei",
+            # Spanish
+            "ninguno", "ninguna", "no es",
+        }
+        # Anti-loop guard: after ONE ambiguous re-prompt, stop re-showing the
+        # list and treat the reply as "none" — the none-branch below hands the
+        # conversation back to the AI with context, so the user's message is
+        # never held hostage by the pick list.
+        _pick_prompts = int(session.get("placesPickPromptCount") or 0)
+        if any(w in normalized for w in _none_words) or _pick_prompts >= 1:
             db.upsert_onboarding_session(phone, {
                 "currentStep": "conversing",
                 "placesPickResults": None,
                 "placesPickQuery": None,
+                "placesPickPromptCount": 0,
             })
             history = session.get("conversationHistory", [])
             history.append({"role": "user", "content": body})
@@ -3734,13 +4001,18 @@ class OnboardingService:
                     "websiteExtractedData": chosen,
                     "placesPickResults": None,
                     "placesPickQuery": None,
+                    "placesPickPromptCount": 0,
                     "conversationHistory": history,
                     "lastMessageId": message_id,
                 })
                 await self._send(phone, confirm_msg)
                 return
 
-        # Ambiguous — ask again, re-show the list compactly
+        # Ambiguous — ask again ONCE, re-show the list compactly. The counter
+        # above guarantees the next ambiguous reply routes to the AI instead
+        # of re-showing the list again (anti-loop).
+        db.upsert_onboarding_session(phone, {"placesPickPromptCount": _pick_prompts + 1})
+        session["placesPickPromptCount"] = _pick_prompts + 1
         lines = ["Please reply with just the number of your business:\n"]
         for i, place in enumerate(results, 1):
             lines.append(f"*{i}.* {place['name']} — {place.get('address', '')}")
@@ -4006,6 +4278,8 @@ class OnboardingService:
                                 "currentStep": "places_pick",
                                 "placesPickResults": valid_results,
                                 "placesPickQuery": pick_query,
+                                "placesPickPromptCount": 0,
+                                "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
                             })
 
                             lines = [
@@ -4574,6 +4848,12 @@ class OnboardingService:
         # Track which channel registered the business
         if session.get("registrationSource"):
             business_data["registrationSource"] = session["registrationSource"]
+
+        # Canonical acquisition attribution — copied from the onboarding session so
+        # the business doc carries channel provenance (Meta ad / website / organic).
+        # This is what the internal dashboard's per-channel acquisition reads.
+        if session.get("attribution"):
+            business_data["attribution"] = session["attribution"]
 
         existing_business_id = session.get("businessId")
         if existing_business_id:

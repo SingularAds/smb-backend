@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import type { Account, Overview, RangeFilter } from "../types";
+import { AcquisitionCard } from "../components/AcquisitionCard";
 import { ActivityChart } from "../components/ActivityChart";
 import { FunnelChart } from "../components/FunnelChart";
 import { GrowthChart } from "../components/GrowthChart";
@@ -204,7 +205,7 @@ export function OverviewPage({
           <StatTile
             label="Booking conversion"
             value={fmtPercent(agg.bookingConversion)}
-            hint="booked ÷ conversations with an outcome"
+            hint="booked ÷ resolved conversations (voice + WhatsApp)"
             icon={<TrendingUpIcon />}
           />
           <StatTile
@@ -235,18 +236,22 @@ export function OverviewPage({
       </div>
 
       <div className="grid gap-4 lg:grid-cols-2">
-        <div className="rise" style={rise(2)}>
+        <div className="rise h-full" style={rise(2)}>
           <FunnelChart
             stages={data.funnel}
             excludedDemoSessions={data.excludedDemoSessions}
           />
         </div>
-        <div className="rise" style={rise(3)}>
+        <div className="rise h-full" style={rise(3)}>
           <GrowthChart points={data.growth} />
         </div>
       </div>
 
-      <section className="card rise p-4" style={rise(4)}>
+      <div className="rise" style={rise(4)}>
+        <AcquisitionCard channels={data.acquisition?.byChannel ?? []} />
+      </div>
+
+      <section className="card rise p-4" style={rise(5)}>
         <div className="mb-3 flex flex-wrap items-center gap-2">
           <h2 className="mr-2 text-sm font-semibold text-ink">
             Accounts

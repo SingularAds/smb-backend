@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 from app import firestore as db
 from app.config import settings
 from app.integrations import langfuse_client, posthog_client
+from app.services import outbound_guard
 from app.services.whatsmeow_client import WhatsmeowClient
 
 logger = logging.getLogger(__name__)
@@ -299,19 +300,39 @@ async def sweep_business(business: dict) -> int:
         if not phone:
             continue
         try:
-            await _wa.send_message(phone, text, device_id=device_id)
-            db.upsert_customer_conversation(business_id, phone, {
-                "csatRequestedAt": _now().isoformat(),
-            })
-            try:
-                posthog_client.capture(
-                    business_id=business_id,
-                    customer_phone=phone,
-                    event="csat_requested",
-                )
-            except Exception:
-                pass
-            sent += 1
+            # CSAT prompts are business-initiated (marketing-class) — they go
+            # through the outbound guard: opt-out, touch budget, daily cap,
+            # business hours, warm-up, 463 circuit breaker, jitter.
+            result = await outbound_guard.send_proactive(
+                business, phone, text, mechanic="csat_prompt",
+            )
+            if result.sent:
+                db.upsert_customer_conversation(business_id, phone, {
+                    "csatRequestedAt": _now().isoformat(),
+                })
+                try:
+                    posthog_client.capture(
+                        business_id=business_id,
+                        customer_phone=phone,
+                        event="csat_requested",
+                    )
+                except Exception:
+                    pass
+                sent += 1
+            elif result.permanent:
+                # Opted-out contact: mark as requested so the sweep never
+                # retries this conversation, and record why.
+                db.upsert_customer_conversation(business_id, phone, {
+                    "csatRequestedAt": _now().isoformat(),
+                    "csatSkippedReason": result.reason,
+                })
+                logger.info("[CSAT] skipped permanently biz=%s phone=%s reason=%s",
+                            business_id, phone, result.reason)
+            else:
+                # Transient block (cap / hours / cooldown) — leave unmarked so
+                # the next sweep retries naturally.
+                logger.info("[CSAT] deferred biz=%s phone=%s reason=%s",
+                            business_id, phone, result.reason)
         except Exception as exc:
             logger.warning("[CSAT] could not send prompt biz=%s phone=%s: %s",
                            business_id, phone, exc)

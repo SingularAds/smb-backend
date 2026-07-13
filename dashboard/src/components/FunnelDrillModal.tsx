@@ -99,6 +99,22 @@ export function FunnelDrillModal({
                     </span>
                   ) : null}
 
+                  {/* Acquisition context — campaign / ad id when attributed */}
+                  {s.campaign ? (
+                    <span
+                      className="rounded-full px-1.5 py-px text-[10px]"
+                      style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+                      title="Campaign"
+                    >
+                      {s.campaign}
+                    </span>
+                  ) : null}
+                  {s.adId ? (
+                    <span className="font-mono text-[10px] text-muted" title="Ad ID">
+                      ad&nbsp;{s.adId}
+                    </span>
+                  ) : null}
+
                   {/* Started relative time */}
                   {s.startedAt ? (
                     <span title={s.startedAt}>{fmtRelative(s.startedAt)}</span>

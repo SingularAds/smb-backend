@@ -837,6 +837,32 @@ async def _process_webhook(payload: dict) -> None:
                             )
                             return
 
+                        # ── Marketing opt-out ("parar"/"sair"/"stop") ──────────
+                        # Runs before CSAT/AI so a contact answering one of OUR
+                        # proactive messages with an opt-out word is suppressed
+                        # globally (all campaign mechanics) and confirmed.
+                        # Non-breaking: for organic conversations (no recent
+                        # proactive touch) the flag is set silently and routing
+                        # continues to the AI exactly as before.
+                        try:
+                            from app.services.outbound_guard import maybe_handle_opt_out
+                            opt_out_handled = await maybe_handle_opt_out(
+                                business=business,
+                                customer_phone=phone,
+                                body=body or "",
+                            )
+                        except Exception as exc:
+                            logger.warning("[OPT-OUT] handler error: %s", exc)
+                            opt_out_handled = False
+                        if opt_out_handled:
+                            _log_event(
+                                "processed",
+                                phone=phone,
+                                message_id=message_id,
+                                detail="marketing opt-out handled",
+                            )
+                            return
+
                         # ── CSAT rating reply (must run before AI / referral) ──
                         # If we asked the customer to rate (1-5) and they did,
                         # consume the digit here so the AI never sees it as a
@@ -1001,12 +1027,23 @@ async def _process_webhook(payload: dict) -> None:
             _log_event("skipped", phone=phone, message_id=message_id, detail="audio on onboarding device")
             return
 
+        # CTWA ad-referral (Meta ad click) forwarded by the bridge, present only
+        # on ad-sourced first messages. Captured here on the ONBOARDING path only
+        # (this branch is the global onboarding device) so a prospect who arrived
+        # from an ad is attributed to it; customer-AI chats never see this.
+        referral = data.get("referral") or None
+        if referral:
+            logger.info(
+                "[ONBOARDING-REFERRAL] phone=%s ad source_id=%r source_url=%r",
+                phone, referral.get("source_id"), referral.get("source_url"),
+            )
+
         logger.info("[ONBOARDING-PROCESS] phone=%s push_name=%r msg_id=%r body=%r", phone, push_name, message_id, body[:100])
         import time
         onboarding_start = time.time()
 
         try:
-            await _onboarding.handle_message(phone, body, push_name, message_id, message_type=message_type)
+            await _onboarding.handle_message(phone, body, push_name, message_id, message_type=message_type, referral=referral)
             duration = time.time() - onboarding_start
             logger.info("[LATENCY] Onboarding processing for phone=%s msg_id=%s took %.3fs", phone, message_id, duration)
             logger.info("[ONBOARDING-RESPONSE] Sent reply for phone=%s msg_id=%r", phone, message_id)

@@ -83,6 +83,9 @@ firebase-secret.json
 
 #nodemodules
 node_modules/
+
+# Claude work-tracking folder (analysis logs, not app code)
+claudesmemory/
 *.md
 tests/
 dashboard/node_modules/

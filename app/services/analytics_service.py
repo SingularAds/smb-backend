@@ -43,6 +43,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 
 from app import firestore as fs
+from app.services.attribution import CHANNEL_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +263,81 @@ def is_registration_session(session: dict) -> bool:
         return True
     step = (session.get("currentStep") or "").strip()
     return _STEP_STAGE.get(step, "started") != "started"
+
+
+# ── Acquisition-by-channel (which marketing channel onboarding prospects came
+# from — Meta ads, website, organic, …). Reuses the same FUNNEL_STAGES so each
+# channel shows the same started→details→paired(connected)→completed steps. ──
+
+_ACQ_STAGE_LABELS = {
+    "started": "Started chatting",
+    "details_collected": "Business details collected",
+    "whatsapp_paired": "Connected to platform",
+    "completed": "Fully onboarded",
+}
+
+
+def session_channel(session: dict) -> str | None:
+    """Canonical acquisition channel for an onboarding session, or None when the
+    session pre-dates attribution capture (no attribution field)."""
+    attr = session.get("attribution")
+    if isinstance(attr, dict) and attr.get("channel"):
+        return str(attr["channel"])
+    return None
+
+
+def _build_acquisition(
+    channel_records: dict[str, list[tuple[str, dict]]],
+    created_by_channel: dict[str, int],
+) -> list[dict]:
+    """Turn per-channel (stage, session-entry) records into the dashboard's
+    acquisition blocks — one cumulative mini-funnel per channel.
+
+    Mirrors the main funnel's rules: counts are cumulative (reaching a deep stage
+    counts for all earlier stages), 'completed' is cross-checked against businesses
+    of that channel created in range, and monotonicity is enforced so a channel's
+    funnel never inverts.
+    """
+    out: list[dict] = []
+    for channel, records in channel_records.items():
+        counts = {s: 0 for s in FUNNEL_STAGES}
+        per_stage: dict[str, list[dict]] = {s: [] for s in FUNNEL_STAGES}
+        for stage, entry in records:
+            for s in FUNNEL_STAGES[: FUNNEL_STAGES.index(stage) + 1]:
+                counts[s] += 1
+            per_stage[stage].append(entry)
+
+        # Authoritative 'completed' from businesses of this channel created in
+        # range (sessions may be deleted after onboarding finishes).
+        counts["completed"] = max(counts["completed"], created_by_channel.get(channel, 0))
+        # Enforce funnel monotonicity (started ≥ details ≥ paired ≥ completed).
+        counts["whatsapp_paired"] = max(counts["whatsapp_paired"], counts["completed"])
+        counts["details_collected"] = max(counts["details_collected"], counts["whatsapp_paired"])
+        counts["started"] = max(counts["started"], counts["details_collected"])
+
+        # Cumulative per-stage session lists (a completed owner also appears under
+        # every earlier stage) — the 'started' bucket is therefore everyone.
+        cumulative: dict[str, list[dict]] = {}
+        for i, sk in enumerate(FUNNEL_STAGES):
+            merged: list[dict] = []
+            for s in FUNNEL_STAGES[i:]:
+                merged.extend(per_stage[s])
+            cumulative[sk] = sorted(merged, key=lambda x: x["startedAt"] or "", reverse=True)
+
+        out.append({
+            "channel": channel,
+            "label": CHANNEL_LABELS.get(channel, channel.replace("_", " ").title()),
+            "total": counts["started"],
+            "stages": [
+                {"stage": s, "label": _ACQ_STAGE_LABELS[s], "count": counts[s]}
+                for s in FUNNEL_STAGES
+            ],
+            "sessions": cumulative["started"],  # all prospects for this channel
+        })
+
+    # Paid ad channels first (the client's focus), then by volume desc.
+    out.sort(key=lambda c: (0 if str(c["channel"]).endswith("_ads") else 1, -c["total"]))
+    return out
 
 
 def _session_activity_dt(session: dict) -> datetime | None:
@@ -587,7 +663,10 @@ def get_platform_overview(
         "sessions": lambda: _stream_collection("onboarding_sessions"),
         "bookings": lambda: _stream_group(
             "bookings",
-            fields=["createdAt", "datetime", "dateTime", "date", "status"],
+            # customerPhone/customer_phone let us attribute a WhatsApp conversation
+            # to a booking (booking-conversion now spans WhatsApp, not just voice).
+            fields=["createdAt", "datetime", "dateTime", "date", "status",
+                    "customerPhone", "customer_phone"],
         ),
         "conversations": lambda: _stream_group(
             "conversations",
@@ -633,6 +712,9 @@ def get_platform_overview(
     # Per-stage session detail lists for the drill-down modal.
     # Each entry holds enough info to identify and contact the owner.
     stage_sessions: dict[str, list[dict]] = {s: [] for s in FUNNEL_STAGES}
+    # Per-acquisition-channel records: channel -> [(stage, session-entry)] used to
+    # build the "acquisition by channel" section (Meta ads, website, organic …).
+    channel_records: dict[str, list[tuple[str, dict]]] = defaultdict(list)
     active_sessions = 0
     excluded_demo_sessions = 0
     for doc_id, sess in sessions:
@@ -676,14 +758,26 @@ def get_platform_overview(
         biz_name = (biz_data or {}).get("name") or (
             (sess.get("businessData") or {}).get("businessName")
         )
-        stage_sessions[stage].append({
+        attribution = sess.get("attribution") if isinstance(sess.get("attribution"), dict) else {}
+        entry = {
             "phone": owner_phone or sess.get("id") or doc_id,
             "name": sess.get("pushName") or (biz_data or {}).get("ownerName"),
             "businessName": biz_name,
             "currentStep": sess.get("currentStep"),
             "startedAt": started.isoformat() if started else None,
             "businessId": (biz_data or {}).get("id"),
-        })
+            # Acquisition context (present only for attributed sessions).
+            "channel": attribution.get("channel"),
+            "adId": attribution.get("adId"),
+            "campaign": attribution.get("campaign"),
+        }
+        stage_sessions[stage].append(entry)
+
+        # Group into the acquisition-by-channel section (skip unattributed
+        # sessions predating attribution capture).
+        channel = session_channel(sess)
+        if channel:
+            channel_records[channel].append((stage, entry))
 
     # "Completed" is authoritative from businesses created in range (sessions
     # may be deleted after onboarding finishes). The funnel ALWAYS excludes
@@ -699,6 +793,19 @@ def get_platform_overview(
         if not p["isTest"] and _in_range(_parse_dt(p["createdAt"]), start, end)
     )
     stage_counts["completed"] = max(stage_counts["completed"], non_test_created)
+
+    # Authoritative per-channel "completed": businesses carrying an
+    # attribution.channel that were created in range (visible only). Feeds the
+    # acquisition section's completed step, mirroring the global funnel logic.
+    created_by_channel: dict[str, int] = defaultdict(int)
+    for bid, b in all_businesses:
+        if not _visible(bid):
+            continue
+        attr = b.get("attribution")
+        ch = attr.get("channel") if isinstance(attr, dict) else None
+        if ch and _in_range(_parse_dt(profiles[bid]["createdAt"]), start, end):
+            created_by_channel[ch] += 1
+    acquisition = {"byChannel": _build_acquisition(channel_records, created_by_channel)}
 
     # Ensure standard funnel monotonicity (Started >= Details Collected >= WhatsApp Paired >= Completed)
     # to prevent funnel inversion when completed sessions were deleted.
@@ -784,6 +891,9 @@ def get_platform_overview(
 
     total_bookings = 0
     bookings_by_status: dict[str, int] = defaultdict(int)
+    # (biz_id, normalized customer phone) pairs that booked in range — lets us
+    # credit a WhatsApp conversation as "converted" when its customer booked.
+    booked_keys_in_range: set[tuple[str, str]] = set()
     for biz_id, _, b in bookings:
         if biz_id not in profiles or not _visible(biz_id):
             continue
@@ -794,6 +904,9 @@ def get_platform_overview(
             total_bookings += 1
             bookings_by_status[b.get("status") or "unknown"] += 1
             book_by_day[created.date().isoformat()] += 1
+            _bphone = b.get("customerPhone") or b.get("customer_phone")
+            if _bphone:
+                booked_keys_in_range.add((biz_id, fs._clean_phone(str(_bphone))))
 
     total_conversations = 0
     outcomes: dict[str, int] = defaultdict(int)
@@ -809,6 +922,13 @@ def get_platform_overview(
             if c.get("outcome"):
                 outcomes[c["outcome"]] += 1
 
+    # WhatsApp conversations carry no `outcome` field (only the voice pipeline
+    # sets one). So booking-conversion used to measure voice ONLY — and reads
+    # empty whenever there are no recent voice calls. We now also treat each live
+    # WhatsApp chat active in range as a "resolved" conversation, converted when
+    # that customer booked in range (matched by phone). See the aggregate below.
+    whatsapp_resolved = 0
+    whatsapp_converted = 0
     for biz_id, doc_id, c in live_convos:
         if biz_id not in profiles or not _visible(biz_id):
             continue
@@ -820,6 +940,12 @@ def get_platform_overview(
             per_biz[biz_id]["conversations"] += 1
             total_conversations += 1
             conv_by_day[last.date().isoformat()] += 1
+            whatsapp_resolved += 1
+            # The customer_conversations doc id is the customer phone (see
+            # normalize_live_conversation); fall back to the stored field.
+            _wphone = c.get("customerPhone") or doc_id
+            if _wphone and (biz_id, fs._clean_phone(str(_wphone))) in booked_keys_in_range:
+                whatsapp_converted += 1
 
     open_complaints = 0
     for biz_id, _, comp in complaints:
@@ -857,6 +983,17 @@ def get_platform_overview(
     outcome_total = sum(outcomes.values())
     booked = outcomes.get("booked", 0)
 
+    # Unified booking conversion across BOTH channels:
+    #   resolved  = voice conversations with an outcome + WhatsApp chats in range
+    #   converted = voice 'booked' outcomes            + WhatsApp chats whose
+    #               customer booked in range (matched by phone)
+    resolved_conversations = outcome_total + whatsapp_resolved
+    converted_conversations = booked + whatsapp_converted
+    booking_conversion = (
+        round(converted_conversations / resolved_conversations, 4)
+        if resolved_conversations else None
+    )
+
     # Owner-activity proxy: last message the owner sent on the platform
     # onboarding number (onboarding_sessions doc id == owner phone).
     owner_activity: dict[str, str] = {}
@@ -888,6 +1025,7 @@ def get_platform_overview(
         "range": {"from": _iso(start), "to": _iso(end)},
         "includeTest": include_test,
         "funnel": funnel,
+        "acquisition": acquisition,
         "activeOnboardingSessions": active_sessions,
         "excludedDemoSessions": excluded_demo_sessions,
         "growth": growth,
@@ -903,8 +1041,11 @@ def get_platform_overview(
             "totalBookings": total_bookings,
             "bookingsByStatus": dict(bookings_by_status),
             "conversationOutcomes": dict(outcomes),
-            # booked conversations ÷ conversations with a recorded outcome
-            "bookingConversion": round(booked / outcome_total, 4) if outcome_total else None,
+            # converted ÷ resolved conversations, across voice + WhatsApp
+            # (see resolved_conversations / converted_conversations above)
+            "bookingConversion": booking_conversion,
+            "resolvedConversations": resolved_conversations,
+            "convertedConversations": converted_conversations,
             "avgCsat": _avg(csat_values),
             "csatResponses": len(csat_values),
             "openComplaints": open_complaints,
@@ -1004,6 +1145,9 @@ def get_business_detail(
     bookings_raw = loaded["bookings_raw"]
     bookings = []
     status_counts: dict[str, int] = defaultdict(int)
+    # Phones that booked in range — used to credit WhatsApp conversations as
+    # converted (see the unified booking-conversion computation below).
+    booked_phones_in_range: set[str] = set()
     for doc_id, b in bookings_raw:
         norm = normalize_booking(b, doc_id, business_id)
         ref_dt = _parse_dt(norm["datetime"]) or _parse_dt(norm["createdAt"])
@@ -1011,6 +1155,8 @@ def get_business_detail(
             continue
         bookings.append(norm)
         status_counts[norm["status"]] += 1
+        if norm.get("customerPhone"):
+            booked_phones_in_range.add(fs._clean_phone(str(norm["customerPhone"])))
     bookings.sort(key=lambda b: b["datetime"] or b["createdAt"] or "", reverse=True)
     bookings_in_range = len(bookings)
     bookings_truncated = (
@@ -1054,6 +1200,10 @@ def get_business_detail(
         conversations.append(norm)
         transcripts[norm["id"]] = _normalize_transcript(c)
 
+    # WhatsApp chats carry no `outcome` — treat each active-in-range chat as a
+    # resolved conversation, converted when that customer booked in range.
+    whatsapp_resolved = 0
+    whatsapp_converted = 0
     for doc_id, c in live_raw:
         norm = normalize_live_conversation(c, doc_id, business_id)
         last = _parse_dt(norm["startedAt"])
@@ -1064,6 +1214,10 @@ def get_business_detail(
         # live chats have no closed log — count them alongside the meta scan
         conversations_in_range += 1
         conv_by_day[last.date().isoformat()] += 1
+        whatsapp_resolved += 1
+        _wphone = norm.get("customerPhone") or doc_id
+        if _wphone and fs._clean_phone(str(_wphone)) in booked_phones_in_range:
+            whatsapp_converted += 1
 
     # All-time context so the UI can say "data exists outside this range"
     # instead of showing a bare empty state (counts are bounded by the fetch
@@ -1092,6 +1246,12 @@ def get_business_detail(
         or len(convos_meta) >= _DETAIL_FETCH_LIMIT
     )
     outcome_total = sum(outcome_counts.values())
+    # Unified conversion (voice outcomes + WhatsApp phone-matched), same as overview.
+    detail_resolved = outcome_total + whatsapp_resolved
+    detail_converted = outcome_counts.get("booked", 0) + whatsapp_converted
+    detail_booking_conversion = (
+        round(detail_converted / detail_resolved, 4) if detail_resolved else None
+    )
     conversations = conversations[:_DETAIL_CONVERSATIONS_LIMIT]
     transcripts = {c["id"]: transcripts.get(c["id"], []) for c in conversations}
 
@@ -1135,10 +1295,7 @@ def get_business_detail(
             "conversationsInRange": conversations_in_range,
             "conversationsTruncated": conversations_truncated,
             "conversationOutcomes": dict(outcome_counts),
-            "bookingConversion": (
-                round(outcome_counts.get("booked", 0) / outcome_total, 4)
-                if outcome_total else None
-            ),
+            "bookingConversion": detail_booking_conversion,
             "avgCsat": _avg([p["rating"] for p in csat_in_range]),
             "csatResponses": len(csat_in_range),
             "openComplaints": sum(1 for c in complaints if c["status"] == "open"),

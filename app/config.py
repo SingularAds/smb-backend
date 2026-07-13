@@ -140,6 +140,29 @@ class Settings(BaseSettings):
     RATE_LIMIT_PER_MINUTE: int = 60
     RATE_LIMIT_PER_HOUR: int = 1000
 
+    # ── WhatsApp Outbound Guard (anti-ban discipline for PROACTIVE sends) ──
+    # Applies to marketing-class messages we initiate (referral invites, CSAT
+    # prompts, future campaigns). Transactional messages (booking confirmations,
+    # reminders, AI replies to inbound) are NOT gated — they are customer-
+    # initiated and are WhatsApp's safest traffic class.
+    WA_OUTBOUND_GUARD_ENABLED: bool = True
+    # Max proactive messages per device (business number) per calendar day.
+    WA_PROACTIVE_DAILY_CAP: int = 50
+    # Max proactive touches per contact per rolling 30 days (across ALL mechanics).
+    WA_TOUCH_BUDGET_PER_30D: int = 2
+    # Randomized human-like delay (seconds) before each proactive send.
+    WA_PROACTIVE_JITTER_MIN_S: float = 10.0
+    WA_PROACTIVE_JITTER_MAX_S: float = 45.0
+    # Local business-hours window for proactive sends (business timezone).
+    WA_PROACTIVE_HOUR_START: int = 9
+    WA_PROACTIVE_HOUR_END: int = 20
+    # Days after WhatsApp pairing during which NO proactive sends happen
+    # (number warm-up). Businesses without waPairedAt are treated as warmed.
+    WA_WARMUP_DAYS: int = 7
+    # Minimum device cooldown (seconds) after WhatsApp 463 (reachout
+    # time-locked). The bridge's retry_after is honored if larger.
+    WA_463_COOLDOWN_MIN_S: int = 3600
+
     # ── LLM Observability (Langfuse) ──
     # Wraps every OpenAI call with traces, token cost, latency, and lets you
     # correlate customer CSAT scores back to the exact AI prompt/response.

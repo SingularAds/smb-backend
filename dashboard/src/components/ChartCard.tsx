@@ -23,7 +23,7 @@ export function ChartCard({
   const [view, setView] = useState<"chart" | "table">("chart");
   const summaryId = useId();
   return (
-    <section className="card p-4">
+    <section className="card p-4 h-full flex flex-col">
       <div className="mb-3 flex items-start justify-between gap-3">
         <div>
           <h2 className="text-sm font-semibold text-ink">{title}</h2>
@@ -43,12 +43,12 @@ export function ChartCard({
         {srSummary}
       </p>
       {view === "chart" ? (
-        <figure role="img" aria-describedby={summaryId} aria-label={title}>
+        <figure role="img" aria-describedby={summaryId} aria-label={title} className="flex-1 flex flex-col justify-end">
           {chart}
         </figure>
       ) : (
         <div
-          className="max-h-64 overflow-auto overscroll-contain"
+          className="max-h-64 flex-1 overflow-auto overscroll-contain"
           tabIndex={0}
           role="group"
           aria-label={`${title} data table`}

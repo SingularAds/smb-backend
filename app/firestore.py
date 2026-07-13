@@ -843,6 +843,45 @@ def delete_onboarding_session(phone: str) -> None:
     _db().collection("onboarding_sessions").document(phone_clean).delete()
 
 
+# ── WhatsApp device send-state (outbound guard) ─────────────────────────────
+# Collection: wa_device_state  —  doc ID = bridge device/session ID.
+# Tracks the per-number proactive daily counter and the 463 circuit-breaker
+# cooldown used by app/services/outbound_guard.py.
+
+def get_wa_device_state(device_id: str) -> dict | None:
+    doc = _db().collection("wa_device_state").document(device_id).get()
+    if not doc.exists:
+        return None
+    data = doc.to_dict()
+    data["id"] = doc.id
+    return data
+
+
+def upsert_wa_device_state(device_id: str, data: dict) -> None:
+    _db().collection("wa_device_state").document(device_id).set(data, merge=True)
+
+
+def get_wa_daily_count(device_id: str, day_key: str) -> int:
+    """Proactive messages sent by this device on day_key (YYYYMMDD)."""
+    doc = _db().collection("wa_device_state").document(f"{device_id}_{day_key}").get()
+    if not doc.exists:
+        return 0
+    return int((doc.to_dict() or {}).get("proactiveCount") or 0)
+
+
+def increment_wa_daily_count(device_id: str, day_key: str) -> None:
+    """Atomically bump the per-device daily proactive counter.
+
+    Uses a per-device-per-day doc + Firestore Increment: no read-modify-write
+    race, no midnight-reset logic, safe across multiple backend instances.
+    """
+    from google.cloud.firestore_v1 import Increment
+
+    _db().collection("wa_device_state").document(f"{device_id}_{day_key}").set(
+        {"proactiveCount": Increment(1), "date": day_key}, merge=True
+    )
+
+
 # ── business lookup by owner phone ───────────────────────────────────────────
 
 def get_business_by_owner_phone(phone: str) -> dict | None:

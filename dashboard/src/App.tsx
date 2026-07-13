@@ -192,13 +192,20 @@ function Shell({ onAuthFail }: { onAuthFail: () => void }) {
         <div className="flex flex-wrap items-center gap-3">
           <h1 className="text-lg font-semibold text-ink">Recepte analytics</h1>
           <span className="text-xs text-muted">internal · team only</span>
-          <nav aria-label="Sections" className="ml-auto flex gap-1">
+          <nav aria-label="Sections" className="ml-auto flex items-center gap-1">
             <NavLink to="/" end className={navLink}>
               Overview
             </NavLink>
             <NavLink to="/global-kb" className={navLink}>
               Global KB
             </NavLink>
+            <button
+              onClick={onAuthFail}
+              className="rounded-md px-2.5 py-1 text-xs font-medium text-[var(--status-critical)] hover:bg-[rgba(208,59,59,0.08)] transition-colors"
+              title="Logout and clear admin session"
+            >
+              Logout
+            </button>
           </nav>
         </div>
         {!isKb ? (
@@ -235,18 +242,34 @@ function Shell({ onAuthFail }: { onAuthFail: () => void }) {
 
 export default function App() {
   const [hasKey, setHasKey] = useState(() => getAdminKey() !== null);
+  const [showLoginToast, setShowLoginToast] = useState(false);
 
   const onAuthFail = useCallback(() => {
     clearAdminKey();
     setHasKey(false);
+    setShowLoginToast(false);
+  }, []);
+
+  const handleLoginSuccess = useCallback(() => {
+    setHasKey(true);
+    setShowLoginToast(true);
+    setTimeout(() => {
+      setShowLoginToast(false);
+    }, 3000);
   }, []);
 
   if (!hasKey) {
-    return <AdminKeyGate onSubmitted={() => setHasKey(true)} />;
+    return <AdminKeyGate onSubmitted={handleLoginSuccess} />;
   }
 
   return (
     <HashRouter>
+      {showLoginToast && (
+        <div className="fixed bottom-4 right-4 z-50 flex items-center gap-2 rounded-lg border border-[var(--status-good)] bg-surface px-4 py-3 text-sm shadow-lg rise border-opacity-30">
+          <span className="flex h-5 w-5 items-center justify-center rounded-full bg-[var(--status-good)] text-white text-[10px] font-bold">✓</span>
+          <span className="font-medium text-ink">Logged in successfully</span>
+        </div>
+      )}
       <Shell onAuthFail={onAuthFail} />
     </HashRouter>
   );

@@ -72,7 +72,7 @@ export function DateRangeDropdown({
         <div
           role="dialog"
           aria-label="Choose date range"
-          className="absolute right-0 z-40 mt-1.5 w-64 overflow-hidden rounded-lg border border-hairline bg-surface"
+          className="absolute left-0 z-40 mt-1.5 w-64 overflow-hidden rounded-lg border border-hairline bg-surface"
           style={{ boxShadow: "var(--shadow-modal)" }}
         >
           <ul className="py-1">

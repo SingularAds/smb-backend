@@ -20,12 +20,25 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 from app import firestore as db
-from app.services.automation.whatsapp_notifier import send_to_customer
+from app.services import outbound_guard
 from app.services.referral_service import get_or_create_referral_code
 
 logger = logging.getLogger(__name__)
 
 _INVITE_DELAY_MINUTES = 90
+
+# Opt-out hint appended to every proactive invite. Offering an explicit way
+# out measurably reduces "report spam" actions — the #1 WhatsApp ban driver.
+_OPT_OUT_HINT = {
+    "en": "_Reply STOP to opt out of these invites._",
+    "pt": "_Responda SAIR para não receber mais convites._",
+    "es": "_Responde SALIR para no recibir más invitaciones._",
+}
+
+
+def _opt_out_hint(business: dict) -> str:
+    lang = (business.get("primaryLanguage") or "pt")[:2].lower()
+    return _OPT_OUT_HINT.get(lang) or _OPT_OUT_HINT["en"]
 
 
 def _now() -> datetime:
@@ -110,21 +123,44 @@ async def run_referral_invite_sweep() -> None:
                         continue
 
                 try:
-                    await _send_referral_invite(business, b, customer_phone, referrer_pct=referrer_pct, referee_pct=referee_pct)
-                    db.update_booking(
-                        b["id"],
-                        {
-                            "referralInviteSent": True,
-                            "referralInviteSentAt": now.isoformat(),
-                        },
-                        biz_id,
-                    )
-                    db.upsert_customer(biz_id, customer_phone, {"lastReferralInviteAt": now.isoformat()})
-                    total_sent += 1
-                    logger.info(
-                        "[REFERRAL_SWEEP] Invite sent to %s (booking=%s biz=%s)",
-                        customer_phone, b["id"], biz_id,
-                    )
+                    result = await _send_referral_invite(business, b, customer_phone, referrer_pct=referrer_pct, referee_pct=referee_pct)
+                    if result.sent:
+                        db.update_booking(
+                            b["id"],
+                            {
+                                "referralInviteSent": True,
+                                "referralInviteSentAt": now.isoformat(),
+                            },
+                            biz_id,
+                        )
+                        db.upsert_customer(biz_id, customer_phone, {"lastReferralInviteAt": now.isoformat()})
+                        total_sent += 1
+                        logger.info(
+                            "[REFERRAL_SWEEP] Invite sent to %s (booking=%s biz=%s)",
+                            customer_phone, b["id"], biz_id,
+                        )
+                    elif result.permanent:
+                        # Opted-out contact — mark done so we never retry.
+                        db.update_booking(
+                            b["id"],
+                            {
+                                "referralInviteSent": True,
+                                "referralInviteSentAt": f"skipped_{result.reason}",
+                            },
+                            biz_id,
+                        )
+                        logger.info(
+                            "[REFERRAL_SWEEP] Skipped %s permanently — %s (biz=%s)",
+                            customer_phone, result.reason, biz_id,
+                        )
+                    else:
+                        # Transient guard block (daily cap / business hours /
+                        # device cooldown / touch budget) — leave the booking
+                        # unmarked so the next sweep retries automatically.
+                        logger.info(
+                            "[REFERRAL_SWEEP] Deferred %s — %s (booking=%s biz=%s)",
+                            customer_phone, result.reason, b["id"], biz_id,
+                        )
                 except Exception as exc:
                     logger.exception(
                         "[REFERRAL_SWEEP] Failed to send invite for booking %s: %s",
@@ -145,8 +181,12 @@ async def _send_referral_invite(
     customer_phone: str,
     referrer_pct: int = 25,
     referee_pct: int = 10,
-) -> None:
-    """Generate referral code and send the invite message to the customer."""
+) -> outbound_guard.GuardResult:
+    """Generate referral code and send the invite through the outbound guard.
+
+    Returns the GuardResult so the sweep can decide whether to mark the
+    booking as sent, permanently skipped, or retry on the next sweep.
+    """
     business_id = business["id"]
     code = get_or_create_referral_code(business_id, customer_phone)
 
@@ -189,9 +229,14 @@ async def _send_referral_invite(
         f"Your referral code: *{code}*{link_section}\n\n"
         f"When your friend completes their first visit, "
         f"you'll earn a *{referrer_pct}% discount* on your next appointment! 🎉\n"
-        f"Your friend gets *{referee_pct}% off* their first visit too!"
+        f"Your friend gets *{referee_pct}% off* their first visit too!\n\n"
+        f"{_opt_out_hint(business)}"
     )
-    await send_to_customer(business, customer_phone, msg)
+    # Marketing-class send → outbound guard (opt-out, touch budget, daily cap,
+    # business hours, warm-up, 463 circuit breaker, humanized jitter).
+    return await outbound_guard.send_proactive(
+        business, customer_phone, msg, mechanic="referral_invite",
+    )
 
 
 async def run_referral_discount_expiry_sweep() -> None:
