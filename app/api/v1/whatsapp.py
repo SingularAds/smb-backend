@@ -690,6 +690,61 @@ async def _process_webhook(payload: dict) -> None:
         # Re-read from settings so that test patches (monkeypatch.setattr on settings)
         # take effect without needing to restart the interpreter.
         current_onboarding_device = settings.WHATSMEOW_ONBOARDING_DEVICE_ID or settings.WHATSMEOW_DEFAULT_DEVICE_ID
+
+        def _digits(s: str) -> str:
+            return "".join(ch for ch in (s or "") if ch.isdigit())
+
+        # ── Bot-to-bot guard ──────────────────────────────────────────────────
+        # Our own service numbers (onboarding + demo) are never customers or
+        # prospects. If one of them shows up as the chat counterpart, replying
+        # would make two of our bots talk to each other in an infinite loop.
+        _service_numbers = {
+            _digits(n)
+            for n in (settings.WHATSMEOW_GLOBAL_NUMBER, settings.DEMO_WA_NUMBER)
+            if n
+        }
+        if _digits(phone) in _service_numbers:
+            logger.info(
+                "[WEBHOOK] skipped — counterpart %s is one of our service numbers", phone
+            )
+            _log_event(
+                "skipped", phone=phone, message_id=message_id,
+                detail="bot-to-bot guard: counterpart is a service number",
+            )
+            return
+
+        # ── Dedicated DEMO number → Salão Bella demo ──────────────────────────
+        # Messages arriving on the demo device run the live demo, isolated from
+        # onboarding/customer AI. Checked FIRST so the demo line never falls into
+        # the customer-AI (no-business → silent) path.
+        _demo_device = settings.DEMO_WA_DEVICE_ID
+        if _demo_device and device_id == _demo_device:
+            logger.info("[WEBHOOK] routing phone=%s device=%r -> demo", phone, device_id)
+            await _onboarding.handle_demo_message(
+                phone, body, push_name, message_id, message_type=message_type
+            )
+            _log_event("processed", phone=phone, message_id=message_id, detail="demo number")
+            return
+
+        # ── Stale duplicate-link guard for the demo phone ─────────────────────
+        # If the demo phone is ALSO linked to the bridge under another session
+        # (e.g. an old test-business pairing on the same handset), every message
+        # fires one webhook per session and gets answered twice — once by the
+        # demo, once by that other session's bot. The demo number serves ONLY
+        # the demo: drop events from any other session on that phone.
+        _demo_number = _digits(settings.DEMO_WA_NUMBER)
+        if _demo_number and _digits(device_own_phone) == _demo_number:
+            logger.warning(
+                "[WEBHOOK] skipped — device %r is a stale extra link on the demo "
+                "number; unlink it from the demo phone (WhatsApp → Linked Devices)",
+                device_id,
+            )
+            _log_event(
+                "skipped", phone=phone, message_id=message_id,
+                detail=f"stale duplicate session {device_id!r} on demo number",
+            )
+            return
+
         routing = "onboarding" if device_id == current_onboarding_device else "customer-ai"
         logger.info(
             "[WEBHOOK] routing phone=%s device=%r -> %s",

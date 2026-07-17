@@ -843,6 +843,38 @@ def delete_onboarding_session(phone: str) -> None:
     _db().collection("onboarding_sessions").document(phone_clean).delete()
 
 
+# Collection: demo_sessions  —  doc ID = phone (digits, no +)
+# Isolated from onboarding_sessions so a Salão Bella demo on the dedicated demo
+# number can never collide with a real onboarding session for the same phone.
+
+def get_demo_session(phone: str) -> dict | None:
+    phone_clean = _clean_phone(phone)
+    doc = _db().collection("demo_sessions").document(phone_clean).get()
+    if not doc.exists:
+        return None
+    data = doc.to_dict()
+    data["id"] = doc.id
+    return data
+
+
+def upsert_demo_session(phone: str, data: dict) -> dict:
+    phone_clean = _clean_phone(phone)
+    ref = _db().collection("demo_sessions").document(phone_clean)
+    doc = ref.get()
+    if doc.exists:
+        ref.update(data)
+    else:
+        ref.set(data)
+    result = ref.get().to_dict()
+    result["id"] = phone_clean
+    return result
+
+
+def delete_demo_session(phone: str) -> None:
+    phone_clean = _clean_phone(phone)
+    _db().collection("demo_sessions").document(phone_clean).delete()
+
+
 # ── WhatsApp device send-state (outbound guard) ─────────────────────────────
 # Collection: wa_device_state  —  doc ID = bridge device/session ID.
 # Tracks the per-number proactive daily counter and the 463 circuit-breaker

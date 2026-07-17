@@ -142,6 +142,45 @@ async def _send_daily_summary(business: dict, today_start: str, today_end: str) 
     # they represent what the SMB received throughout the day.
     total_bookings_received = len(today_bookings) + len(cancelled_today)
 
+    # Trust reframe (client trust spec item 11): a zero-filled digest
+    # ("0 bookings, 0 calls, 0 customers") reads as failure and erodes trust.
+    # On fully quiet days send a short "all quiet, I'm watching" note instead.
+    if (
+        not today_bookings
+        and not cancelled_today
+        and not new_customers
+        and calls_today == 0
+        and total_bookings_received == 0
+    ):
+        lang = str(business.get("primaryLanguage") or "en")[:2].lower()
+        quiet_msgs = {
+            "en": (
+                f"☀️ Good morning! All quiet at *{biz_name}* yesterday — "
+                "no new bookings yet.\n\n"
+                "I'm watching your WhatsApp 👀 The moment a customer messages, "
+                "I'll handle them and you'll see it all right here."
+            ),
+            "pt": (
+                f"☀️ Bom dia! Tudo tranquilo no *{biz_name}* ontem — "
+                "ainda sem novos agendamentos.\n\n"
+                "Estou de olho no seu WhatsApp 👀 Assim que um cliente mandar "
+                "mensagem, eu atendo e você vê tudo por aqui."
+            ),
+            "es": (
+                f"☀️ ¡Buenos días! Todo tranquilo en *{biz_name}* ayer — "
+                "aún sin nuevas reservas.\n\n"
+                "Estoy pendiente de tu WhatsApp 👀 En cuanto un cliente escriba, "
+                "yo lo atiendo y tú lo verás todo aquí."
+            ),
+        }
+        quiet_msg = quiet_msgs.get(lang) or quiet_msgs["en"]
+        logger.info(
+            "[AUTOMATION:DAILY_SUMMARY] quiet-day note for biz %s (%s) — no activity",
+            biz_id, biz_name,
+        )
+        await send_to_owner(business, quiet_msg)
+        return
+
     # Build message
     total_people = sum(int(b.get("partySize") or 1) for b in today_bookings)
 

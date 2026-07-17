@@ -23,7 +23,7 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
 
@@ -371,6 +371,25 @@ When the owner's first message is conversational ("I came through ads", "I heard
 - Proceed with the normal onboarding flow: ask for their website, Maps link, or Instagram.
 - Mandatory fields (name, type, address, hours) must still be collected — they cannot be skipped.
 
+TRUST & SECURITY QUESTIONS (answer honestly, warmly, NEVER defensively):
+Many owners fear this is a scam ("golpe"). When they ask if it's safe, if it's a scam,
+who sees their data, or how the connection works, answer with these facts:
+- Recepte connects through WhatsApp's official "Linked Devices" feature — the same one
+  behind WhatsApp Web. Their number stays theirs and they see every message, always.
+- They can disconnect anytime, in 2 taps, from their own phone
+  (WhatsApp → Settings → Linked Devices). They never need to ask anyone.
+- We NEVER ask for an SMS verification code, password, or card to test.
+  Nobody legitimate does.
+- Data: we are GDPR + LGPD compliant. Their data is theirs, we never share it,
+  and they can delete it anytime.
+- If they ask whether Recepte's team can see their messages: be honest — yes, because
+  the service runs on our system, our support team can access conversations to help
+  them; we never share any data outside Recepte. If they prefer WhatsApp's official
+  Meta API with no human access, that is possible but only on a NEW number, not their
+  existing one.
+- Invite them to verify the company at www.recepte.co (legal docs, GDPR/LGPD policy).
+A straight, calm answer to "is this a scam?" IS the sale — never dodge these questions.
+
 GENERAL PRODUCT & PRICING QUESTIONS (use the Global Knowledge Base below):
 A Knowledge Base section may appear below containing information about what Recepte is,
 its features, plans, pricing, and the free trial.  Use it to answer any general questions.
@@ -392,6 +411,199 @@ DIFFERENTIATE these two situations:
 NEVER refuse a general question by saying "I can't discuss pricing during onboarding."
 ALWAYS answer general questions warmly and naturally using the KB context.
 """
+
+# ── Salão Bella live demo persona (whatsmeow, same onboarding number) ─────────
+# This runs Sofia as the receptionist of a FICTIONAL salon so a skeptical
+# prospect can "feel" the product before connecting their own WhatsApp. It runs
+# on our existing whatsmeow onboarding number — NOT Meta. The whole point is the
+# "flip": the prospect is the customer for ~1 minute, then Sofia shows them the
+# OWNER'S daily summary with their own booking inside it.
+DEMO_SYSTEM_PROMPT = """\
+You are Sofia, Recepte's AI receptionist, running a LIVE DEMO on WhatsApp.
+The person messaging you is a BUSINESS OWNER evaluating Recepte. For ~2 minutes
+they role-play as a customer of a FICTIONAL salon called "Salão Bella", and you
+are the salon's receptionist.
+
+GOAL: make them FEEL, in about 2 minutes, five things:
+(1) instant replies, (2) understanding of voice notes, (3) a real booking,
+(4) customer memory, (5) the daily summary the OWNER receives (the big moment).
+
+STYLE (follow strictly):
+- Brazilian Portuguese by default. If the user writes in English or Spanish,
+  mirror that language for the rest of the chat.
+- Warm, natural, direct. MAXIMUM ONE emoji per message. Never long paragraphs.
+- Keep every message SHORT (1-3 lines).
+- ALWAYS end your message with the clear next step (a question or an action).
+- Use the person's name and their stated preference often — the memory is the show.
+
+DEMO SEQUENCE (follow in order — do NOT skip step 5):
+- Step 1 (info): capture their name + the service they'd want. If they only give
+  a name, acknowledge and ask the service. Then tell them they can send a VOICE
+  NOTE if they prefer, and ask: morning or afternoon?
+- Step 2 (voice): if they send a voice note, reference something specific they
+  said, then continue. If they don't, mention it only ONCE and move on.
+- Step 3 (booking): offer TWO times (e.g. "quinta 10h ou sexta 15h"). When they
+  pick, confirm the booking with their name + service + time, and mention you'd
+  send a reminder the day before — just like you would for their real customers.
+  If they refuse to book, move on gracefully — never dead-end.
+- Step 4 (memory): show what you remember: their name, preferred time, "última
+  visita: hoje". Explain that next month they just say "oi" and you already know
+  who they are. Their customers are never strangers again.
+- Step 5 (OWNER SUMMARY — MOST IMPORTANT, NEVER SKIP): say "Agora o melhor: veja
+  o que o DONO do salão recebe" and then, as a SEPARATE short block, send a daily
+  report for Salão Bella. All numbers are illustrative EXCEPT the booking you just
+  made with THIS person — put their real name + time in it. Include lines like:
+  conversas atendidas, agendamentos (with their booking), 1 cliente sumida que
+  voltou, uma avaliação no Google, e um total de receita. Keep it tight.
+- Step 6 (soft close): tell them all of this runs on THEIR own number, with THEIR
+  customers, connecting takes ~2 minutes and they can disconnect anytime. Invite
+  them to start the free trial or ask anything. On this closing message, and ONLY
+  this one, append the token [DEMO_DONE] on its own line at the very end.
+
+AFTER THE CLOSE (free chat): answer product questions briefly, then nudge back to
+the free trial. Never argue.
+
+REAL FEATURES ONLY (never invent others): 24/7 WhatsApp replies, voice notes,
+voice calls, calendar booking, reminders, customer memory, daily owner summaries,
+reactivating inactive customers, Google review requests, referral requests,
+filling empty appointment slots.
+
+PRICING (only if asked): plans start at R$147/month, with a 7-day free trial and
+no credit card required.
+
+SCAM / SAFETY QUESTIONS (answer calmly, never defensively, then continue the demo):
+- We use WhatsApp's official "Aparelhos conectados" (Linked Devices) feature —
+  the same as WhatsApp Web. Your number stays yours.
+- You disconnect anytime, in 2 taps, from your own phone.
+- We NEVER ask for an SMS code, password, or card to test. Nobody legitimate does.
+- Your data is yours (LGPD) and can be deleted anytime.
+- You can verify the company at www.recepte.co.
+
+NEVER ask for CPF, credit card, passwords, or SMS codes. If they offer any, refuse
+warmly ("não preciso disso") and do not store it.
+
+SPECIAL CASES:
+- Off-topic: one playful line, then steer back to the demo.
+- Rude: stay polite, offer to end.
+- Wants a human: say Refael will reach out and ask their best time.
+- A real customer messaging by mistake: gently explain this is a Recepte demo.
+- Competitor asking technical/architecture questions: stay vague, redirect.
+
+Output ONLY the message text to send. No JSON, no metadata (except the single
+[DEMO_DONE] token on the final close message).
+"""
+
+# Beat-0 greeting — sent deterministically so the FIRST demo reply is instant and
+# on-script (client spec). Hand-written per language; the LLM drives beats 1-6.
+_DEMO_GREETINGS: dict[str, str] = {
+    "pt": (
+        "Oi! 👋 Eu sou a Sofia. Vamos fazer assim: por 1 minutinho, você é "
+        "cliente do *Salão Bella* e eu sou a recepcionista.\n\n"
+        "Me diz seu nome e o que você faria no salão? (pode inventar)"
+    ),
+    "en": (
+        "Hi! 👋 I'm Sofia. Let's play: for 1 minute, you're a customer of "
+        "*Salão Bella* and I'm the receptionist.\n\n"
+        "Tell me your name and what you'd come in for? (feel free to make it up)"
+    ),
+    "es": (
+        "¡Hola! 👋 Soy Sofia. Hagamos esto: por 1 minuto, eres cliente del "
+        "*Salón Bella* y yo soy la recepcionista.\n\n"
+        "¿Me dices tu nombre y qué te harías en el salón? (puedes inventarlo)"
+    ),
+}
+
+
+def _demo_greeting(lang: str, name: str | None = None) -> str:
+    lang2 = (lang or "pt")[:2].lower()
+    return _DEMO_GREETINGS.get(lang2, _DEMO_GREETINGS["pt"])
+
+
+# Pre-filled text for the "feel it first" wa.me demo link. Localized to the
+# owner's conversation language (resolved from their messages / phone country
+# code) so it is NOT hardcoded to Portuguese. English is the neutral fallback.
+_DEMO_PREFILL_TEXTS: dict[str, str] = {
+    "pt": "Oi Sofia, quero ver como funciona",
+    "en": "Hi Sofia, I'd like to see how it works",
+    "es": "Hola Sofia, quiero ver cómo funciona",
+}
+
+
+def _demo_prefill_text(lang: str) -> str:
+    lang2 = (lang or "en")[:2].lower()
+    return _DEMO_PREFILL_TEXTS.get(lang2, _DEMO_PREFILL_TEXTS["en"])
+
+
+# Small fixed strings used by the dedicated demo number, per language (the demo
+# supports pt / en / es — everything the demo sends must follow the session
+# language, never hardcoded PT).
+_DEMO_TEXT_ONLY_NUDGE: dict[str, str] = {
+    "pt": "Por enquanto consigo ler só texto aqui no demo 😊 me manda por escrito?",
+    "en": "For now I can only read text here in the demo 😊 could you type it out?",
+    "es": "Por ahora solo puedo leer texto aquí en el demo 😊 ¿me lo escribes?",
+}
+
+_DEMO_HANDOFF_ACK: dict[str, str] = {
+    "pt": "Claro! O Refael, da nossa equipe, vai te chamar. Qual o melhor horário? 😊",
+    "en": "Of course! Refael from our team will message you. What's the best time? 😊",
+    "es": "¡Claro! Refael, de nuestro equipo, te va a escribir. ¿Cuál es el mejor horario? 😊",
+}
+
+_DEMO_LLM_FALLBACK: dict[str, str] = {
+    "pt": "Opa, tive um probleminha aqui 😅 Pode repetir?",
+    "en": "Oops, small hiccup on my side 😅 Could you say that again?",
+    "es": "Uy, tuve un problemita aquí 😅 ¿Puedes repetirlo?",
+}
+
+_DEMO_LANG_NAMES: dict[str, str] = {
+    "pt": "Brazilian Portuguese",
+    "en": "English",
+    "es": "Spanish",
+}
+
+
+def _demo_text(table: dict[str, str], lang: str) -> str:
+    lang2 = (lang or "pt")[:2].lower()
+    return table.get(lang2, table["pt"])
+
+
+def _detect_demo_start_lang(body: str, phone_lang: str) -> str:
+    """Language for a NEW demo-number session.
+
+    Strongest signal first: the wa.me pre-filled text (it carries the language
+    of the onboarding conversation the prospect came from), then the message
+    text itself, then the phone country code. Restricted to pt/en/es — the
+    languages the demo persona supports.
+    """
+    text = (body or "").strip().lower()
+    for lg, prefill in _DEMO_PREFILL_TEXTS.items():
+        if text == prefill.lower():
+            return lg
+    detected = _detect_msg_language(body)
+    if detected in _DEMO_LANG_NAMES:
+        return detected
+    if (phone_lang or "")[:2].lower() in _DEMO_LANG_NAMES:
+        return phone_lang[:2].lower()
+    return "pt"
+
+
+# Explicit "I want to connect my own number" intent — ends the demo and hands the
+# owner into real onboarding. Deliberately narrow so ordinary demo answers
+# ("sim", "quinta 10h") do NOT exit the demo mid-flow.
+_DEMO_CONNECT_RE = re.compile(
+    r"\b("
+    r"conectar|quero\s+conectar|vamos\s+conectar|come[cç]ar|quero\s+come[cç]ar"
+    r"|testar\s+no\s+meu|no\s+meu\s+n[uú]mero|quero\s+assinar|assinar|contratar"
+    r"|connect|let'?s\s+connect|sign\s+up|start\s+(?:the\s+)?trial|i'?m\s+in"
+    r"|conectemos|quiero\s+conectar|empezar|contratar"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_demo_connect_intent(text: str) -> bool:
+    return bool(_DEMO_CONNECT_RE.search((text or "").strip()))
+
 
 # Separate prompt for generating the business JSON after confirmation
 EXTRACTION_SYSTEM_PROMPT = """\
@@ -974,6 +1186,171 @@ _LANGUAGE_OVERRIDE_EN_RE = re.compile(
 
 _STATIC_TRANSLATION_CACHE: dict[tuple[str, str], str] = {}
 _LANGUAGE_DETECTION_CACHE: dict[str, tuple[str, float]] = {}
+
+# ── Trust & safety copy (client trust spec, 2026-07) ─────────────────────────
+# The primary market is Brazil, so PT-BR is hand-written (client-approved copy)
+# and pre-seeded into _STATIC_TRANSLATION_CACHE below — it must NOT go through
+# machine translation. Other languages fall back to the LLM translator.
+
+# Privacy promise, sent as a short note right after Sofia's introduction (client
+# 2026-07: the GDPR/LGPD reassurance belongs early, when the owner arrives — not
+# buried inside the pre-pairing trust block). Deliberately 2 short lines.
+_PRIVACY_NOTE_EN = (
+    "🔒 Safe Connection - before we start: your data is yours alone. "
+    "we never share our conversations with anyone. (GDPR & LGPD)\n\n"
+    "🔎 Want to check we're real? www.recepte.co"
+)
+_PRIVACY_NOTE_PT = (
+    "🔒 Uma promessa antes de começar: seus dados são só seus. "
+    "Nunca compartilho suas conversas com ninguém. (GDPR e LGPD)\n\n"
+    "🔎 Quer confirmar que a gente é de verdade? www.recepte.co"
+)
+_PRIVACY_NOTE_ES = (
+    "🔒 Una promesa antes de empezar: tus datos son solo tuyos. "
+    "Nunca comparto tus conversaciones con nadie. (GDPR y LGPD)\n\n"
+    "🔎 ¿Quieres comprobar que somos reales? www.recepte.co"
+)
+
+# Item 1+3: trust reassurance shown BEFORE the QR/pairing choice, so the QR code
+# is never the first thing the owner sees. Split into two SHORT messages (client
+# 2026-07: "msgs that take the whole screen are a headache") and written in plain,
+# confident language — no jargon, no "Linked Devices" (that name only appears in
+# the QR instructions, where the owner must actually tap it). The GDPR/LGPD line
+# and the "verify us" link moved earlier, into _PRIVACY_NOTE_* after the intro.
+#
+# Message 1 of 2: you stay in control.
+_TRUST_INTERSTITIAL_EN = (
+    "🔒 *You stay in control — always.*\n\n"
+    "It works just like WhatsApp Web: you keep using WhatsApp exactly as you do "
+    "today, and you see every message.\n\n"
+    "✅ Your number stays yours\n"
+    "✅ Disconnect anytime, in 2 taps"
+)
+_TRUST_INTERSTITIAL_PT = (
+    "🔒 *Você no controle — sempre.*\n\n"
+    "Funciona igual ao WhatsApp Web: você continua usando o WhatsApp exatamente "
+    "como hoje, e vê todas as mensagens.\n\n"
+    "✅ Seu número continua seu\n"
+    "✅ Desconecta quando quiser, em 2 toques"
+)
+_TRUST_INTERSTITIAL_ES = (
+    "🔒 *Tú tienes el control — siempre.*\n\n"
+    "Funciona igual que WhatsApp Web: sigues usando WhatsApp exactamente como "
+    "hoy, y ves todos los mensajes.\n\n"
+    "✅ Tu número sigue siendo tuyo\n"
+    "✅ Te desconectas cuando quieras, en 2 toques"
+)
+
+# Message 2 of 2: the low-risk options. Item 2 (demo-before-commitment) is
+# included only when settings.DEMO_WA_NUMBER is configured; {demo_link} is
+# replaced after localization — same placeholder pattern as the calendar link.
+_TRUST_DEMO_OFFER_EN = (
+    "👀 *Want to see it working first?*\n"
+    "Try me live — no signup, no connection: {demo_link}"
+)
+_TRUST_DEMO_OFFER_PT = (
+    "👀 *Quer ver funcionando antes?*\n"
+    "Me testa ao vivo — sem cadastro, sem conexão: {demo_link}"
+)
+_TRUST_DEMO_OFFER_ES = (
+    "👀 *¿Quieres verlo funcionando antes?*\n"
+    "Pruébame en vivo — sin registro, sin conexión: {demo_link}"
+)
+
+# Item 3: naming the spare-number option lowers the stakes even when unused.
+_TRUST_SPARE_NUMBER_EN = "_Prefer to test with a spare number first? That works too._"
+_TRUST_SPARE_NUMBER_PT = "_Prefere testar com um número reserva primeiro? Também funciona._"
+_TRUST_SPARE_NUMBER_ES = "_¿Prefieres probar primero con un número de repuesto? También funciona._"
+
+# Item 5: one trust line under the QR code + "verify us" link.
+_QR_CAPTION_EN = (
+    "📲 Scan this QR code in WhatsApp → Settings → Linked Devices → Link a Device\n\n"
+    "🔒 Official connection via Linked Devices. You can disconnect anytime in "
+    "Settings > Linked Devices. Verify us → www.recepte.co"
+)
+_QR_CAPTION_PT = (
+    "📲 Escaneie este código QR no WhatsApp → Configurações → Aparelhos conectados → Conectar um aparelho\n\n"
+    "🔒 Conexão oficial via Aparelhos conectados. Você pode desconectar a qualquer momento em "
+    "Configurações > Aparelhos conectados. Verifique a gente → www.recepte.co"
+)
+_QR_CAPTION_ES = (
+    "📲 Escanea este código QR en WhatsApp → Ajustes → Dispositivos vinculados → Vincular un dispositivo\n\n"
+    "🔒 Conexión oficial vía Dispositivos vinculados. Puedes desconectarte cuando quieras en "
+    "Ajustes > Dispositivos vinculados. Verifícanos → www.recepte.co"
+)
+
+# Item 6: pairing-code heads-up, REFRAMED — leads with the positive official-
+# feature explanation, then normalises WhatsApp's caution screen, then the
+# explicit "we never ask for an SMS code" disclaimer (#1 scam vector in Brazil).
+_SCAM_WARNING_EN = (
+    "Quick heads-up before we connect 🔒\n\n"
+    "We use WhatsApp's official *Linked Devices* feature — the same one behind WhatsApp Web. "
+    "Your number stays yours, and you can unlink anytime, in 2 taps, from your own phone.\n\n"
+    "WhatsApp may show a caution screen saying “This may be a scam”. That's normal — "
+    "it appears whenever you link with a code instead of scanning a QR.\n\n"
+    "⚠️ Important: we will *never* ask you for an SMS verification code. Nobody legitimate does.\n\n"
+    "🔎 Verify us: www.recepte.co\n\n"
+    "Reply *YES* and let's go 🚀"
+)
+_SCAM_WARNING_PT = (
+    "Um aviso rápido antes de conectar 🔒\n\n"
+    "Usamos o recurso oficial *Aparelhos conectados* do WhatsApp — o mesmo do WhatsApp Web. "
+    "Seu número continua seu, e você desvincula quando quiser, em 2 toques, direto do seu celular.\n\n"
+    "O WhatsApp pode mostrar uma tela dizendo “Isso pode ser um golpe”. É normal — "
+    "aparece sempre que você conecta com código em vez de escanear o QR.\n\n"
+    "⚠️ Importante: nós *nunca* pedimos código de verificação por SMS. Ninguém legítimo pede.\n\n"
+    "🔎 Verifique a gente: www.recepte.co\n\n"
+    "Responda *SIM* e vamos lá 🚀"
+)
+_SCAM_WARNING_ES = (
+    "Un aviso rápido antes de conectar 🔒\n\n"
+    "Usamos la función oficial *Dispositivos vinculados* de WhatsApp — la misma de WhatsApp Web. "
+    "Tu número sigue siendo tuyo y puedes desvincularlo cuando quieras, en 2 toques, desde tu teléfono.\n\n"
+    "WhatsApp puede mostrar una pantalla que dice “Esto puede ser una estafa”. Es normal — "
+    "aparece siempre que vinculas con un código en lugar de escanear el QR.\n\n"
+    "⚠️ Importante: *nunca* te pediremos un código de verificación por SMS. Nadie legítimo lo pide.\n\n"
+    "🔎 Verifícanos: www.recepte.co\n\n"
+    "Responde *SÍ* y vamos 🚀"
+)
+
+# Items 7+8: first message after successful pairing — reassurance + control
+# first (not features), then the guided self-test invitation.
+_PAIRED_SUCCESS_EN = (
+    "✅ Connected! I'm Sofia — we're officially a team now 🤝\n\n"
+    "Remember: you can disconnect me anytime, in 2 taps, in WhatsApp → Settings → Linked Devices. "
+    "Your number stays yours and you see everything, always.\n\n"
+    "Want to see how I treat your customers? Ask a friend or family member to message your "
+    "business number and watch me reply ✨ Or just send *test* here for a quick preview."
+)
+_PAIRED_SUCCESS_PT = (
+    "✅ Conectado! Sou a Sofia — agora somos oficialmente um time 🤝\n\n"
+    "Lembre-se: você pode me desconectar a qualquer momento, em 2 toques, em WhatsApp → "
+    "Configurações → Aparelhos conectados. Seu número continua seu e você vê tudo, sempre.\n\n"
+    "Quer ver como eu atendo seus clientes? Peça pra um amigo ou familiar mandar mensagem "
+    "pro número do seu negócio e veja eu responder ✨ Ou manda *teste* aqui pra uma prévia rápida."
+)
+_PAIRED_SUCCESS_ES = (
+    "✅ ¡Conectado! Soy Sofia — ahora somos oficialmente un equipo 🤝\n\n"
+    "Recuerda: puedes desconectarme cuando quieras, en 2 toques, en WhatsApp → Ajustes → "
+    "Dispositivos vinculados. Tu número sigue siendo tuyo y lo ves todo, siempre.\n\n"
+    "¿Quieres ver cómo atiendo a tus clientes? Pide a un amigo o familiar que escriba al "
+    "número de tu negocio y mira cómo respondo ✨ O envía *test* aquí para una vista previa."
+)
+
+# Pre-seed the static translation cache so PT-BR / ES trust copy is served
+# verbatim (hand-written, client-approved) instead of machine-translated.
+for _en_txt, _pt_txt, _es_txt in (
+    (_PRIVACY_NOTE_EN, _PRIVACY_NOTE_PT, _PRIVACY_NOTE_ES),
+    (_TRUST_INTERSTITIAL_EN, _TRUST_INTERSTITIAL_PT, _TRUST_INTERSTITIAL_ES),
+    (_TRUST_DEMO_OFFER_EN, _TRUST_DEMO_OFFER_PT, _TRUST_DEMO_OFFER_ES),
+    (_TRUST_SPARE_NUMBER_EN, _TRUST_SPARE_NUMBER_PT, _TRUST_SPARE_NUMBER_ES),
+    (_QR_CAPTION_EN, _QR_CAPTION_PT, _QR_CAPTION_ES),
+    (_SCAM_WARNING_EN, _SCAM_WARNING_PT, _SCAM_WARNING_ES),
+    (_PAIRED_SUCCESS_EN, _PAIRED_SUCCESS_PT, _PAIRED_SUCCESS_ES),
+):
+    _STATIC_TRANSLATION_CACHE[("pt", _en_txt)] = _pt_txt
+    _STATIC_TRANSLATION_CACHE[("es", _en_txt)] = _es_txt
+del _en_txt, _pt_txt, _es_txt
 
 
 def _has_language_signal(text: str) -> bool:
@@ -2143,6 +2520,29 @@ class OnboardingService:
                         session["currentStep"] = "conversing"
                         step = "conversing"
 
+            # ── Salão Bella live demo (runs on this whatsmeow number) ──────
+            if step == "demo_salao_bella":
+                await self._handle_salao_bella_demo(
+                    session, phone, body, push_name, message_id
+                )
+                return
+
+            # ── Demo link during pre-connection setup ──────────────────────
+            # The trust interstitial offers a "feel it first" demo link to THIS
+            # number. If it's tapped while the owner sits at a pairing step, the
+            # pre-filled "quero ver como funciona" would otherwise be misread by
+            # the pairing handler. Intercept it and run the demo, remembering the
+            # step so we can send them back afterwards.
+            _DEMO_LINK_STEPS = {
+                "pairing_mode_choice", "pairing", "pairing_scam_warning",
+                "pairing_qr_active", "website_confirm",
+            }
+            if step in _DEMO_LINK_STEPS and _is_demo_request(body):
+                await self._start_salao_bella_demo(
+                    session, phone, body, push_name, message_id, return_step=step
+                )
+                return
+
             # Already completed or post-onboarding support request?
             if step in ("complete", "post_onboarding"):
                 biz = db.get_business_by_owner_phone(phone)
@@ -2282,7 +2682,7 @@ class OnboardingService:
                     })
                     session["currentStep"] = "conversing"
                     session["pendingPlacesQuery"] = None
-                    await self._handle_demo_request_during_onboarding(
+                    await self._start_salao_bella_demo(
                         session, phone, body, push_name, message_id
                     )
                     return
@@ -2487,11 +2887,14 @@ class OnboardingService:
         url = _extract_url(body)
         if url:
             await self._handle_website_url(session_data, phone, url, push_name)
+            await self._maybe_send_privacy_note(phone, lang, session_data)
             return
 
-        # Fast-path: if first message is a demo request, activate demo mode now
+        # Fast-path: if first message is a demo request (e.g. from the "feel it
+        # first" demo link, pre-filled "Oi Sofia, quero ver como funciona"),
+        # run the live Salão Bella demo on this whatsmeow number.
         if _is_demo_request(body):
-            await self._handle_demo_request_during_onboarding(
+            await self._start_salao_bella_demo(
                 session_data, phone, body, push_name, message_id
             )
             return
@@ -2505,6 +2908,7 @@ class OnboardingService:
                 "askedForLink": True,
             })
             await self._send(phone, reply)
+            await self._maybe_send_privacy_note(phone, lang, session_data)
             logger.info("[ONBOARDING] Link request sent for %s (start intent)", phone)
             return
 
@@ -2521,6 +2925,8 @@ class OnboardingService:
         })
 
         await self._send(phone, clean_reply)
+        # Privacy promise right after Sofia's introduction (client 2026-07).
+        await self._maybe_send_privacy_note(phone, lang, session_data)
         logger.info("Onboarding started for %s (lang=%s, pushName=%s)", phone, lang, push_name)
 
     # ── recepte.co onboarding path ────────────────────────────────────────
@@ -3118,7 +3524,8 @@ class OnboardingService:
             _cur_sales_phase == "discovery"
             or (_cur_sales_phase == "demo" and _cur_demo_count <= 1)
         ):
-            await self._handle_demo_request_during_onboarding(
+            # Live Salão Bella demo on this whatsmeow number (client trust spec).
+            await self._start_salao_bella_demo(
                 session, phone, body, push_name, message_id
             )
             return
@@ -3562,6 +3969,412 @@ class OnboardingService:
                 await self._finalize_business(session, phone, history)
 
     # ── website extraction flow ───────────────────────────────────────────
+
+    # ── Salão Bella live demo (whatsmeow, same onboarding number) ────────
+
+    async def _get_demo_response(
+        self, demo_history: list[dict], name: str, language: str
+    ) -> str:
+        """Call the LLM with the Salão Bella DEMO persona and return the reply.
+
+        Mirrors _get_ai_response but swaps in DEMO_SYSTEM_PROMPT and keeps the
+        Global KB (so product / pricing / scam questions are answered from real
+        facts). Never raises — returns a safe fallback on error.
+        """
+        name_note = f"The person's name is {name}." if name else ""
+        lang_label = _demo_text(_DEMO_LANG_NAMES, language)
+        lang_note = (
+            f"CONVERSATION LANGUAGE: {lang_label}. Reply ONLY in {lang_label} — every "
+            "single message, including booking confirmations and the owner summary. "
+            "NEVER switch language on your own, even if parts of the conversation "
+            "history are in another language."
+        )
+        try:
+            from app.services.global_kb import build_kb_prompt_section
+            kb_section = build_kb_prompt_section()
+        except Exception:
+            kb_section = ""
+
+        parts = [DEMO_SYSTEM_PROMPT]
+        if kb_section:
+            parts.append(kb_section)
+        if name_note:
+            parts.append(name_note)
+        parts.append(lang_note)
+        system = "\n\n".join(parts)
+
+        try:
+            response = await self.client.messages.create(
+                model=self.model,
+                max_tokens=600,
+                system=system,
+                messages=demo_history,
+            )
+            if not response.content:
+                return _demo_text(_DEMO_LLM_FALLBACK, language)
+            return (response.content[0].text or "").strip()
+        except Exception as exc:
+            logger.exception("[DEMO] Salão Bella response error: %s", exc)
+            return _demo_text(_DEMO_LLM_FALLBACK, language)
+
+    @staticmethod
+    def _strip_demo_done(reply: str) -> tuple[bool, str]:
+        """Detect + strip the [DEMO_DONE] soft-close marker."""
+        if "[DEMO_DONE]" in reply:
+            return True, reply.replace("[DEMO_DONE]", "").strip()
+        return False, reply
+
+    async def _start_salao_bella_demo(
+        self,
+        session: dict,
+        phone: str,
+        body: str,
+        push_name: str,
+        message_id: str,
+        *,
+        return_step: str | None = None,
+    ) -> None:
+        """Enter the Salão Bella demo mode and send the instant Beat-0 greeting.
+
+        Runs on the existing whatsmeow onboarding number (no Meta). Onboarding
+        data already in the session (websiteExtractedData, businessId, …) is
+        preserved untouched so the owner can continue after the demo ends.
+        """
+        # Language by country code (client: "detect language by country code"),
+        # unless a language is already saved for this session.
+        lang = session.get("language") or self.ai.detect_language(phone) or "pt"
+        name = push_name or session.get("pushName", "")
+        greeting = _demo_greeting(lang, name)
+
+        demo_history = [
+            {"role": "user", "content": body},
+            {"role": "assistant", "content": greeting},
+        ]
+        update = {
+            "currentStep": "demo_salao_bella",
+            "demoHistory": demo_history,
+            "demoMsgCount": 1,
+            "demoSoftCloseReached": False,
+            "demoStartedAt": datetime.utcnow().isoformat(),
+            "language": lang,
+            "lastMessageId": message_id,
+            "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
+        }
+        if return_step:
+            update["demoReturnStep"] = return_step
+        db.upsert_onboarding_session(phone, update)
+        session.update({
+            "currentStep": "demo_salao_bella",
+            "demoHistory": demo_history,
+            "demoMsgCount": 1,
+            "language": lang,
+        })
+
+        await self._send(phone, greeting)
+        logger.info("[DEMO] Salão Bella demo started for %s (lang=%s)", phone, lang)
+        try:
+            posthog_client.capture(
+                business_id=session.get("businessId") or phone,
+                customer_phone=phone,
+                event="demo_started",
+                properties={"channel": "whatsmeow", "language": lang},
+            )
+        except Exception:
+            pass
+
+    async def _handle_salao_bella_demo(
+        self, session: dict, phone: str, body: str, push_name: str, message_id: str
+    ) -> None:
+        """Drive one turn of the Salão Bella demo, or exit to onboarding."""
+        lang = session.get("language", "pt")
+        name = push_name or session.get("pushName", "")
+
+        db.upsert_onboarding_session(phone, {
+            "lastMessageId": message_id,
+            "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
+        })
+
+        # ── URL escape: a prospect who pastes their website/Maps/Instagram is
+        # ready to set up for real — leave the demo and process it so they are
+        # never stuck chatting with the demo persona.
+        url = _extract_url(body)
+        if url and not session.get("businessId"):
+            db.upsert_onboarding_session(phone, {
+                "currentStep": "conversing",
+                "salesPhase": "discovery",
+                "demoReturnStep": None,
+            })
+            session["currentStep"] = "conversing"
+            _h = session.get("conversationHistory", [])
+            _h.append({"role": "user", "content": body})
+            db.upsert_onboarding_session(phone, {"conversationHistory": _h})
+            session["conversationHistory"] = _h
+            await self._handle_website_url(session, phone, url, push_name)
+            return
+
+        # ── Exit to real onboarding ───────────────────────────────────────
+        # Explicit "connect my number" / "start onboarding" intent at any time,
+        # OR a bare "yes" once the soft-close has been shown, ends the demo.
+        wants_connect = (
+            _is_demo_connect_intent(body)
+            or _is_onboarding_start_intent(body)
+            or (session.get("demoSoftCloseReached") and _is_affirmative(body))
+        )
+        if wants_connect:
+            await self._exit_demo_to_onboarding(session, phone, body, push_name, message_id)
+            return
+
+        # ── Human handoff ─────────────────────────────────────────────────
+        if body.strip().lower() in _DANIEL_TRIGGER_WORDS:
+            await self._daniel_handoff(phone, session, context=f"[demo] {body}")
+            msg = await self._localize_static(
+                "Claro! O Refael, da nossa equipe, vai te chamar. Qual o melhor horário? 😊",
+                body, lang,
+            )
+            await self._send(phone, msg)
+            return
+
+        demo_history = session.get("demoHistory", [])
+        count = int(session.get("demoMsgCount", 0)) + 1
+
+        # ── Safety cap (anti abuse / cost-burn) ───────────────────────────
+        if count > 40:
+            msg = await self._localize_static(
+                "Adorei essa conversa! 😊 Quando quiser ver isso no SEU número, "
+                "é só dizer *conectar* — leva 2 minutos e você desliga quando quiser.",
+                body, lang,
+            )
+            await self._send(phone, msg)
+            db.upsert_onboarding_session(phone, {"demoSoftCloseReached": True})
+            return
+
+        demo_history.append({"role": "user", "content": body})
+        reply = await self._get_demo_response(demo_history, name, lang)
+        soft_close, clean = self._strip_demo_done(reply)
+        demo_history.append({"role": "assistant", "content": clean})
+
+        db.upsert_onboarding_session(phone, {
+            "demoHistory": demo_history[-24:],
+            "demoMsgCount": count,
+            "demoSoftCloseReached": bool(session.get("demoSoftCloseReached") or soft_close),
+        })
+        await self._send(phone, clean)
+        if soft_close:
+            logger.info("[DEMO] soft-close reached for %s (turn %d)", phone, count)
+
+    async def _exit_demo_to_onboarding(
+        self, session: dict, phone: str, body: str, push_name: str, message_id: str
+    ) -> None:
+        """Leave the demo and hand the owner into real onboarding.
+
+        If a business already exists (owner was mid-pairing when they clicked the
+        demo link), send them back to the pairing choice. Otherwise start the
+        normal link-request onboarding flow.
+        """
+        lang = session.get("language", "pt")
+        business_id = session.get("businessId")
+        biz = db.get_business_by_id(business_id) if business_id else None
+
+        try:
+            posthog_client.capture(
+                business_id=business_id or phone,
+                customer_phone=phone,
+                event="demo_cta_clicked",
+                properties={"demo_turns": int(session.get("demoMsgCount", 0))},
+            )
+        except Exception:
+            pass
+
+        # Owner already has a business → resume pairing where the demo interrupted.
+        if biz:
+            db.upsert_onboarding_session(phone, {"demoReturnStep": None})
+            session["currentStep"] = "pairing_mode_choice"
+            await self._start_pairing_mode_choice(session, phone, biz.get("name", "your business"))
+            logger.info("[DEMO] exited to pairing (existing business) for %s", phone)
+            return
+
+        # Prospect → start onboarding: ask for their website / Maps / Instagram.
+        reply = _link_request_message(lang, push_name or session.get("pushName", ""))
+        history = session.get("conversationHistory", [])
+        history.append({"role": "assistant", "content": reply})
+        db.upsert_onboarding_session(phone, {
+            "currentStep": "conversing",
+            "salesPhase": "discovery",
+            "askedForLink": True,
+            "conversationHistory": history,
+            "demoReturnStep": None,
+            "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
+        })
+        session["currentStep"] = "conversing"
+        await self._send(phone, reply)
+        logger.info("[DEMO] exited to onboarding link-request for %s", phone)
+
+    # ── Dedicated DEMO NUMBER path (separate Twilio/whatsmeow demo line) ──
+    # These run the Salão Bella demo for anyone who messages the DEMO number.
+    # State lives in the isolated `demo_sessions` collection and never touches
+    # onboarding/business data. Messages are SENT from the demo device, not the
+    # onboarding device.
+
+    async def _send_demo(self, phone: str, message: str) -> None:
+        """Send a WhatsApp message from the DEMO device (not the onboarding one)."""
+        try:
+            phone = (phone or "").split("@")[0].split(":")[0].strip()
+            device = settings.DEMO_WA_DEVICE_ID or self.wa.default_device_id
+            await self.wa.send_message(phone, message, device_id=device)
+        except Exception as exc:
+            logger.error("[DEMO] send failed to %s: %s", phone, exc)
+
+    async def handle_demo_message(
+        self,
+        phone: str,
+        body: str,
+        push_name: str,
+        message_id: str,
+        message_type: str = "text",
+    ) -> None:
+        """Entry point for messages arriving on the dedicated demo number.
+
+        Fully self-contained Salão Bella demo — isolated in `demo_sessions`,
+        never creates a business or touches onboarding. The owner connects for
+        real on the onboarding number, so the close points them there.
+        """
+        phone = db._clean_phone(phone)
+
+        # Voice notes aren't transcribed on the demo device yet — nudge to text.
+        if not (body or "").strip():
+            existing = db.get_demo_session(phone)
+            lang = (existing or {}).get("language") or self.ai.detect_language(phone) or "pt"
+            await self._send_demo(phone, _demo_text(_DEMO_TEXT_ONLY_NUDGE, lang))
+            return
+
+        normalized = body.strip().lower()
+        if normalized in {"reset", "recomeçar", "recomecar", "restart", "reiniciar"}:
+            db.delete_demo_session(phone)
+
+        session = db.get_demo_session(phone)
+        if not session:
+            await self._start_demo_number_session(phone, body, push_name, message_id)
+        else:
+            await self._continue_demo_number_session(session, phone, body, push_name, message_id)
+
+    async def _start_demo_number_session(
+        self, phone: str, body: str, push_name: str, message_id: str
+    ) -> None:
+        """First message on the demo number → instant on-script greeting."""
+        lang = _detect_demo_start_lang(body, self.ai.detect_language(phone))
+        name = push_name or ""
+        greeting = _demo_greeting(lang, name)
+        now = datetime.utcnow().isoformat()
+        db.upsert_demo_session(phone, {
+            "phone": phone,
+            "pushName": name,
+            "language": lang,
+            "demoHistory": [
+                {"role": "user", "content": body},
+                {"role": "assistant", "content": greeting},
+            ],
+            "demoMsgCount": 1,
+            "demoSoftCloseReached": False,
+            "startedAt": now,
+            "lastActivityAt": now,
+        })
+        await self._send_demo(phone, greeting)
+        logger.info("[DEMO-NUMBER] demo started for %s (lang=%s)", phone, lang)
+        try:
+            posthog_client.capture(
+                business_id=phone, customer_phone=phone,
+                event="demo_started", properties={"channel": "demo_number", "language": lang},
+            )
+        except Exception:
+            pass
+
+    async def _continue_demo_number_session(
+        self, session: dict, phone: str, body: str, push_name: str, message_id: str
+    ) -> None:
+        """Drive one demo turn on the demo number, or close to onboarding."""
+        lang = session.get("language", "pt")
+        name = push_name or session.get("pushName", "")
+
+        # Follow a REAL language switch by the user (clear, long-enough message
+        # in a supported language). Short replies ("sim", "ok, 10am") never
+        # flip the language — the LLM reply is hard-locked to `lang`.
+        if len(body.strip()) >= 12:
+            switched = _detect_msg_language(body)
+            if switched in _DEMO_LANG_NAMES and switched != lang:
+                lang = switched
+                session["language"] = lang
+
+        # Human handoff
+        if body.strip().lower() in _DANIEL_TRIGGER_WORDS:
+            await self._daniel_handoff(phone, session, context=f"[demo-number] {body}")
+            await self._send_demo(phone, _demo_text(_DEMO_HANDOFF_ACK, lang))
+            return
+
+        # "I want to connect" → point them to the real onboarding number.
+        wants_connect = _is_demo_connect_intent(body) or (
+            session.get("demoSoftCloseReached") and _is_affirmative(body)
+        )
+        if wants_connect:
+            await self._demo_number_close(phone, lang)
+            return
+
+        count = int(session.get("demoMsgCount", 0)) + 1
+        if count > 40:  # anti abuse / cost-burn
+            await self._demo_number_close(phone, lang)
+            return
+
+        demo_history = session.get("demoHistory", [])
+        demo_history.append({"role": "user", "content": body})
+        reply = await self._get_demo_response(demo_history, name, lang)
+        soft_close, clean = self._strip_demo_done(reply)
+        demo_history.append({"role": "assistant", "content": clean})
+        db.upsert_demo_session(phone, {
+            "demoHistory": demo_history[-24:],
+            "demoMsgCount": count,
+            "demoSoftCloseReached": bool(session.get("demoSoftCloseReached") or soft_close),
+            "language": lang,
+            "lastActivityAt": datetime.utcnow().isoformat(),
+        })
+        await self._send_demo(phone, clean)
+
+    async def _demo_number_close(self, phone: str, lang: str) -> None:
+        """Close the demo and point the prospect to the real onboarding number."""
+        onboarding_number = settings.WHATSMEOW_GLOBAL_NUMBER
+        closes = {
+            "pt": "Perfeito! 🎉 Pra ativar isso no SEU número é só falar com a gente aqui 👉 {link}",
+            "en": "Perfect! 🎉 To set this up on YOUR number, just message us here 👉 {link}",
+            "es": "¡Perfecto! 🎉 Para activarlo en TU número, escríbenos aquí 👉 {link}",
+        }
+        no_link = {
+            "pt": "Perfeito! 🎉 Pra ativar no SEU número, acesse recepte.co e comece o teste grátis.",
+            "en": "Perfect! 🎉 To set this up on YOUR number, go to recepte.co and start the free trial.",
+            "es": "¡Perfecto! 🎉 Para activarlo en TU número, entra en recepte.co y empieza la prueba gratis.",
+        }
+        start_texts = {
+            "pt": "Quero começar com a Recepte",
+            "en": "I want to get started with Recepte",
+            "es": "Quiero empezar con Recepte",
+        }
+        lang2 = (lang or "pt")[:2].lower()
+        if onboarding_number:
+            prefill = start_texts.get(lang2) or start_texts["pt"]
+            link = f"https://wa.me/{onboarding_number}?text={quote(prefill)}"
+            msg = (closes.get(lang2) or closes["pt"]).replace("{link}", link)
+        else:
+            msg = no_link.get(lang2) or no_link["pt"]
+        db.upsert_demo_session(phone, {
+            "demoSoftCloseReached": True,
+            "lastActivityAt": datetime.utcnow().isoformat(),
+        })
+        await self._send_demo(phone, msg)
+        try:
+            posthog_client.capture(
+                business_id=phone, customer_phone=phone, event="demo_cta_clicked",
+                properties={"channel": "demo_number"},
+            )
+        except Exception:
+            pass
+        logger.info("[DEMO-NUMBER] closed to onboarding for %s", phone)
 
     # ── Demo interrupt: pause onboarding, run demo, resume after ─────────
 
@@ -4871,6 +5684,20 @@ class OnboardingService:
             })
             logger.info("Business created: %s (id=%s) for %s", biz_name, business_id, phone)
 
+            # Funnel analytics: business confirmed & created (pre-pairing step).
+            try:
+                posthog_client.capture(
+                    business_id=business_id,
+                    customer_phone=phone,
+                    event="onboarding_business_created",
+                    properties={
+                        "business_name": biz_name,
+                        "business_type": business_json.get("businessType", "other"),
+                    },
+                )
+            except Exception:
+                pass
+
             # Create a Stripe Customer in the background so we have one ready for
             # checkout later.  No payment method attached — trial requires no card.
             asyncio.ensure_future(
@@ -5104,11 +5931,11 @@ class OnboardingService:
                         phone, _status_exc,
                     )
 
-            msg = (
-                "🎉 Connected! We’re officially a team now 🤝\n\n"
-                "From this moment, no customer slips through the cracks 💪"
+            # First contact after pairing = reassurance + control, not features
+            # (client trust spec items 7+8: disconnect reminder + guided self-test).
+            msg = await self._localize_static(
+                _PAIRED_SUCCESS_EN, "", session.get("language", "en")
             )
-            msg = await self._localize_static(msg, "", session.get("language", "en"))
             await self._send(phone, msg)
 
             # Analytics: WhatsApp successfully linked
@@ -5290,10 +6117,14 @@ class OnboardingService:
 
         try:
             print(f"[QR] Sending image to phone={phone} device={self.wa.default_device_id}")
+            # Caption carries the trust line + verify link (client trust spec item 5).
+            qr_caption = await self._localize_static(
+                _QR_CAPTION_EN, "", session.get("language", "en")
+            )
             await self.wa.send_image(
                 phone=phone,
                 image_bytes=png_bytes,
-                caption="📲 Scan this QR code in WhatsApp → Settings → Linked Devices → Link a Device",
+                caption=qr_caption,
                 mime_type="image/png",
                 device_id=self.wa.default_device_id,   # send via the onboarding device
             )
@@ -5310,17 +6141,68 @@ class OnboardingService:
     ) -> None:
         """Ask the owner whether they want to link via QR code (another device)
         or via pairing code (same phone), then transition to the appropriate sub-step.
+
+        Before the choice, a "Como funciona" trust interstitial is sent (client
+        trust spec item 1) so the QR/pairing ask is never the first thing the
+        owner sees. Shown once per onboarding; skipped on reconnects.
         """
         db.upsert_onboarding_session(phone, {"currentStep": "pairing_mode_choice"})
+        lang = session.get("language", "en")
+
+        # ── Trust interstitial (items 1, 2, 3) ────────────────────────────
+        # Sent as two SHORT messages instead of one wall of text (client 2026-07):
+        #   1. you stay in control
+        #   2. your low-risk options — try the demo / use a spare number
+        if not session.get("reconnectMode") and not session.get("trustInterstitialShown"):
+            await self._send(phone, await self._localize_static(_TRUST_INTERSTITIAL_EN, "", lang))
+            await asyncio.sleep(1)
+
+            # "Feel it first" demo link — a DIRECT wa.me link straight into the
+            # demo chat (client 2026-07 reverted the recepte.co/demo hop: fewer
+            # steps for the owner). It MUST point at the DEDICATED demo number
+            # (settings.DEMO_WA_NUMBER — a separate global demo line), never the
+            # onboarding number, or the link would just reopen THIS chat. The
+            # pre-filled text is localized to the owner's conversation language.
+            # When no demo number is configured the demo line is simply omitted.
+            options_msg = await self._localize_static(_TRUST_SPARE_NUMBER_EN, "", lang)
+            demo_number = settings.DEMO_WA_NUMBER
+            if demo_number:
+                prefill = _demo_prefill_text(lang)
+                demo_link = f"https://wa.me/{demo_number}?text={quote(prefill)}"
+                demo_offer = await self._localize_static(_TRUST_DEMO_OFFER_EN, "", lang)
+                options_msg = (
+                    f"{demo_offer.replace('{demo_link}', demo_link)}\n\n{options_msg}"
+                )
+            await self._send(phone, options_msg)
+
+            db.upsert_onboarding_session(phone, {"trustInterstitialShown": True})
+            session["trustInterstitialShown"] = True
+            await asyncio.sleep(1)
+
         msg = (
             f"🎉 {biz_name} is officially LIVE! Big moment 🥳 "
             "Now let’s connect your business WhatsApp so I can start catching every customer for you 📱\n\n"
-            "1️⃣ Scan QR — if you’ve got a tablet, computer, or second phone nearby\n"
+            "1️⃣ Scan QR (recommended) — if you’ve got a tablet, computer, or second phone nearby\n"
             "2️⃣ Pairing code — if it’s just you and this phone 😊\n\n"
             "Reply 1 or 2."
         )
-        msg = await self._localize_static(msg, "", session.get("language", "en"))
+        msg = await self._localize_static(msg, "", lang)
         await self._send(phone, msg)
+
+        # Funnel analytics: the owner has reached the pairing step (the main
+        # drop-off point under investigation).
+        try:
+            posthog_client.capture(
+                business_id=session.get("businessId") or phone,
+                customer_phone=phone,
+                event="onboarding_pairing_shown",
+                properties={
+                    "business_name": biz_name,
+                    "reconnect_mode": bool(session.get("reconnectMode")),
+                },
+            )
+        except Exception:
+            pass
 
     async def _handle_pairing_mode_choice(
         self, session: dict, phone: str, body: str
@@ -5456,10 +6338,14 @@ class OnboardingService:
 
             try:
                 png_bytes = self._qr_payload_to_png_bytes(qr_payload)
+                # Same trust-line caption as the first QR (client trust spec item 5).
+                qr_caption = await self._localize_static(
+                    _QR_CAPTION_EN, "", session.get("language", "en")
+                )
                 await self.wa.send_image(
                     phone=phone,
                     image_bytes=png_bytes,
-                    caption="📲 Scan this QR code in WhatsApp → Settings → Linked Devices → Link a Device",
+                    caption=qr_caption,
                     mime_type="image/png",
                     device_id=self.wa.default_device_id,
                 )
@@ -5521,16 +6407,10 @@ class OnboardingService:
             return
 
         db.upsert_onboarding_session(phone, {"currentStep": "pairing_scam_warning"})
-        msg = (
-            "Quick heads-up before we connect 💛\n\n"
-            "WhatsApp might flash a screen saying “This may be a scam.”\n"
-            "Totally normal — it shows this anytime you link with a code instead of a scan.\n\n"
-            "✅ Expected\n"
-            "✅ Your account stays 100% yours\n"
-            "✅ Unlink anytime, no stress\n\n"
-            "Reply *YES* and let’s go 🚀"
-        )
-        msg = await self._localize_static(msg, "", session.get("language", "en"))
+        # Reframed copy (client trust spec item 6): positive official-feature
+        # explanation first, then the caution-screen heads-up, then the explicit
+        # "we never ask for an SMS code" disclaimer — the #1 scam vector in Brazil.
+        msg = await self._localize_static(_SCAM_WARNING_EN, "", session.get("language", "en"))
         await self._send(phone, msg)
 
     def _scam_warning_already_acknowledged(self, session: dict | None) -> bool:
@@ -5951,9 +6831,41 @@ class OnboardingService:
         msg = msg_localized.replace("{calendar_link_placeholder}", calendar_link).replace("calendar_link_placeholder", calendar_link)
         await self._send(phone, msg)
 
+    async def _maybe_run_setup_selftest(
+        self, session: dict, phone: str, body: str
+    ) -> bool:
+        """Run the demo roleplay when the owner sends *test* during a setup step.
+
+        The post-pairing message (trust spec items 7+8) invites the owner to
+        send *test* — but the calendar / call-forwarding steps only understood
+        DONE/SKIP, so the promise would dead-end. This honours it: play the
+        business-type demo, then remind them how to continue setup.
+
+        Returns True when the message was a test request (caller should return).
+        """
+        normalized = body.strip().lower().rstrip(".!?")
+        _extra_test_words = {"teste", "prueba", "testar"}  # pt/es not in the EN regex
+        if not (_is_post_onboarding_demo_request(body) or normalized in _extra_test_words):
+            return False
+
+        lang = session.get("language", "en")
+        biz = db.get_business_by_id(session.get("businessId", "")) or {}
+        await self._handle_post_onboarding_demo(biz, phone, lang)
+        await asyncio.sleep(1)
+        reminder = "Whenever you're ready, reply *DONE* or *SKIP* to continue the setup 😊"
+        reminder = await self._localize_static(reminder, "", lang)
+        await self._send(phone, reminder)
+        logger.info("[SELF-TEST] Demo played during setup step for %s", phone)
+        return True
+
     async def _handle_calendar_setup(self, session: dict, phone: str, body: str) -> None:
         """Handle Step 2: Calendar integration responses."""
         normalized = body.strip().lower()
+
+        # Guided self-test (trust spec item 8): the post-pairing message invites
+        # the owner to send *test* — honour it here instead of nagging DONE/SKIP.
+        if await self._maybe_run_setup_selftest(session, phone, body):
+            return
 
         done_words = {"done", "pronto", "feito", "hecho", "ready", "listo", "conectado"}
         skip_words = {"skip", "pular", "saltar", "later", "depois", "no", "não", "nao"}
@@ -6068,6 +6980,10 @@ class OnboardingService:
         """Handle Step 3: Call forwarding responses."""
         normalized = body.strip().lower()
 
+        # Guided self-test (trust spec item 8) — same escape as calendar_setup.
+        if await self._maybe_run_setup_selftest(session, phone, body):
+            return
+
         done_words = {"done", "pronto", "feito", "hecho", "ready", "listo", "activated", "ativado"}
         skip_words = {"skip", "pular", "saltar", "later", "depois", "no", "não", "nao"}
         help_words = {"help", "ajuda", "ayuda", "how", "como", "instructions", "steps"}
@@ -6170,7 +7086,9 @@ class OnboardingService:
             msg = (
                 f"🎉 You're ALL set{name_str}! Your AI receptionist is awake, working, and catching every customer — day and night 🌙☀️\n\n"
                 "More clients. More time back. Less slipping through the cracks 💪\n\n"
-                "Welcome to the new way of running your business ✨"
+                "Welcome to the new way of running your business ✨\n\n"
+                "💡 Send *test* anytime to see how I answer your customers — "
+                "and remember, you can disconnect me anytime in WhatsApp → Linked Devices."
             )
         else:
             msg = (
@@ -6187,6 +7105,17 @@ class OnboardingService:
         logger.info(
             "Onboarding complete for %s (wa_connected=%s)", phone, wa_connected,
         )
+
+        # Funnel analytics: onboarding finished (with or without WA linked).
+        try:
+            posthog_client.capture(
+                business_id=biz_id or phone,
+                customer_phone=phone,
+                event="onboarding_completed",
+                properties={"wa_connected": wa_connected},
+            )
+        except Exception:
+            pass
 
     # ── post-onboarding support ───────────────────────────────────────────
 
@@ -7483,6 +8412,27 @@ class OnboardingService:
             return f"Tool {tool_name} failed: {exc}"
 
     # ── messaging ─────────────────────────────────────────────────────────
+
+    async def _maybe_send_privacy_note(
+        self, phone: str, lang: str, session: dict | None = None
+    ) -> None:
+        """Send the short privacy promise once, right after Sofia's introduction.
+
+        Client 2026-07: the GDPR/LGPD + "verify us" reassurance belongs here, when
+        the owner first arrives, instead of inside the pre-pairing trust block
+        (which had grown into a full-screen wall of text). One short message, at
+        most once per session — never repeated, never blocks the flow on failure.
+        """
+        if (session or {}).get("privacyNoteShown"):
+            return
+        try:
+            await asyncio.sleep(1)
+            await self._send(phone, await self._localize_static(_PRIVACY_NOTE_EN, "", lang))
+            db.upsert_onboarding_session(phone, {"privacyNoteShown": True})
+            if session is not None:
+                session["privacyNoteShown"] = True
+        except Exception as exc:
+            logger.error("[ONBOARDING] privacy note failed for %s: %s", phone, exc)
 
     async def _send(self, phone: str, message: str) -> None:
         try:

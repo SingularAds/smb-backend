@@ -89,3 +89,4 @@ claudesmemory/
 tests/
 dashboard/node_modules/
 dashboard/dist/
+*md

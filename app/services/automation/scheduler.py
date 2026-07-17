@@ -27,6 +27,7 @@ from app.services.automation.weekly_summary import run_weekly_summary_for_all_bu
 from app.services.automation.customer_intelligence import run_customer_intelligence_sweep
 from app.services.automation.referral_automation import run_referral_invite_sweep, run_referral_discount_expiry_sweep
 from app.services.automation.trial_expiry_automation import run_trial_expiry_sweep
+from app.services.automation.day2_checkin import run_day2_checkin_sweep
 from app.services.automation.kb_expiry import run_kb_expiry_sweep
 from app.services.csat_service import sweep_all as run_csat_sweep
 from app.config import settings as _settings
@@ -91,6 +92,13 @@ async def _job_trial_expiry() -> None:
         await run_trial_expiry_sweep()
     except Exception as exc:
         logger.exception("[Scheduler] trial expiry sweep crashed: %s", exc)
+
+
+async def _job_day2_checkin() -> None:
+    try:
+        await run_day2_checkin_sweep()
+    except Exception as exc:
+        logger.exception("[Scheduler] day-2 check-in sweep crashed: %s", exc)
 
 
 async def _job_kb_expiry() -> None:
@@ -198,6 +206,18 @@ def start_scheduler() -> None:
         trigger=CronTrigger(hour=9, minute=0, timezone="UTC"),
         id="trial_expiry_sweep",
         name="Trial expiry reminder sweep (day 0/1/3/7)",
+        replace_existing=True,
+        misfire_grace_time=600,
+    )
+
+    # Day-2 trust check-in — every day at 10:00 UTC. One-shot Sofia message
+    # 2 days after trial start repeating the "disconnect anytime" reminder
+    # (client trust spec item 12 — people who feel free stay).
+    _scheduler.add_job(
+        _job_day2_checkin,
+        trigger=CronTrigger(hour=10, minute=0, timezone="UTC"),
+        id="day2_checkin_sweep",
+        name="Day-2 trust check-in (one-shot, 2 days after trial start)",
         replace_existing=True,
         misfire_grace_time=600,
     )

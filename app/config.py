@@ -122,6 +122,25 @@ class Settings(BaseSettings):
     RECEPTE_PHONE: str = "911111111111"      # Recepte WhatsApp number (no +)
     RECEPTE_CALENDAR_BASE_URL: str = "https://recepte.co/connect-calendar"
 
+    # Dedicated global DEMO number (digits, no +) for the "feel it first" link.
+    # This MUST be a SEPARATE number from the onboarding number — e.g. a Twilio
+    # demo line — so the wa.me link opens a NEW chat instead of reopening the
+    # owner's onboarding chat. When empty, the demo link is simply not shown
+    # (we never point it at the onboarding number). The Salão Bella demo persona
+    # handles the conversation on this number.
+    DEMO_WA_NUMBER: str = ""
+    # Bridge device/session ID that the demo number is linked to on the whatsmeow
+    # bridge. Incoming messages arriving on THIS device are routed to the Salão
+    # Bella demo handler. Must be set (alongside DEMO_WA_NUMBER) for the demo to
+    # actually reply — otherwise messages to the demo number reach no handler.
+    DEMO_WA_DEVICE_ID: str = ""
+    # Public URL of the "feel it first" demo landing page on the website. The
+    # trust interstitial links here (instead of a raw wa.me link); the page then
+    # opens the WhatsApp demo chat with a localized pre-filled message. The
+    # backend appends ?lang=<lang>&n=<demo number> so the page knows which
+    # language and which demo number to open.
+    DEMO_PAGE_URL: str = "https://recepte.co/demo"
+
     # Call-forwarding destination numbers, keyed by country calling code.
     # JSON object stored as a string, e.g.:
     #   CALL_FORWARDING_NUMBERS_JSON='{"351": "+351200010001", "1": "+12125550100", "44": "+441234567890"}'
