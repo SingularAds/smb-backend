@@ -104,6 +104,14 @@ class Settings(BaseSettings):
     WHATSMEOW_DEFAULT_DEVICE_ID: str = "smba"  # Legacy default device/session ID (kept for compatibility)
     WHATSMEOW_ONBOARDING_DEVICE_ID: str = ""   # Optional explicit global/onboarding device/session ID
     WHATSMEOW_GLOBAL_NUMBER: str = ""          # Optional global onboarding WhatsApp number (digits, no +)
+    # Optional: run onboarding on MULTIPLE global numbers at once. Comma-separated
+    # "deviceId:number" pairs, e.g. "smba:918968012547, smbb:917696794756". When
+    # set, ANY of these numbers runs the same onboarding flow and each owner gets
+    # replies back on whichever number they messaged. When EMPTY (default), the
+    # system falls back to the single WHATSMEOW_ONBOARDING_DEVICE_ID /
+    # WHATSMEOW_DEFAULT_DEVICE_ID + WHATSMEOW_GLOBAL_NUMBER above — i.e. nothing
+    # changes until this is filled in. See app/services/global_numbers.py.
+    WHATSMEOW_GLOBAL_NUMBERS: str = ""
     WHATSAPP_DEBOUNCE_S: float = 2.0           # Seconds to wait before flushing a rapid-message burst to the LLM
     WEBHOOK_SECRET: str = ""                 # Webhook secret for validation
     X_WEBHOOK_SECRET: str = ""               # Alias (header: X-Webhook-Secret)

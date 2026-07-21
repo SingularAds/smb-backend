@@ -78,6 +78,11 @@ def is_protected_number(phone: str, business: dict | None = None) -> bool:
     if not target:
         return False
     candidates: list[str] = []
+    # Every configured global onboarding number (one OR many — see
+    # app/services/global_numbers.py). Falls back to the single
+    # WHATSMEOW_GLOBAL_NUMBER when multi-number config is unset.
+    from app.services import global_numbers
+    candidates.extend(global_numbers.all_global_numbers())
     if settings.WHATSMEOW_GLOBAL_NUMBER:
         candidates.append(settings.WHATSMEOW_GLOBAL_NUMBER)
     if settings.RECEPTE_PHONE:

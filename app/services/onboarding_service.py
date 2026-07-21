@@ -29,6 +29,7 @@ from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
 
 from app.config import settings
 from app import firestore as db
+from app.services import global_numbers
 from app.integrations import posthog_client
 from app.services.attribution import build_attribution, is_ad_channel
 from app.services.whatsmeow_client import PairingStateConflict, ReachoutTimelocked, WhatsmeowClient
@@ -455,10 +456,15 @@ DEMO SEQUENCE (follow in order — do NOT skip step 5):
   made with THIS person — put their real name + time in it. Include lines like:
   conversas atendidas, agendamentos (with their booking), 1 cliente sumida que
   voltou, uma avaliação no Google, e um total de receita. Keep it tight.
-- Step 6 (soft close): tell them all of this runs on THEIR own number, with THEIR
-  customers, connecting takes ~2 minutes and they can disconnect anytime. Invite
-  them to start the free trial or ask anything. On this closing message, and ONLY
-  this one, append the token [DEMO_DONE] on its own line at the very end.
+- Step 6 (soft close — warm and personal): make it click for them. In a super
+  friendly tone, say that what they just felt is EXACTLY how THEIR OWN customers
+  will feel messaging THEIR business — instant answers, remembered, taken care of.
+  Then reassure them on trust: it runs on THEIR own number via WhatsApp's official
+  Linked Devices, their number stays theirs, they disconnect in 2 taps anytime,
+  and their customers' data is always private and protected (LGPD) — that same
+  care is how we help THEM earn their customers' trust. Connecting takes ~2 minutes.
+  Invite them to start the free trial or ask anything. On this closing message,
+  and ONLY this one, append the token [DEMO_DONE] on its own line at the very end.
 
 AFTER THE CLOSE (free chat): answer product questions briefly, then nudge back to
 the free trial. Never argue.
@@ -471,12 +477,17 @@ filling empty appointment slots.
 PRICING (only if asked): plans start at R$147/month, with a 7-day free trial and
 no credit card required.
 
-SCAM / SAFETY QUESTIONS (answer calmly, never defensively, then continue the demo):
+TRUST / PRIVACY / SCAM QUESTIONS (this can happen ANY time, even mid-role-play):
+If they ask anything about trust, safety, privacy, "is this a scam", "who sees my
+data", etc. — pause the role-play, answer warmly and confidently in 1-2 short lines,
+reassure them, THEN return to EXACTLY where the role-play left off and continue as
+if nothing interrupted it. Never sound defensive. Facts you can use:
 - We use WhatsApp's official "Aparelhos conectados" (Linked Devices) feature —
   the same as WhatsApp Web. Your number stays yours.
 - You disconnect anytime, in 2 taps, from your own phone.
 - We NEVER ask for an SMS code, password, or card to test. Nobody legitimate does.
-- Your data is yours (LGPD) and can be deleted anytime.
+- Your data — and your customers' data — is private, protected, and yours (LGPD),
+  and can be deleted anytime. We never share it.
 - You can verify the company at www.recepte.co.
 
 NEVER ask for CPF, credit card, passwords, or SMS codes. If they offer any, refuse
@@ -570,20 +581,23 @@ def _demo_text(table: dict[str, str], lang: str) -> str:
 def _detect_demo_start_lang(body: str, phone_lang: str) -> str:
     """Language for a NEW demo-number session.
 
-    Strongest signal first: the wa.me pre-filled text (it carries the language
-    of the onboarding conversation the prospect came from), then the message
-    text itself, then the phone country code. Restricted to pt/en/es — the
-    languages the demo persona supports.
+    Client rule: the demo follows the language of the PHONE NUMBER's country code
+    (so a Brazilian +55 number gets Portuguese, a US/UK/India number gets English,
+    a Spanish +34 number gets Spanish). ``phone_lang`` is the country-code language
+    from AIService.detect_language(phone). Only when the country code maps to a
+    language the demo doesn't support (pt/en/es) do we fall back to the message
+    text, then the wa.me pre-filled greeting, then Portuguese.
     """
+    lang2 = (phone_lang or "")[:2].lower()
+    if lang2 in _DEMO_LANG_NAMES:
+        return lang2
+    detected = _detect_msg_language(body)
+    if detected in _DEMO_LANG_NAMES:
+        return detected
     text = (body or "").strip().lower()
     for lg, prefill in _DEMO_PREFILL_TEXTS.items():
         if text == prefill.lower():
             return lg
-    detected = _detect_msg_language(body)
-    if detected in _DEMO_LANG_NAMES:
-        return detected
-    if (phone_lang or "")[:2].lower() in _DEMO_LANG_NAMES:
-        return phone_lang[:2].lower()
     return "pt"
 
 
@@ -2402,6 +2416,7 @@ class OnboardingService:
         message_id: str,
         message_type: str = "text",
         referral: dict | None = None,
+        device_id: str | None = None,
     ) -> None:
         import time
         db_lookup_start = time.time()
@@ -2409,6 +2424,17 @@ class OnboardingService:
 
         # 1. Check for existing session
         session = db.get_onboarding_session(phone)
+
+        # Remember which global onboarding number this owner is messaging, so
+        # every reply goes back out on the SAME number (multi-global-number
+        # support — app/services/global_numbers.py). Stored on the session;
+        # _send() reads it and falls back to the default device when unset.
+        # Only trusts a recognised onboarding device (never a stray device_id).
+        onb_device = device_id if global_numbers.is_onboarding_device(device_id) else None
+        if onb_device and session and session.get("onboardingDeviceId") != onb_device:
+            # Existing session → update() merges this field in safely.
+            db.upsert_onboarding_session(phone, {"onboardingDeviceId": onb_device})
+            session["onboardingDeviceId"] = onb_device
 
         # 2. Look up existing business BEFORE the recepte activation check.
         #    EC10: prevents re-triggering onboarding for an owner who already
@@ -2454,6 +2480,7 @@ class OnboardingService:
                     message_id,
                     _act.group(1).strip(),
                     lang_override=lang_for_message,
+                    onboarding_device=onb_device,
                 )
                 return
         # ─────────────────────────────────────────────────────────────────────
@@ -2804,6 +2831,7 @@ class OnboardingService:
                 lead,
                 lang_override=lang_for_message,
                 referral=referral,
+                onboarding_device=onb_device,
             )
             return
 
@@ -2812,6 +2840,7 @@ class OnboardingService:
         await self._start_new(
             phone, body, push_name, message_id,
             lang_override=lang_for_message, referral=referral,
+            onboarding_device=onb_device,
         )
 
     # ── new session ───────────────────────────────────────────────────────
@@ -2825,6 +2854,7 @@ class OnboardingService:
         *,
         lang_override: str | None = None,
         referral: dict | None = None,
+        onboarding_device: str | None = None,
     ) -> None:
         lang = lang_override
         if not lang:
@@ -2852,6 +2882,10 @@ class OnboardingService:
             "pairingSessionId": None,
             "businessId": None,
             "lastMessageId": message_id,
+            # Which global onboarding number this owner is messaging (multi-global
+            # -number support). Included here so a brand-new session records it
+            # even on the reset/new-business path; _send() replies from it.
+            "onboardingDeviceId": onboarding_device or None,
             # Acquisition attribution (canonical — see app/services/attribution.py)
             "attribution": attribution,
             # Sales-phase tracking. Ad-sourced leads first go through a Global-KB
@@ -2998,6 +3032,7 @@ class OnboardingService:
         *,
         lang_override: str | None = None,
         referral: dict | None = None,
+        onboarding_device: str | None = None,
     ) -> None:
         """Create a ``recepte_confirm`` session and send the pre-filled data card.
 
@@ -3015,6 +3050,13 @@ class OnboardingService:
             lang, _ = await self._resolve_message_language(body, phone, None)
         now        = datetime.utcnow().isoformat()
         display_address = lead.get("address") or city
+
+        # Persist which global number this owner is on BEFORE the first reply, so
+        # even the confirmation card goes out on the right number (this method
+        # always creates the full session a few lines below, so this never leaves
+        # a stray doc behind).
+        if onboarding_device:
+            db.upsert_onboarding_session(phone, {"onboardingDeviceId": onboarding_device})
 
         logger.info("[RECEPTE] Showing lead confirmation for %s: businessName=%r", phone, biz_name)
         print(f"[LEAD-LOOKUP] Sending confirmation card to {phone}: businessName={biz_name!r}")
@@ -3042,6 +3084,7 @@ class OnboardingService:
             "pairingSessionId": None,
             "businessId": None,
             "lastMessageId": message_id,
+            "onboardingDeviceId": onboarding_device or None,
             "recepteLeadData": lead,
             "registrationSource": "recepte.co",
             "attribution": attribution,
@@ -3061,6 +3104,7 @@ class OnboardingService:
         business_name_hint: str,
         *,
         lang_override: str | None = None,
+        onboarding_device: str | None = None,
     ) -> None:
         """Start onboarding when the user sends the recepte.co WhatsApp activation message.
 
@@ -3088,6 +3132,7 @@ class OnboardingService:
                 push_name,
                 message_id,
                 lang_override=lang_override,
+                onboarding_device=onboarding_device,
             )
             return
 
@@ -4339,7 +4384,10 @@ class OnboardingService:
 
     async def _demo_number_close(self, phone: str, lang: str) -> None:
         """Close the demo and point the prospect to the real onboarding number."""
-        onboarding_number = settings.WHATSMEOW_GLOBAL_NUMBER
+        # Picks the PRIMARY global number (first entry in the multi-number
+        # registry, or the single legacy number when only one is configured) —
+        # see app/services/global_numbers.py.
+        onboarding_number = global_numbers.primary_number()
         closes = {
             "pt": "Perfeito! 🎉 Pra ativar isso no SEU número é só falar com a gente aqui 👉 {link}",
             "en": "Perfect! 🎉 To set this up on YOUR number, just message us here 👉 {link}",
@@ -6116,7 +6164,10 @@ class OnboardingService:
             return False
 
         try:
-            print(f"[QR] Sending image to phone={phone} device={self.wa.default_device_id}")
+            # Send the QR image from the SAME global number the owner is on
+            # (multi-global-number support), falling back to the default device.
+            qr_device = session.get("onboardingDeviceId") or self.wa.default_device_id
+            print(f"[QR] Sending image to phone={phone} device={qr_device}")
             # Caption carries the trust line + verify link (client trust spec item 5).
             qr_caption = await self._localize_static(
                 _QR_CAPTION_EN, "", session.get("language", "en")
@@ -6126,7 +6177,7 @@ class OnboardingService:
                 image_bytes=png_bytes,
                 caption=qr_caption,
                 mime_type="image/png",
-                device_id=self.wa.default_device_id,   # send via the onboarding device
+                device_id=qr_device,   # send via the owner's onboarding device
             )
             print(f"[QR] Image sent successfully to {phone}")
             logger.info("[QR] QR image sent to %s (session=%s)", phone, pairing_sid)
@@ -6347,7 +6398,7 @@ class OnboardingService:
                     image_bytes=png_bytes,
                     caption=qr_caption,
                     mime_type="image/png",
-                    device_id=self.wa.default_device_id,
+                    device_id=session.get("onboardingDeviceId") or self.wa.default_device_id,
                 )
                 await asyncio.sleep(1)
                 await self._send(
@@ -7618,6 +7669,9 @@ class OnboardingService:
                 "[NEW-BIZ-CONFIRM] Owner %s confirmed adding a second business — wiping session",
                 phone,
             )
+            # Preserve which global number this owner is on across the wipe, so
+            # the fresh session still replies from the same number.
+            _onb_device = session.get("onboardingDeviceId")
             db.delete_onboarding_session(phone)
             await self._start_new(
                 phone,
@@ -7625,6 +7679,7 @@ class OnboardingService:
                 push_name,
                 message_id,
                 lang_override=lang,
+                onboarding_device=_onb_device,
             )
             return
 
@@ -8439,6 +8494,7 @@ class OnboardingService:
             # Defensive normalization: keep only bare phone digits and drop any
             # accidental multi-device suffix (e.g. "351962461776:9").
             phone = (phone or "").split("@")[0].split(":")[0].strip()
+            session = {}
             if message:
                 try:
                     session = db.get_onboarding_session(phone) or {}
@@ -8453,12 +8509,22 @@ class OnboardingService:
                     message = await self._localize_static(
                         message, user_message, target_lang
                     )
+            else:
+                try:
+                    session = db.get_onboarding_session(phone) or {}
+                except Exception:
+                    session = {}
+            # Reply on the SAME global number the owner is messaging (multi-global
+            # -number support). Falls back to the default onboarding device when
+            # the session has no stored device (single-number deployments, or a
+            # session created before this field existed).
+            onb_device = session.get("onboardingDeviceId") or None
             try:
-                logger.debug("Onboarding AI -> %s: %s", phone, message)
+                logger.debug("Onboarding AI -> %s (device=%s): %s", phone, onb_device, message)
             except Exception:
                 logger.exception("Onboarding AI -> (logging failed)")
             try:
-                await self.wa.send_message(phone, message)
+                await self.wa.send_message(phone, message, device_id=onb_device)
             except ReachoutTimelocked as exc:
                 # Cold-contact rate-limit. The reply was NOT delivered. We log
                 # this distinctly so it's separable from real bridge crashes in

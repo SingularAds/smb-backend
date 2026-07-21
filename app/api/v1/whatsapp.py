@@ -21,6 +21,7 @@ from app.services.onboarding_service import OnboardingService
 from app.services.customer_ai_service import CustomerAIService
 from app.services.owner_takeover_service import handle_owner_message
 from app.services import ai_pause_service
+from app.services import global_numbers
 from app.services.whatsmeow_client import WhatsmeowClient, is_our_outbound_echo
 from app.owner.commands.handlers import handle_owner_command, is_owner_message
 from app import firestore as db
@@ -327,9 +328,10 @@ async def _process_webhook(payload: dict) -> None:
                     return
 
             # ── Global onboarding number guard ───────────────────────────────
-            # If this owner_message came from the Recepte global onboarding
-            # number (configured via WHATSMEOW_GLOBAL_NUMBER), do NOT run the
-            # customer-takeover path. The global number is not tied to any
+            # If this owner_message came from ANY Recepte global onboarding
+            # number (single or multiple — see app/services/global_numbers.py,
+            # checked via is_protected_number below), do NOT run the
+            # customer-takeover path. A global number is not tied to any
             # single SMB owner↔customer relationship, so treating an outbound
             # from it as a "takeover" would trigger a spurious 90-minute AI
             # pause on whichever chat happens to be the recipient. See the
@@ -689,18 +691,22 @@ async def _process_webhook(payload: dict) -> None:
         # ── Routing decision log ──────────────────────────────────────────────
         # Re-read from settings so that test patches (monkeypatch.setattr on settings)
         # take effect without needing to restart the interpreter.
-        current_onboarding_device = settings.WHATSMEOW_ONBOARDING_DEVICE_ID or settings.WHATSMEOW_DEFAULT_DEVICE_ID
+        # Onboarding runs on one OR MORE global numbers (app/services/global_numbers.py);
+        # is_onboarding_device() covers both the single-number (legacy) and the
+        # multi-number configurations transparently.
+        is_onboarding_device = global_numbers.is_onboarding_device(device_id)
 
         def _digits(s: str) -> str:
             return "".join(ch for ch in (s or "") if ch.isdigit())
 
         # ── Bot-to-bot guard ──────────────────────────────────────────────────
-        # Our own service numbers (onboarding + demo) are never customers or
-        # prospects. If one of them shows up as the chat counterpart, replying
-        # would make two of our bots talk to each other in an infinite loop.
+        # Our own service numbers (every global onboarding number + the demo) are
+        # never customers or prospects. If one of them shows up as the chat
+        # counterpart, replying would make two of our bots talk to each other in
+        # an infinite loop.
         _service_numbers = {
             _digits(n)
-            for n in (settings.WHATSMEOW_GLOBAL_NUMBER, settings.DEMO_WA_NUMBER)
+            for n in (*global_numbers.all_global_numbers(), settings.DEMO_WA_NUMBER)
             if n
         }
         if _digits(phone) in _service_numbers:
@@ -745,15 +751,41 @@ async def _process_webhook(payload: dict) -> None:
             )
             return
 
-        routing = "onboarding" if device_id == current_onboarding_device else "customer-ai"
+        # ── Stale duplicate-link guard for GLOBAL onboarding numbers ──────────
+        # A global onboarding number must be served ONLY by its own onboarding
+        # session (smba/smbb/…). If the SAME phone is also linked under another
+        # session (e.g. a leftover biz-<number> pairing from earlier testing),
+        # that stale session fires duplicate webhooks that would double-reply
+        # the owner. The legitimate onboarding session passes is_onboarding_device
+        # and is untouched; any OTHER session whose own phone is a global number
+        # is a stale extra link and is dropped.
+        _own_digits = _digits(device_own_phone)
+        if (
+            _own_digits
+            and not is_onboarding_device
+            and _own_digits in {_digits(n) for n in global_numbers.all_global_numbers()}
+        ):
+            logger.warning(
+                "[WEBHOOK] skipped — device %r is a stale extra link on global "
+                "onboarding number %s; log it out of the bridge (only the "
+                "onboarding session should serve that number)",
+                device_id, _own_digits,
+            )
+            _log_event(
+                "skipped", phone=phone, message_id=message_id,
+                detail=f"stale duplicate session {device_id!r} on global number",
+            )
+            return
+
+        routing = "onboarding" if is_onboarding_device else "customer-ai"
         logger.info(
             "[WEBHOOK] routing phone=%s device=%r -> %s",
             phone, device_id, routing,
         )
 
-        # Messages arriving on the Recepte global device → onboarding
+        # Messages arriving on any Recepte global device → onboarding
         # Messages on other device IDs → customer AI (dynamic replies)
-        if device_id != current_onboarding_device:
+        if not is_onboarding_device:
             # Look up the business that owns this WhatsApp session
             business = db.get_business_by_wa_session_id(device_id)
             biz_id = business["id"] if business else None
@@ -1098,7 +1130,7 @@ async def _process_webhook(payload: dict) -> None:
         onboarding_start = time.time()
 
         try:
-            await _onboarding.handle_message(phone, body, push_name, message_id, message_type=message_type, referral=referral)
+            await _onboarding.handle_message(phone, body, push_name, message_id, message_type=message_type, referral=referral, device_id=device_id)
             duration = time.time() - onboarding_start
             logger.info("[LATENCY] Onboarding processing for phone=%s msg_id=%s took %.3fs", phone, message_id, duration)
             logger.info("[ONBOARDING-RESPONSE] Sent reply for phone=%s msg_id=%r", phone, message_id)
