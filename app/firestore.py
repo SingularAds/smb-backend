@@ -843,6 +843,108 @@ def delete_onboarding_session(phone: str) -> None:
     _db().collection("onboarding_sessions").document(phone_clean).delete()
 
 
+# ── Onboarding transcript archive ────────────────────────────────────────────
+# Collection: onboarding_transcripts/{phone}/messages/{autoId}
+#
+# Append-only mirror of every message exchanged on the global onboarding
+# number. Deliberately a SEPARATE top-level collection from
+# onboarding_sessions, whose conversationHistory erodes in three ways:
+# _start_new resets it, the post_onboarding handler overwrites it with the
+# trimmed last-20 support turns, and the new-biz confirm path deletes the
+# whole session doc. The archive survives all three, so the AI onboarding
+# analyzer always has the full journey.
+
+def append_onboarding_transcript_message(phone: str, entry: dict) -> None:
+    """Append one message to the immutable transcript archive.
+
+    Callers must treat this as best-effort (fire-and-forget from the
+    message path) — it must never block or fail the live conversation.
+    """
+    phone_clean = _clean_phone(phone)
+    (
+        _db().collection("onboarding_transcripts")
+        .document(phone_clean)
+        .collection("messages")
+        .add(entry)
+    )
+
+
+def get_onboarding_transcript(phone: str, limit: int = 500) -> list[dict]:
+    """Full archived transcript for a phone, oldest first."""
+    phone_clean = _clean_phone(phone)
+    docs = (
+        _db().collection("onboarding_transcripts")
+        .document(phone_clean)
+        .collection("messages")
+        .order_by("ts")
+        .limit(limit)
+        .stream()
+    )
+    out: list[dict] = []
+    for doc in docs:
+        data = doc.to_dict()
+        data["id"] = doc.id
+        out.append(data)
+    return out
+
+
+# ── Onboarding analyses (AI analyzer results) ────────────────────────────────
+# Collection: onboarding_analyses  —  doc ID = phone (digits, no +).
+# Each doc stores the latest AI analysis of that owner's onboarding journey
+# plus a fingerprint (messageCount/lastMessageTs/promptVersion/model) used
+# as the cache key, and any team feedback. This doubles as the learning
+# corpus for improving the analyzer prompt over time.
+
+def get_onboarding_analysis(phone: str) -> dict | None:
+    phone_clean = _clean_phone(phone)
+    doc = _db().collection("onboarding_analyses").document(phone_clean).get()
+    if not doc.exists:
+        return None
+    data = doc.to_dict()
+    data["id"] = doc.id
+    return data
+
+
+def set_onboarding_analysis(phone: str, data: dict) -> None:
+    """Overwrite the stored analysis for a phone (feedback is preserved
+    by the caller merging it in — the analyzer service owns that logic)."""
+    phone_clean = _clean_phone(phone)
+    _db().collection("onboarding_analyses").document(phone_clean).set(data)
+
+
+def append_onboarding_analysis_feedback(phone: str, feedback: dict) -> bool:
+    """Attach team feedback (helpful yes/no + note) to a stored analysis.
+
+    Returns False when no analysis exists for the phone yet.
+    """
+    phone_clean = _clean_phone(phone)
+    ref = _db().collection("onboarding_analyses").document(phone_clean)
+    if not ref.get().exists:
+        return False
+    ref.update({"feedback": fb_firestore.ArrayUnion([feedback])})
+    return True
+
+
+# ── Analyzer context (marketing KB for the onboarding analyzer) ─────────────
+# Stored at `system/analyzer_context`, mirroring the Global KB pattern.
+# Holds the client-provided marketing context (objectives, expected journey,
+# objection playbook) injected into every analysis prompt — editable from
+# the internal dashboard without a deploy.
+
+def get_analyzer_context() -> dict | None:
+    doc = _db().collection("system").document("analyzer_context").get()
+    if not doc.exists:
+        return None
+    return doc.to_dict()
+
+
+def set_analyzer_context(content: str) -> None:
+    _db().collection("system").document("analyzer_context").set({
+        "content": content,
+        "updatedAt": _now_iso(),
+    })
+
+
 # ── WhatsApp device send-state (outbound guard) ─────────────────────────────
 # Collection: wa_device_state  —  doc ID = bridge device/session ID.
 # Tracks the per-number proactive daily counter and the 463 circuit-breaker

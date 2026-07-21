@@ -1,4 +1,10 @@
-import type { BusinessDetail, GlobalKb, Overview, RangeFilter } from "./types";
+import type {
+  BusinessDetail,
+  GlobalKb,
+  OnboardingAnalysisResult,
+  Overview,
+  RangeFilter,
+} from "./types";
 
 // The admin key lives in sessionStorage only (cleared when the tab closes) —
 // this is an internal tool behind a shared key, not user auth.
@@ -37,7 +43,7 @@ function rangeParams(filter: RangeFilter): URLSearchParams {
 }
 
 async function request<T>(
-  method: "GET" | "PUT",
+  method: "GET" | "PUT" | "POST",
   path: string,
   params?: URLSearchParams,
   body?: unknown,
@@ -92,4 +98,34 @@ export function fetchGlobalKb(): Promise<GlobalKb> {
 
 export function saveGlobalKb(content: string): Promise<GlobalKb> {
   return request<GlobalKb>("PUT", "/global-kb", undefined, { content });
+}
+
+// ── Onboarding analyzer ───────────────────────────────────────────────────────
+
+/** Run (or fetch the cached) AI analysis of one owner's onboarding journey.
+ *  Fresh runs take 5–20s (LLM call); cached results return instantly. */
+export function analyzeOnboardingSession(
+  phone: string,
+  force = false,
+): Promise<OnboardingAnalysisResult> {
+  const params = new URLSearchParams();
+  if (force) params.set("force", "true");
+  return request<OnboardingAnalysisResult>(
+    "POST",
+    `/onboarding-sessions/${encodeURIComponent(phone)}/analyze`,
+    params,
+  );
+}
+
+export function sendAnalysisFeedback(
+  phone: string,
+  helpful: boolean,
+  note?: string,
+): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>(
+    "POST",
+    `/onboarding-sessions/${encodeURIComponent(phone)}/analysis-feedback`,
+    undefined,
+    { helpful, note },
+  );
 }

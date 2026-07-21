@@ -131,3 +131,97 @@ def update_global_kb(
     global_kb_module.get_global_kb(force_refresh=True)
     logger.info("[ANALYTICS] Global KB updated (%d chars)", len(content))
     return _global_kb_payload()
+
+
+# ── Onboarding analyzer (AI analysis of onboarding journeys) ─────────────────
+# Backs the "Analyze" button in the funnel drill-down. Results are cached in
+# Firestore keyed by a transcript fingerprint, so repeat clicks cost nothing;
+# ?force=true re-runs the LLM. See app/services/onboarding_analyzer_service.py.
+
+
+class AnalysisFeedback(BaseModel):
+    helpful: bool
+    note: str | None = None
+
+
+@router.post("/onboarding-sessions/{phone}/analyze")
+async def analyze_onboarding_session(
+    phone: str,
+    force: bool = Query(False, description="Re-run the LLM even when a fresh cached analysis exists"),
+    _: None = Depends(require_admin_key),
+) -> dict:
+    """AI analysis of one owner's onboarding journey: intent, drop-off reason
+    (evidence-backed), objections, friction points, and flow recommendations."""
+    from app.services import onboarding_analyzer_service as analyzer
+
+    try:
+        return await analyzer.analyze_onboarding_session(phone, force=force)
+    except analyzer.SessionNotFound:
+        raise HTTPException(status_code=404, detail="No onboarding session or transcript for this phone")
+    except analyzer.InsufficientConversation as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except analyzer.AnalyzerError as exc:
+        logger.error("[ANALYZER] analysis failed for %s: %s", phone, exc)
+        raise HTTPException(status_code=502, detail=f"Analysis failed: {exc}")
+
+
+@router.post("/onboarding-sessions/{phone}/analysis-feedback")
+async def onboarding_analysis_feedback(
+    phone: str,
+    payload: AnalysisFeedback,
+    _: None = Depends(require_admin_key),
+) -> dict:
+    """Attach team feedback (helpful yes/no + note) to a stored analysis —
+    the signal used to compare analyzer prompt versions over time."""
+    from app.services import onboarding_analyzer_service as analyzer
+
+    try:
+        await analyzer.record_analysis_feedback(phone, payload.helpful, payload.note)
+    except analyzer.SessionNotFound:
+        raise HTTPException(status_code=404, detail="No stored analysis for this phone")
+    return {"ok": True}
+
+
+# ── Analyzer marketing context (view + edit — mirrors the Global KB) ─────────
+
+_ANALYZER_CONTEXT_MAX_CHARS = 30_000
+
+
+class AnalyzerContextUpdate(BaseModel):
+    content: str
+
+
+def _analyzer_context_payload() -> dict:
+    doc = fs.get_analyzer_context()
+    content = str((doc or {}).get("content") or "")
+    return {
+        "content": content,
+        "updatedAt": (doc or {}).get("updatedAt"),
+        "chars": len(content),
+        "maxChars": _ANALYZER_CONTEXT_MAX_CHARS,
+    }
+
+
+@router.get("/analyzer-context")
+def get_analyzer_context(_: None = Depends(require_admin_key)) -> dict:
+    """Marketing context injected into every onboarding analysis prompt
+    (objectives, expected journey, objection playbook — client-provided)."""
+    return _analyzer_context_payload()
+
+
+@router.put("/analyzer-context")
+def update_analyzer_context(
+    payload: AnalyzerContextUpdate,
+    _: None = Depends(require_admin_key),
+) -> dict:
+    """Replace the analyzer marketing context. Empty content is allowed —
+    it simply removes the section from future analysis prompts."""
+    content = payload.content.replace("\r\n", "\n")
+    if len(content) > _ANALYZER_CONTEXT_MAX_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Context is {len(content):,} characters — the cap is {_ANALYZER_CONTEXT_MAX_CHARS:,}",
+        )
+    fs.set_analyzer_context(content)
+    logger.info("[ANALYTICS] Analyzer context updated (%d chars)", len(content))
+    return _analyzer_context_payload()

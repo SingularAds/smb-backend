@@ -266,3 +266,48 @@ export interface RangeFilter {
   from: string | null; // YYYY-MM-DD when custom
   to: string | null;
 }
+
+// ── Onboarding analyzer ───────────────────────────────────────────────────────
+// Mirrors app/services/onboarding_analyzer_service.py (OnboardingAnalysis +
+// the stored analysis doc returned by POST /onboarding-sessions/{phone}/analyze).
+
+export type AnalysisOutcome = "completed" | "dropped" | "still_active";
+
+export type DropOffReason =
+  | "PRICING_CONCERN"
+  | "FEATURE_MISMATCH"
+  | "CONFUSION_FRICTION"
+  | "TRUST_HESITATION"
+  | "LOST_INTEREST_INACTIVE"
+  | "LANGUAGE_BARRIER"
+  | "TECHNICAL_ISSUE"
+  | "PAIRING_ABANDONED"
+  | "PAYMENT_ABANDONED"
+  | "INSUFFICIENT_EVIDENCE"
+  | "OTHER";
+
+export interface OnboardingAnalysis {
+  customerIntent: string;
+  outcome: AnalysisOutcome;
+  dropOffStage: string | null;
+  dropOffReason: DropOffReason | null;
+  confidence: "high" | "medium" | "low";
+  evidence: string[];
+  objections: string[];
+  frictionPoints: string[];
+  recommendations: string[];
+  summary: string;
+}
+
+export interface OnboardingAnalysisResult {
+  phone: string;
+  analysis: OnboardingAnalysis;
+  provider: string;
+  model: string;
+  promptVersion: number;
+  transcriptSource: "archive" | "session_history";
+  messageCount: number;
+  analyzedAt: string;
+  /** true when served from the Firestore cache (no LLM call) */
+  cached: boolean;
+}

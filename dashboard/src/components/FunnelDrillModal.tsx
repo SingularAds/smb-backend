@@ -1,13 +1,15 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Modal } from "./Modal";
+import { OnboardingAnalysisModal } from "./OnboardingAnalysisModal";
 import type { FunnelSessionEntry } from "../types";
 import { fmtPhone, fmtRelative, fmtToken } from "../lib/format";
 
 // Drill-down modal: shows the individual owners at a specific funnel stage.
 // Clicking "View" on a completed owner navigates to the Business Detail page.
 // For in-progress owners (no businessId), phone + step are shown for direct
-// WhatsApp contact.
+// WhatsApp contact. "Analyze" opens the AI onboarding analysis for that owner
+// (intent, drop-off reason, friction points, flow recommendations).
 
 function copyToClipboard(text: string) {
   navigator.clipboard.writeText(text).catch(() => {});
@@ -24,6 +26,7 @@ export function FunnelDrillModal({
 }) {
   const navigate = useNavigate();
   const [copied, setCopied] = useState<string | null>(null);
+  const [analyzeTarget, setAnalyzeTarget] = useState<FunnelSessionEntry | null>(null);
 
   function handleCopy(phone: string) {
     copyToClipboard(phone);
@@ -122,7 +125,17 @@ export function FunnelDrillModal({
                 </div>
               </div>
 
-              {/* Action button */}
+              {/* Action buttons */}
+              {s.phone ? (
+                <button
+                  type="button"
+                  onClick={() => setAnalyzeTarget(s)}
+                  title="AI analysis of this onboarding conversation"
+                  className="shrink-0 rounded-md border border-[var(--hairline)] px-2.5 py-1 text-xs font-medium text-ink-2 hover:bg-[var(--page)]"
+                >
+                  Analyze
+                </button>
+              ) : null}
               {s.businessId ? (
                 <button
                   type="button"
@@ -149,6 +162,15 @@ export function FunnelDrillModal({
           ))}
         </ul>
       )}
+
+      {/* AI analysis — stacked portal modal over the drill-down */}
+      {analyzeTarget?.phone ? (
+        <OnboardingAnalysisModal
+          phone={analyzeTarget.phone}
+          name={analyzeTarget.name}
+          onClose={() => setAnalyzeTarget(null)}
+        />
+      ) : null}
     </Modal>
   );
 }

@@ -117,6 +117,71 @@ async def _generate_prompt_bg(business_id: str, business: dict) -> None:
 
 
 
+_last_archive_ts: str = ""
+
+
+def _archive_ts() -> str:
+    """Strictly increasing ISO timestamp for transcript entries.
+
+    The OS clock can tick coarsely enough that two messages archived in the
+    same turn get identical utcnow() values, making the transcript's
+    order_by("ts") ambiguous (replies can sort before the message they answer).
+    Bump ties by 1µs so per-process ordering is always well-defined.
+    """
+    global _last_archive_ts
+    ts = datetime.utcnow().isoformat()
+    if ts <= _last_archive_ts:
+        ts = (
+            datetime.fromisoformat(_last_archive_ts) + timedelta(microseconds=1)
+        ).isoformat()
+    _last_archive_ts = ts
+    return ts
+
+
+def _archive_transcript_message(
+    phone: str,
+    role: str,
+    content: str,
+    session: dict | None,
+    message_id: str | None = None,
+) -> None:
+    """Fire-and-forget append to onboarding_transcripts/{phone}/messages.
+
+    The session doc's conversationHistory erodes (post-onboarding trims it,
+    _start_new resets it, new-biz confirm deletes the doc), so this archive is
+    the durable record the AI onboarding analyzer reads. Must NEVER block or
+    fail the live conversation — all errors are swallowed and logged.
+    """
+    try:
+        entry: dict = {
+            "role": role,
+            "content": content,
+            "ts": _archive_ts(),
+        }
+        if session:
+            if session.get("currentStep"):
+                entry["step"] = session["currentStep"]
+            if session.get("salesPhase"):
+                entry["salesPhase"] = session["salesPhase"]
+            mode = session.get("temporaryMode") or session.get("mode")
+            if mode:
+                entry["mode"] = mode
+        if message_id:
+            entry["messageId"] = message_id
+
+        async def _write() -> None:
+            try:
+                await asyncio.to_thread(
+                    db.append_onboarding_transcript_message, phone, entry
+                )
+            except Exception as exc:
+                logger.warning("[TRANSCRIPT] archive write failed for %s: %s", phone, exc)
+
+        asyncio.create_task(_write())
+    except Exception as exc:
+        logger.warning("[TRANSCRIPT] archive scheduling failed for %s: %s", phone, exc)
+
+
 async def _dispatch_owner_cmd(command: dict, business: dict) -> str:
     """Dispatch a parsed owner command to the right service function.
 
@@ -1436,6 +1501,44 @@ _AFFIRMATIVE_RE = re.compile(
 )
 
 
+# Detects replies that already ask the owner for a yes/confirmation. The
+# onboarding CTA footer ("…reply YES and I'll set everything up!") must NEVER
+# be appended to such replies — two different YES asks in one message is a
+# contradiction (prod bug 2026-07-14: "Reply yes to confirm [the address]" +
+# CTA YES in the same bubble; the owner's "Yes" then reset the whole flow).
+_CONFIRM_ASK_RE = re.compile(
+    r"reply\s+\*?(?:yes|sim|si|sí)\b"
+    r"|responda?\s+\*?(?:sim|si|sí)\b"
+    r"|does this look correct|is this correct"
+    r"|está correto|esta correto|es correcto",
+    re.IGNORECASE,
+)
+
+
+def _reply_asks_confirmation(text: str) -> bool:
+    """True when the outgoing reply already contains its own yes/confirm ask."""
+    return bool(text) and bool(_CONFIRM_ASK_RE.search(text))
+
+
+# Location-gate escape words (multilingual). Shared by the location_request
+# gate and the pending-search supplement guard so "no"-style replies are
+# never mistaken for a city/address.
+_LOC_ESCAPE_WORDS = frozenset({
+    "no", "nope", "nah", "skip", "none", "no thanks",
+    "don't have", "dont have", "cancel",
+    # Portuguese
+    "não", "nao", "não tenho", "nao tenho", "pular", "cancelar",
+    "depois", "mais tarde", "agora não", "agora nao",
+    # Spanish
+    "no tengo", "saltar", "más tarde", "mas tarde", "ahora no",
+    "luego", "omitir",
+})
+
+# Max LLM-answered detours inside the location gate before the safety valve
+# releases it (with a REAL text search) so nobody can circle forever.
+_LOC_GATE_MAX_DETOURS = 3
+
+
 def _is_affirmative(text: str) -> bool:
     """True when the ENTIRE message is a bare 'yes' in a supported language."""
     if not text:
@@ -2033,6 +2136,10 @@ class OnboardingService:
         # 1. Check for existing session
         session = db.get_onboarding_session(phone)
 
+        # Archive the inbound message (append-only transcript for the analyzer).
+        if body:
+            _archive_transcript_message(phone, "user", body, session, message_id=message_id)
+
         # 2. Look up existing business BEFORE the recepte activation check.
         #    EC10: prevents re-triggering onboarding for an owner who already
         #    completed setup and later taps the recepte.co deep-link again.
@@ -2250,16 +2357,7 @@ class OnboardingService:
                 # ("não", "pular"…); an English-only list caused an infinite
                 # re-prompt loop for any non-English reply (prod bug 2026-07-13).
                 _loc_escape = body.strip().lower()
-                if _loc_escape in (
-                    "no", "nope", "nah", "skip", "none", "no thanks",
-                    "don't have", "dont have", "cancel",
-                    # Portuguese
-                    "não", "nao", "não tenho", "nao tenho", "pular", "cancelar",
-                    "depois", "mais tarde", "agora não", "agora nao",
-                    # Spanish
-                    "no tengo", "saltar", "más tarde", "mas tarde", "ahora no",
-                    "luego", "omitir",
-                ):
+                if _loc_escape in _LOC_ESCAPE_WORDS:
                     _pending_query = session.get("pendingPlacesQuery", "")
                     db.upsert_onboarding_session(phone, {"currentStep": "conversing"})
                     session["currentStep"] = "conversing"
@@ -2286,20 +2384,37 @@ class OnboardingService:
                         session, phone, body, push_name, message_id
                     )
                     return
-                # ── Anti-loop guard (prod bug 2026-07-13) ─────────────────────
-                # The user replied with something that is neither a location
-                # share nor an escape word (e.g. "ola", a question, small talk).
-                # Old behaviour re-sent the same static location prompt forever.
-                # New behaviour: re-prompt AT MOST ONCE, then release the gate
-                # and let the AI answer the actual message (dynamic onboarding).
-                # askedForLocation stays True, so a later Places search falls
-                # back to global text search instead of re-asking — the gate
-                # can never re-trap this session.
+                # ── Dynamic detour-and-return (prod feedback 2026-07-14) ──────
+                # The message is neither a location share nor an escape word —
+                # it's a question or comment ("why do you need my location?").
+                # Answer it with the LLM IN PLACE: the gate stays active, the
+                # answer ends with an invitation back to this step, and a
+                # location share / *skip* / escape word still works on the next
+                # message. The onboarding step and its collected data
+                # (pendingPlacesQuery, askedForLocation) stay fully intact.
                 _loc_prompts = int(session.get("locationPromptCount") or 0)
-                if _loc_prompts >= 1:
+                _pending_query = session.get("pendingPlacesQuery", "")
+
+                # A bare "yes/ok/sim" after a detour = "ready to continue" —
+                # resume the step deterministically (re-issue the prompt), no
+                # LLM call, no counter burn.
+                if _loc_prompts >= 1 and _is_affirmative(body):
+                    loc_msg = (
+                        "Perfect! 📍 Tap 📎 → Location → Send Your Current "
+                        "Location. Or reply *skip* and we'll continue without it."
+                    )
+                    loc_msg = await self._localize_static(loc_msg, body, session.get("language", "en"))
+                    await self._send(phone, loc_msg)
+                    return
+
+                # Safety valve: after _LOC_GATE_MAX_DETOURS answered detours,
+                # release the gate and run a REAL global text search with the
+                # pending query (askedForLocation=True → no re-ask, no re-trap).
+                # Never leave a pending search for the LLM to "pretend" on.
+                if _loc_prompts >= _LOC_GATE_MAX_DETOURS:
                     logger.info(
-                        "[ONBOARDING] location_request released after %d re-prompts "
-                        "for %s — routing message to AI (anti-loop)",
+                        "[ONBOARDING] location_request released after %d detours "
+                        "for %s — falling back to global text search (anti-loop)",
                         _loc_prompts, phone,
                     )
                     db.upsert_onboarding_session(phone, {
@@ -2308,21 +2423,50 @@ class OnboardingService:
                         "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
                     })
                     session["currentStep"] = "conversing"
-                    await self._handle_conversation(session, phone, body, push_name, message_id)
+                    if _pending_query:
+                        await self._run_places_search(session, phone, _pending_query, push_name)
+                    else:
+                        await self._handle_conversation(session, phone, body, push_name, message_id)
                     return
 
+                # LLM detour: answer the owner's actual message, then invite
+                # them back to the location step. History is persisted so the
+                # conversation context stays consistent for later turns.
                 db.upsert_onboarding_session(phone, {
                     "locationPromptCount": _loc_prompts + 1,
                     "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
                 })
                 session["locationPromptCount"] = _loc_prompts + 1
-                loc_msg = (
-                    "Perfect! 📍 Let’s find you on the map. "
-                    "Tap 📎 → Location → Send Your Current Location. Takes 2 seconds 🙌\n\n"
-                    "_(Or just reply *skip* and we'll continue without it.)_"
+
+                _detour_history = session.get("conversationHistory", [])
+                _detour_history.append({"role": "user", "content": body})
+                _push = push_name or session.get("pushName", "")
+                _lang = session.get("language", "en")
+                _gate_ctx = (
+                    "ONBOARDING GATE CONTEXT: We are mid-onboarding. We just asked "
+                    "the owner to share their WhatsApp location (Tap 📎 → Location) "
+                    f"so we can find their business '{_pending_query or 'their business'}' "
+                    "on Google Maps. Their latest message is a question or comment "
+                    "instead of a location. Do exactly two things, in the owner's "
+                    "conversation language: (1) answer their message briefly and "
+                    "helpfully; (2) ask if they're ready to continue — they can share "
+                    "the location now, or reply *skip* to continue without it. "
+                    "Do NOT claim to search for anything yourself — the SYSTEM runs "
+                    "the Google search only after the location arrives or they skip. "
+                    "Do NOT restart onboarding, do NOT ask for the business name "
+                    "again, and do NOT invent business details."
                 )
-                loc_msg = await self._localize_static(loc_msg, body, session.get("language", "en"))
-                await self._send(phone, loc_msg)
+                ai_reply = await self._get_ai_response(
+                    _detour_history, _push, _lang, extra_context=_gate_ctx
+                )
+                _, _clean_detour = self._check_confirmed(ai_reply)
+                _detour_history.append({"role": "assistant", "content": _clean_detour})
+                db.upsert_onboarding_session(phone, {
+                    "conversationHistory": _detour_history,
+                    "lastMessageId": message_id,
+                })
+                session["conversationHistory"] = _detour_history
+                await self._send(phone, _clean_detour)
                 return
 
             # Website confirmation step
@@ -3231,6 +3375,12 @@ class OnboardingService:
             session.get("onboardingCtaOffered")
             and _is_affirmative(body)
             and session.get("salesPhase", "discovery") != "demo"
+            # A pending Places search means onboarding is ALREADY underway —
+            # a bare "yes" here answers the flow's own question (e.g. a
+            # details confirmation), never the sales CTA. Without this guard
+            # the owner's "Yes" reset the whole flow back to the link request
+            # (prod bug 2026-07-14, double-YES contradiction).
+            and not session.get("pendingPlacesQuery")
         )
         if (_is_onboarding_start_intent(body) or _cta_yes) and not session.get("askedForLink"):
             history = session.get("conversationHistory", [])
@@ -3265,6 +3415,45 @@ class OnboardingService:
             logger.info(
                 "[ONBOARDING] Link request sent for %s (%s)",
                 phone, "CTA consent" if _cta_yes else "reset start intent",
+            )
+            return
+
+        # ── Pending-search supplement (prod bug 2026-07-14) ──────────────────
+        # A Places search is still pending: the owner gave a business name but
+        # the search never ran (location gate was detoured/skipped/released).
+        # If the owner now sends a short location-ish message ("Sector 71
+        # Mohali"), run a REAL combined text search — the LLM must never
+        # pretend to search or fabricate results. Guards: no escape/affirmative
+        # words, no questions, capped at 2 supplement attempts.
+        _pending_search = session.get("pendingPlacesQuery") or ""
+        _supplement_count = int(session.get("placesSupplementCount") or 0)
+        if (
+            settings.GOOGLE_PLACES_API_KEY
+            and _pending_search
+            and not session.get("websiteExtractedData")
+            and _supplement_count < 2
+            and 1 <= len(body.split()) <= 6
+            and "?" not in body
+            and body.strip().lower() not in _LOC_ESCAPE_WORDS
+            and not _is_affirmative(body)
+            and not _is_demo_request(body)
+            and not _is_conversational_noise(body)
+        ):
+            _h = session.get("conversationHistory", [])
+            _h.append({"role": "user", "content": body})
+            db.upsert_onboarding_session(phone, {
+                "conversationHistory": _h,
+                "placesSupplementCount": _supplement_count + 1,
+            })
+            session["conversationHistory"] = _h
+            session["placesSupplementCount"] = _supplement_count + 1
+            logger.info(
+                "[ONBOARDING] Pending-search supplement for %s: %r + %r",
+                phone, _pending_search, body.strip(),
+            )
+            await self._run_places_search(
+                session, phone, f"{_pending_search} {body.strip()}", push_name,
+                original_body=body,
             )
             return
 
@@ -3343,6 +3532,21 @@ class OnboardingService:
 
         # Build combined context: lead data + phase-specific instructions + persona
         _ctx_parts: list[str] = [p for p in [lead_ctx] if p]
+
+        # Never let the LLM fake a Google search (prod bug 2026-07-14: it
+        # replied "I'll search now… One moment… I wasn't able to find a match"
+        # and later fabricated a found-details card — with no tool call ever
+        # made). While a Places lookup is pending, pin the boundary explicitly.
+        if session.get("pendingPlacesQuery"):
+            _ctx_parts.append(
+                "IMPORTANT — SEARCH BOUNDARY: A Google Places lookup for "
+                f"'{session.get('pendingPlacesQuery')}' is performed by the "
+                "SYSTEM, never by you. Do NOT say you are searching, do NOT "
+                "announce search results, and do NOT present business details "
+                "(name/address/type cards) that were not explicitly provided "
+                "in this conversation. If the owner shares a city or address, "
+                "acknowledge it briefly — the system will run the real search."
+            )
 
         _phase_prompt = SALES_PHASE_PROMPTS.get(sales_phase, "")
         if _phase_prompt:
@@ -3528,6 +3732,13 @@ class OnboardingService:
             and not session.get("mandatoryFieldsRequired")
             and not session.get("resumeOnboardingAfterDemo")
             and not session.get("justResumedFromDemo")
+            # Mid-search prospects already started onboarding — the sales CTA
+            # is redundant and its YES collides with flow questions.
+            and not session.get("pendingPlacesQuery")
+            # Never stack the CTA's "reply YES" under a reply that already
+            # asks its own yes/confirmation — two YES asks in one message is
+            # a contradiction (prod bug 2026-07-14).
+            and not _reply_asks_confirmation(clean_reply)
         )
         if _cta_eligible:
             _cta_text = await self._localize_static(_ONBOARDING_CTA, body, lang)
@@ -3891,7 +4102,12 @@ class OnboardingService:
             db.upsert_onboarding_session(phone, {
                 "currentStep": "website_confirm",
                 "websiteExtractedData": result,
+                # Search completed — clear the pending marker so the
+                # supplement guard / CTA suppression don't linger.
+                "pendingPlacesQuery": None,
+                "placesSupplementCount": 0,
             })
+            session["pendingPlacesQuery"] = None
             biz_name = result.get("name", "")
             biz_type = (result.get("type") or result.get("businessType") or "").title()
             address = result.get("address") or result.get("formatted_address") or ""
@@ -3913,8 +4129,13 @@ class OnboardingService:
             "placesPickResults": results,
             "placesPickQuery": query,
             "placesPickPromptCount": 0,
+            # Search completed — clear the pending marker so the supplement
+            # guard / CTA suppression don't linger.
+            "pendingPlacesQuery": None,
+            "placesSupplementCount": 0,
             "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
         })
+        session["pendingPlacesQuery"] = None
         lines = [f"I found {len(results)} businesses matching *{query}*. Which one is yours?\n"]
         for i, place in enumerate(results, 1):
             lines.append(self._format_places_card(i, place))
@@ -7509,6 +7730,10 @@ class OnboardingService:
                 logger.exception("Onboarding AI -> (logging failed)")
             try:
                 await self.wa.send_message(phone, message)
+                # Archive the delivered reply (transcript for the analyzer).
+                # Skipped on ReachoutTimelocked below — the owner never saw it.
+                if message:
+                    _archive_transcript_message(phone, "assistant", message, session)
             except ReachoutTimelocked as exc:
                 # Cold-contact rate-limit. The reply was NOT delivered. We log
                 # this distinctly so it's separable from real bridge crashes in

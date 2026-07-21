@@ -50,9 +50,17 @@ class Settings(BaseSettings):
     
     # Anthropic
     ANTHROPIC_API_KEY: str = ""
-    
+
     # OpenAI
     OPENAI_API_KEY: str = ""
+
+    # Onboarding analyzer (AI analysis of onboarding journeys — dashboard tool).
+    # Provider is switchable per-deploy: "openai" (default, Langfuse-traced like
+    # the live chat stack) or "anthropic" (official Anthropic SDK, needs
+    # ANTHROPIC_API_KEY). One .env line flips the whole analyzer over.
+    ONBOARDING_ANALYZER_PROVIDER: str = "openai"          # "openai" | "anthropic"
+    ONBOARDING_ANALYZER_OPENAI_MODEL: str = "gpt-4o"      # analysis needs > gpt-4o-mini
+    ONBOARDING_ANALYZER_ANTHROPIC_MODEL: str = "claude-opus-4-8"
     
     # ElevenLabs
     ELEVENLABS_API_KEY: str = ""
