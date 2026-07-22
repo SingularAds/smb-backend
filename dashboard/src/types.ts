@@ -14,10 +14,24 @@ export interface FunnelSessionEntry {
   currentStep: string | null;
   startedAt: string | null;
   businessId: string | null;
+  /** which global onboarding number this prospect came in on */
+  onboardingDeviceId?: string | null;
+  onboardingNumber?: string | null;
   /** acquisition context — present only on attributed (ad/website) sessions */
   channel?: string | null;
   adId?: string | null;
   campaign?: string | null;
+}
+
+/** One selectable global onboarding number (bridge session + phone). */
+export interface GlobalNumberOption {
+  /** bridge session id, e.g. "smba"; "_unattributed" for legacy sessions */
+  deviceId: string;
+  number: string | null;
+  label: string;
+  /** unfiltered volumes, so the picker shows each number's true size */
+  sessions: number;
+  accounts: number;
 }
 
 export interface AcquisitionStage {
@@ -104,11 +118,20 @@ export interface Account {
   pendingKnowledgeGaps: number;
   lastCustomerActivityAt: string | null;
   lastOwnerActivityAt: string | null;
+  /** global onboarding number this account came in on (via its owner's session) */
+  onboardingDeviceId?: string | null;
+  onboardingNumber?: string | null;
 }
 
 export interface Overview {
   range: DateRange;
   includeTest: boolean;
+  /** every global onboarding number available to filter by */
+  globalNumbers: GlobalNumberOption[];
+  /** currently selected number (null = all numbers combined) */
+  globalDevice: string | null;
+  /** the funnel's OWN window — all time unless the user picks a range */
+  funnelRange: { allTime: boolean; from: string | null; to: string | null };
   funnel: FunnelStage[];
   /** onboarding prospects grouped by acquisition channel (Meta ads, website…) */
   acquisition: Acquisition;
@@ -125,6 +148,21 @@ export interface ServiceItem {
   name: string | null;
   price: number | string | null;
   duration: number | string | null;
+}
+
+/** The owner's own onboarding chat with Sofia on the global number.
+ *  Present even when they never paired — that is the case worth reading. */
+export interface OnboardingChat {
+  ownerPhone: string | null;
+  currentStep: string | null;
+  language: string | null;
+  startedAt: string | null;
+  lastActivityAt: string | null;
+  messageCount: number;
+  ownerMessageCount: number;
+  onboardingDeviceId: string | null;
+  onboardingNumber: string | null;
+  turns: TranscriptTurn[];
 }
 
 export interface DetailProfile extends Omit<
@@ -244,6 +282,8 @@ export interface BusinessDetail {
   bookings: Booking[];
   conversations: Conversation[];
   transcripts: Record<string, TranscriptTurn[]>;
+  /** the owner↔Sofia onboarding chat; null when there are no messages */
+  onboardingChat: OnboardingChat | null;
   csatTrend: CsatPoint[];
   complaints: Complaint[];
   knowledgeGaps: KnowledgeGap[];
@@ -265,4 +305,11 @@ export interface RangeFilter {
   preset: RangePreset | null;
   from: string | null; // YYYY-MM-DD when custom
   to: string | null;
+}
+
+/** All three null = "all time" (only the funnel's picker offers this). */
+export const ALL_TIME: RangeFilter = { preset: null, from: null, to: null };
+
+export function isAllTime(f: RangeFilter): boolean {
+  return !f.preset && !f.from;
 }

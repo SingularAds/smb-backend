@@ -1,8 +1,10 @@
 import { useState } from "react";
-import type { FunnelStage } from "../types";
+import type { FunnelStage, RangeFilter } from "../types";
+import { isAllTime } from "../types";
 import { ChartCard } from "./ChartCard";
+import { DateRangeDropdown } from "./DateRangeDropdown";
 import { FunnelDrillModal } from "./FunnelDrillModal";
-import { fmtNumber, fmtPercent } from "../lib/format";
+import { fmtDate, fmtNumber, fmtPercent } from "../lib/format";
 
 // Onboarding registration funnel: 4 ordered stages → horizontal bars on an
 // ordinal single-hue ramp (validated --ordinal, light AND dark). Between
@@ -21,12 +23,26 @@ const RAMP = [
 export function FunnelChart({
   stages,
   excludedDemoSessions = 0,
+  range,
+  onRangeChange,
 }: {
   stages: FunnelStage[];
   excludedDemoSessions?: number;
+  /** the funnel's OWN window — all time by default, independent of the page filter */
+  range?: RangeFilter;
+  onRangeChange?: (f: RangeFilter) => void;
 }) {
   const max = Math.max(1, ...stages.map((s) => s.count));
   const [drillStage, setDrillStage] = useState<FunnelStage | null>(null);
+
+  // Say plainly what the bars cover, since it is NOT the page's date filter.
+  const windowLabel = !range
+    ? "in range"
+    : isAllTime(range)
+      ? "all time"
+      : range.from
+        ? `${fmtDate(range.from)} – ${range.to ? fmtDate(range.to) : "today"}`
+        : `last ${range.preset} days`;
 
   const srSummary =
     `Onboarding registration funnel: ` +
@@ -150,12 +166,22 @@ export function FunnelChart({
     <>
       <ChartCard
         title="Onboarding funnel"
-        subtitle={`Owner registration sessions started in range — demo/booking roleplay excluded${
-          excludedDemoSessions > 0 ? ` (${excludedDemoSessions} in range)` : ""
+        subtitle={`Owner registration sessions — ${windowLabel} · demo/booking roleplay excluded${
+          excludedDemoSessions > 0 ? ` (${excludedDemoSessions})` : ""
         } · test accounts excluded · click a bar to see owners`}
         srSummary={srSummary}
         chart={chart}
         table={table}
+        headerExtra={
+          range && onRangeChange ? (
+            <DateRangeDropdown
+              filter={range}
+              onChange={onRangeChange}
+              allowAllTime
+              label="Onboarding funnel date range"
+            />
+          ) : null
+        }
       />
 
       {drillStage ? (

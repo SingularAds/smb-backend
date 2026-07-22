@@ -6,6 +6,7 @@ import { BookingModal } from "../components/BookingModal";
 import { CsatTrendChart } from "../components/CsatTrendChart";
 import { ConversationsTable } from "../components/ConversationsTable";
 import { EmptyState } from "../components/EmptyState";
+import { OnboardingChatCard } from "../components/OnboardingChatCard";
 import { KpiRow, StatTile } from "../components/StatTile";
 import { SortableTable, type Column } from "../components/SortableTable";
 import {
@@ -236,6 +237,14 @@ export function BusinessDetailPage({ detail }: { detail: BusinessDetail }) {
             label="Onboarding step"
             value={p.onboardingStep ? fmtToken(p.onboardingStep) : "—"}
           />
+          <HeaderFact
+            label="Onboarded via"
+            value={
+              <span title="The global Recepte number this owner started their onboarding chat on">
+                {p.onboardingNumber ? fmtPhone(p.onboardingNumber) : "—"}
+              </span>
+            }
+          />
           <HeaderFact label="Customers" value={fmtNumber(s.totalCustomers)} />
           <HeaderFact label="Address" value={p.address ?? "—"} />
         </dl>
@@ -244,8 +253,18 @@ export function BusinessDetailPage({ detail }: { detail: BusinessDetail }) {
         </div>
       </section>
 
+      {/* The owner's own onboarding chat with Sofia on the global number.
+          Shown for paired AND unpaired accounts — for an account that stalled
+          before pairing this is the only record of what actually happened. */}
+      <OnboardingChatCard
+        chat={detail.onboardingChat}
+        businessName={p.name}
+        whatsappPaired={p.whatsappPaired}
+        style={rise(1)}
+      />
+
       {/* KPI row (range-scoped) */}
-      <div className="rise" style={rise(1)}>
+      <div className="rise" style={rise(2)}>
         <KpiRow>
           <StatTile
             label="Bookings"
@@ -286,7 +305,7 @@ export function BusinessDetailPage({ detail }: { detail: BusinessDetail }) {
         </KpiRow>
       </div>
 
-      <div className="rise" style={rise(2)}>
+      <div className="rise" style={rise(3)}>
         <ActivityChart
           points={detail.activity}
           title="Activity"
@@ -294,12 +313,12 @@ export function BusinessDetailPage({ detail }: { detail: BusinessDetail }) {
         />
       </div>
 
-      <div className="rise" style={rise(3)}>
+      <div className="rise" style={rise(4)}>
         <CsatTrendChart points={detail.csatTrend} />
       </div>
 
       {/* Bookings */}
-      <section className="card rise p-4" style={rise(4)}>
+      <section className="card rise p-4" style={rise(5)}>
         <h2 className="mb-1 text-sm font-semibold text-ink">
           Bookings
           <span className="ml-2 font-normal text-muted">
@@ -349,7 +368,7 @@ export function BusinessDetailPage({ detail }: { detail: BusinessDetail }) {
       </section>
 
       {/* Conversations */}
-      <section className="card rise p-4" style={rise(5)}>
+      <section className="card rise p-4" style={rise(6)}>
         <h2 className="mb-1 text-sm font-semibold text-ink">
           Conversations
           <span className="ml-2 font-normal text-muted">
@@ -381,7 +400,7 @@ export function BusinessDetailPage({ detail }: { detail: BusinessDetail }) {
 
       {/* Complaints + knowledge gaps */}
       <div className="grid gap-4 lg:grid-cols-2">
-        <section className="card rise p-4" style={rise(6)}>
+        <section className="card rise p-4" style={rise(7)}>
           <h2 className="mb-2 text-sm font-semibold text-ink">
             Complaints
             <span className="ml-2 font-normal text-muted">
@@ -420,7 +439,7 @@ export function BusinessDetailPage({ detail }: { detail: BusinessDetail }) {
           )}
         </section>
 
-        <section className="card rise p-4" style={rise(7)}>
+        <section className="card rise p-4" style={rise(8)}>
           <h2 className="mb-2 text-sm font-semibold text-ink">
             Knowledge gaps
             <span className="ml-2 font-normal text-muted">

@@ -14,7 +14,13 @@ import {
   fetchOverview,
   getAdminKey,
 } from "./api";
-import type { BusinessDetail, Overview, RangeFilter } from "./types";
+import type {
+  BusinessDetail,
+  GlobalNumberOption,
+  Overview,
+  RangeFilter,
+} from "./types";
+import { ALL_TIME } from "./types";
 import { AdminKeyGate } from "./components/AdminKeyGate";
 import { FilterBar } from "./components/FilterBar";
 import { DetailSkeleton, OverviewSkeleton } from "./components/Skeleton";
@@ -52,9 +58,12 @@ function swrSet(key: string, value: unknown): void {
   swrCache.set(key, value);
 }
 
-/** Serialize the range filter into a stable cache-key fragment. */
+/** Serialize the range filter into a stable cache-key fragment.
+ *  A null preset with no `from` means ALL TIME (the funnel's default) and must
+ *  NOT collapse to "d30", or the two would share one cache entry. */
 function filterKey(f: RangeFilter): string {
-  return f.from ? `${f.from}~${f.to ?? "now"}` : `d${f.preset ?? 30}`;
+  if (f.from) return `${f.from}~${f.to ?? "now"}`;
+  return f.preset ? `d${f.preset}` : "all";
 }
 
 function useFetch<T>(
@@ -118,27 +127,47 @@ function ErrorPanel({ message }: { message: string }) {
 function OverviewRoute({
   filter,
   includeTest,
+  globalDevice,
+  funnelRange,
+  onFunnelRangeChange,
+  onGlobalNumbers,
   onAuthFail,
 }: {
   filter: RangeFilter;
   includeTest: boolean;
+  globalDevice: string | null;
+  funnelRange: RangeFilter;
+  onFunnelRangeChange: (f: RangeFilter) => void;
+  /** lifts the available numbers up so the shell's filter row can render them */
+  onGlobalNumbers: (options: GlobalNumberOption[]) => void;
   onAuthFail: () => void;
 }) {
   const fetcher = useCallback(
-    () => fetchOverview(filter, includeTest),
-    [filter, includeTest],
+    () => fetchOverview(filter, includeTest, globalDevice, funnelRange),
+    [filter, includeTest, globalDevice, funnelRange],
   );
   const { data, loading, error } = useFetch<Overview>(
     fetcher,
     onAuthFail,
-    `ov:${filterKey(filter)}:${includeTest}`,
+    `ov:${filterKey(filter)}:${includeTest}:${globalDevice ?? "all"}:f${filterKey(funnelRange)}`,
   );
+
+  // The picker's options come from the response; publish them to the shell.
+  const numbers = data?.globalNumbers;
+  useEffect(() => {
+    if (numbers) onGlobalNumbers(numbers);
+  }, [numbers, onGlobalNumbers]);
 
   if (error) return <ErrorPanel message={error} />;
   if (!data) return <OverviewSkeleton />;
   return (
     <div className={loading ? "is-refetching" : ""}>
-      <OverviewPage data={data} filter={filter} />
+      <OverviewPage
+        data={data}
+        filter={filter}
+        funnelRange={funnelRange}
+        onFunnelRangeChange={onFunnelRangeChange}
+      />
     </div>
   );
 }
@@ -180,6 +209,18 @@ function Shell({ onAuthFail }: { onAuthFail: () => void }) {
     to: null,
   });
   const [includeTest, setIncludeTest] = useState(false);
+  // Global-number scope (null = all numbers). The options list is published by
+  // the overview route, which is the only screen that can be scoped.
+  const [globalDevice, setGlobalDevice] = useState<string | null>(null);
+  const [globalNumbers, setGlobalNumbers] = useState<GlobalNumberOption[]>([]);
+  // The onboarding funnel has its OWN window, defaulting to all time — it is
+  // deliberately not tied to the page's date filter.
+  const [funnelRange, setFunnelRange] = useState<RangeFilter>(ALL_TIME);
+  const handleGlobalNumbers = useCallback((options: GlobalNumberOption[]) => {
+    setGlobalNumbers((prev) =>
+      JSON.stringify(prev) === JSON.stringify(options) ? prev : options,
+    );
+  }, []);
 
   const navLink = ({ isActive }: { isActive: boolean }) =>
     `rounded-md px-2.5 py-1 text-xs font-medium ${
@@ -214,6 +255,9 @@ function Shell({ onAuthFail }: { onAuthFail: () => void }) {
             onFilterChange={setFilter}
             includeTest={isOverview ? includeTest : undefined}
             onIncludeTestChange={isOverview ? setIncludeTest : undefined}
+            globalNumbers={isOverview ? globalNumbers : undefined}
+            globalDevice={isOverview ? globalDevice : undefined}
+            onGlobalDeviceChange={isOverview ? setGlobalDevice : undefined}
           />
         ) : null}
       </header>
@@ -225,6 +269,10 @@ function Shell({ onAuthFail }: { onAuthFail: () => void }) {
               <OverviewRoute
                 filter={filter}
                 includeTest={includeTest}
+                globalDevice={globalDevice}
+                funnelRange={funnelRange}
+                onFunnelRangeChange={setFunnelRange}
+                onGlobalNumbers={handleGlobalNumbers}
                 onAuthFail={onAuthFail}
               />
             }

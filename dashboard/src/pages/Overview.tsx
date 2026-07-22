@@ -20,6 +20,7 @@ import {
 import {
   fmtNumber,
   fmtPercent,
+  fmtPhone,
   fmtRelative,
   fmtDate,
   fmtToken,
@@ -62,9 +63,14 @@ function rise(index: number): React.CSSProperties {
 export function OverviewPage({
   data,
   filter,
+  funnelRange,
+  onFunnelRangeChange,
 }: {
   data: Overview;
   filter: RangeFilter;
+  /** the onboarding funnel's own window (all time by default) */
+  funnelRange: RangeFilter;
+  onFunnelRangeChange: (f: RangeFilter) => void;
 }) {
   const navigate = useNavigate();
   const [quick, setQuick] = useState<QuickFilter>("all");
@@ -121,6 +127,19 @@ export function OverviewPage({
       header: "WhatsApp",
       sortValue: (a) => (a.whatsappPaired ? 1 : 0),
       render: (a) => <PairedBadge paired={a.whatsappPaired} />,
+    },
+    {
+      key: "onboardingNumber",
+      header: "Onboarded via",
+      sortValue: (a) => a.onboardingNumber ?? a.onboardingDeviceId ?? "",
+      render: (a) => (
+        <span
+          className="whitespace-nowrap text-ink-2"
+          title="The global Recepte number this owner started their onboarding chat on"
+        >
+          {a.onboardingNumber ? fmtPhone(a.onboardingNumber) : "—"}
+        </span>
+      ),
     },
     {
       key: "bookings",
@@ -240,6 +259,8 @@ export function OverviewPage({
           <FunnelChart
             stages={data.funnel}
             excludedDemoSessions={data.excludedDemoSessions}
+            range={funnelRange}
+            onRangeChange={onFunnelRangeChange}
           />
         </div>
         <div className="rise h-full" style={rise(3)}>

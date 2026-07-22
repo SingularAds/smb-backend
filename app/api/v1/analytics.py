@@ -47,12 +47,42 @@ def analytics_overview(
     date_from: str | None = Query(None, alias="from", description="Range start (ISO date/datetime, UTC)"),
     date_to: str | None = Query(None, alias="to", description="Range end (ISO date/datetime, UTC; defaults to now)"),
     include_test: bool = Query(False, description="Include QA/demo/test businesses"),
+    global_device: str | None = Query(
+        None,
+        description=(
+            "Scope the whole screen to ONE global onboarding number, by bridge "
+            "session id (e.g. 'smba'). Omit for all numbers combined. The "
+            "available ids are returned in the response's globalNumbers list."
+        ),
+    ),
+    funnel_days: int | None = Query(
+        None, ge=1, le=3650,
+        description="Lookback window for the ONBOARDING FUNNEL only. Omit (with no funnel_from) for all time.",
+    ),
+    funnel_from: str | None = Query(
+        None, description="Funnel-only range start (ISO date/datetime, UTC)",
+    ),
+    funnel_to: str | None = Query(
+        None, description="Funnel-only range end (ISO date/datetime, UTC; defaults to now)",
+    ),
     _: None = Depends(require_admin_key),
 ) -> dict:
     """Platform overview: onboarding funnel, growth trend, aggregate KPIs,
-    and the accounts table."""
+    and the accounts table — optionally scoped to one global number.
+
+    The onboarding funnel carries its OWN date window (funnel_days / funnel_from
+    / funnel_to). When none are supplied the funnel covers ALL TIME, while the
+    rest of the screen still follows days / from / to.
+    """
     start, end = _resolve_range(days, date_from, date_to)
-    return analytics_service.get_platform_overview(start, end, include_test=include_test)
+    if funnel_days is not None or funnel_from is not None:
+        funnel_start, funnel_end = _resolve_range(funnel_days, funnel_from, funnel_to)
+    else:
+        funnel_start = funnel_end = None
+    return analytics_service.get_platform_overview(
+        start, end, include_test=include_test, global_device=global_device,
+        funnel_start=funnel_start, funnel_end=funnel_end,
+    )
 
 
 @router.get("/businesses/{business_id}")

@@ -13,31 +13,38 @@ export function ChartCard({
   srSummary,
   chart,
   table,
+  headerExtra,
 }: {
   title: string;
   subtitle?: string;
   srSummary: string;
   chart: React.ReactNode;
   table: React.ReactNode;
+  /** Optional control rendered beside the chart/table toggle (e.g. a
+   *  per-chart date range). Kept generic so any card can opt in. */
+  headerExtra?: React.ReactNode;
 }) {
   const [view, setView] = useState<"chart" | "table">("chart");
   const summaryId = useId();
   return (
     <section className="card p-4 h-full flex flex-col">
       <div className="mb-3 flex items-start justify-between gap-3">
-        <div>
+        <div className="min-w-0">
           <h2 className="text-sm font-semibold text-ink">{title}</h2>
           {subtitle ? <p className="text-xs text-muted">{subtitle}</p> : null}
         </div>
-        <button
-          type="button"
-          onClick={() => setView(view === "chart" ? "table" : "chart")}
-          className="inline-flex items-center gap-1 rounded border border-hairline px-2 py-1 text-xs text-ink-2 hover:bg-page"
-          aria-pressed={view === "table"}
-        >
-          {view === "chart" ? <TableIcon /> : <ChartIcon />}
-          {view === "chart" ? "View data" : "View chart"}
-        </button>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {headerExtra}
+          <button
+            type="button"
+            onClick={() => setView(view === "chart" ? "table" : "chart")}
+            className="inline-flex items-center gap-1 rounded border border-hairline px-2 py-1 text-xs text-ink-2 hover:bg-page"
+            aria-pressed={view === "table"}
+          >
+            {view === "chart" ? <TableIcon /> : <ChartIcon />}
+            {view === "chart" ? "View data" : "View chart"}
+          </button>
+        </div>
       </div>
       <p id={summaryId} className="sr-only">
         {srSummary}

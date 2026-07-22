@@ -14,21 +14,29 @@ const PRESETS: { value: RangePreset; label: string }[] = [
   { value: 365, label: "Last 12 months" },
 ];
 
-function filterLabel(filter: RangeFilter): string {
+function filterLabel(filter: RangeFilter, allowAllTime: boolean): string {
   if (filter.from) {
     const from = fmtDate(filter.from);
     const to = filter.to ? fmtDate(filter.to) : "today";
     return `${from} – ${to}`;
   }
+  if (!filter.preset && allowAllTime) return "All time";
   return PRESETS.find((p) => p.value === filter.preset)?.label ?? "Last 30 days";
 }
 
 export function DateRangeDropdown({
   filter,
   onChange,
+  // Adds an "All time" option (no window at all). Used by the onboarding
+  // funnel, which defaults to every session ever rather than a lookback.
+  allowAllTime = false,
+  label,
 }: {
   filter: RangeFilter;
   onChange: (f: RangeFilter) => void;
+  allowAllTime?: boolean;
+  /** optional accessible name, e.g. "Funnel date range" */
+  label?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [from, setFrom] = useState(filter.from ?? "");
@@ -60,9 +68,10 @@ export function DateRangeDropdown({
         aria-expanded={open}
         className="inline-flex items-center gap-2 rounded-lg border border-hairline bg-surface px-3 py-1.5 text-xs font-medium text-ink-2 hover:text-ink"
         style={{ boxShadow: "var(--shadow-card)" }}
+        aria-label={label}
       >
         <CalendarIcon className="text-muted" />
-        {filterLabel(filter)}
+        {filterLabel(filter, allowAllTime)}
         <span className={open ? "rotate-180" : ""}>
           <ChevronDownIcon className="text-muted" />
         </span>
@@ -71,11 +80,31 @@ export function DateRangeDropdown({
       {open ? (
         <div
           role="dialog"
-          aria-label="Choose date range"
-          className="absolute left-0 z-40 mt-1.5 w-64 overflow-hidden rounded-lg border border-hairline bg-surface"
+          aria-label={label ?? "Choose date range"}
+          className="absolute right-0 z-40 mt-1.5 w-64 overflow-hidden rounded-lg border border-hairline bg-surface sm:left-0 sm:right-auto"
           style={{ boxShadow: "var(--shadow-modal)" }}
         >
           <ul className="py-1">
+            {allowAllTime ? (
+              <li>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onChange({ preset: null, from: null, to: null });
+                    setOpen(false);
+                  }}
+                  aria-pressed={!filter.preset && !filter.from}
+                  className="flex w-full items-center justify-between px-3 py-2 text-left text-xs text-ink-2 hover:bg-page"
+                >
+                  <span className={!filter.preset && !filter.from ? "font-semibold text-ink" : ""}>
+                    All time
+                  </span>
+                  {!filter.preset && !filter.from ? (
+                    <CheckBoldIcon className="text-accent" />
+                  ) : null}
+                </button>
+              </li>
+            ) : null}
             {PRESETS.map((p) => {
               const active = !filter.from && filter.preset === p.value;
               return (

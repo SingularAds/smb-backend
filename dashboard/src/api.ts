@@ -70,9 +70,23 @@ const apiGet = <T,>(path: string, params: URLSearchParams) =>
 export function fetchOverview(
   filter: RangeFilter,
   includeTest: boolean,
+  globalDevice?: string | null,
+  funnelRange?: RangeFilter | null,
 ): Promise<Overview> {
   const params = rangeParams(filter);
   if (includeTest) params.set("include_test", "true");
+  // Omitted entirely when null → backend returns all numbers combined.
+  if (globalDevice) params.set("global_device", globalDevice);
+  // The funnel carries its own window. Sending NO funnel_* param is what
+  // asks the backend for all time, so an all-time selection stays silent.
+  if (funnelRange) {
+    if (funnelRange.from) {
+      params.set("funnel_from", funnelRange.from);
+      if (funnelRange.to) params.set("funnel_to", funnelRange.to);
+    } else if (funnelRange.preset) {
+      params.set("funnel_days", String(funnelRange.preset));
+    }
+  }
   return apiGet<Overview>("/overview", params);
 }
 
