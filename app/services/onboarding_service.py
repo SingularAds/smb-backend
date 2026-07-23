@@ -2443,10 +2443,25 @@ class OnboardingService:
         # _send() reads it and falls back to the default device when unset.
         # Only trusts a recognised onboarding device (never a stray device_id).
         onb_device = device_id if global_numbers.is_onboarding_device(device_id) else None
-        if onb_device and session and session.get("onboardingDeviceId") != onb_device:
-            # Existing session → update() merges this field in safely.
-            db.upsert_onboarding_session(phone, {"onboardingDeviceId": onb_device})
-            session["onboardingDeviceId"] = onb_device
+        if onb_device and session:
+            # Store the NUMBER (immutable phone digits) alongside the device id
+            # (a mutable bridge pointer) so analytics can attribute this session
+            # to the number it actually arrived on even after the device is
+            # later re-pointed. Also self-heals a pre-existing session that never
+            # captured a number — but ONLY when we actually have a number to
+            # write, so an un-configured device (no digits) can't trigger a
+            # redundant Firestore write on every inbound message.
+            _onb_number = global_numbers.number_for_device(onb_device) or None
+            _device_changed = session.get("onboardingDeviceId") != onb_device
+            _needs_number = bool(_onb_number) and not session.get("onboardingNumber")
+            if _device_changed or _needs_number:
+                # update() merges these fields in safely on the existing doc.
+                db.upsert_onboarding_session(phone, {
+                    "onboardingDeviceId": onb_device,
+                    "onboardingNumber": _onb_number,
+                })
+                session["onboardingDeviceId"] = onb_device
+                session["onboardingNumber"] = _onb_number
 
         # 2. Look up existing business BEFORE the recepte activation check.
         #    EC10: prevents re-triggering onboarding for an owner who already
@@ -2898,6 +2913,10 @@ class OnboardingService:
             # -number support). Included here so a brand-new session records it
             # even on the reset/new-business path; _send() replies from it.
             "onboardingDeviceId": onboarding_device or None,
+            # Immutable phone digits of that number, captured now so analytics
+            # attribution survives a later device→number re-point (the device id
+            # is only a live routing pointer).
+            "onboardingNumber": global_numbers.number_for_device(onboarding_device) or None,
             # Acquisition attribution (canonical — see app/services/attribution.py)
             "attribution": attribution,
             # Sales-phase tracking. Ad-sourced leads first go through a Global-KB
@@ -3068,7 +3087,10 @@ class OnboardingService:
         # always creates the full session a few lines below, so this never leaves
         # a stray doc behind).
         if onboarding_device:
-            db.upsert_onboarding_session(phone, {"onboardingDeviceId": onboarding_device})
+            db.upsert_onboarding_session(phone, {
+                "onboardingDeviceId": onboarding_device,
+                "onboardingNumber": global_numbers.number_for_device(onboarding_device) or None,
+            })
 
         logger.info("[RECEPTE] Showing lead confirmation for %s: businessName=%r", phone, biz_name)
         print(f"[LEAD-LOOKUP] Sending confirmation card to {phone}: businessName={biz_name!r}")
@@ -3097,6 +3119,7 @@ class OnboardingService:
             "businessId": None,
             "lastMessageId": message_id,
             "onboardingDeviceId": onboarding_device or None,
+            "onboardingNumber": global_numbers.number_for_device(onboarding_device) or None,
             "recepteLeadData": lead,
             "registrationSource": "recepte.co",
             "attribution": attribution,
