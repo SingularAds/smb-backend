@@ -544,3 +544,73 @@ class WhatsmeowClient:
                     exc.response.status_code, phone, device, exc.response.text[:200],
                 )
                 raise
+
+    async def send_video_note(
+        self,
+        phone: str,
+        video_bytes: bytes,
+        device_id: str | None = None,
+        mime_type: str = "video/mp4",
+        ptv: bool = True,
+        seconds: int = 0,
+        width: int = 0,
+        height: int = 0,
+    ) -> dict:
+        """Send an MP4 video via the bridge.
+
+        With ``ptv=True`` (default) it is delivered as a WhatsApp *video note* —
+        the round, tap-to-play bubble — which WhatsApp only renders correctly for
+        SHORT (≤60s), SQUARE clips. With ``ptv=False`` it is a normal video.
+
+        The bridge does NOT transcode video, so ``video_bytes`` must already be a
+        WhatsApp-compatible MP4 (H.264 video + AAC audio).
+        """
+        device = device_id or self.default_device_id
+        jid = _phone_to_jid(phone)
+        video_b64 = base64.b64encode(video_bytes).decode()
+
+        video_field: dict = {"data": video_b64, "mimetype": mime_type}
+        if seconds > 0:
+            video_field["seconds"] = int(seconds)
+        if width > 0:
+            video_field["width"] = int(width)
+        if height > 0:
+            video_field["height"] = int(height)
+
+        async with self._client(timeout=90.0) as client:
+            try:
+                logger.debug(
+                    "→ WhatsApp VIDEO%s to %s (device=%s, %d bytes)",
+                    " NOTE" if ptv else "", jid, device, len(video_bytes),
+                )
+                resp = await client.post(
+                    "/send/message",
+                    json={
+                        "phone": jid,
+                        "type": "video",
+                        "video": video_field,
+                        "ptv": ptv,
+                    },
+                    headers={"X-Device-Id": device},
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                if isinstance(result, dict):
+                    _register_sent_id(result.get("message_id", ""))
+                logger.info(
+                    "[VIDEO] %s sent to %s (device=%s) status=%s",
+                    "note" if ptv else "video", phone, device, resp.status_code,
+                )
+                return result
+            except httpx.ConnectError as exc:
+                logger.error(
+                    "WhatsApp bridge unreachable for video to %s (device=%s): %s",
+                    phone, device, exc,
+                )
+                raise
+            except httpx.HTTPStatusError as exc:
+                logger.error(
+                    "WhatsApp bridge returned %s for video to %s (device=%s): %s",
+                    exc.response.status_code, phone, device, exc.response.text[:200],
+                )
+                raise

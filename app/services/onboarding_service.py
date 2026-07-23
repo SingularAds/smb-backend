@@ -1206,58 +1206,16 @@ _LANGUAGE_DETECTION_CACHE: dict[str, tuple[str, float]] = {}
 # and pre-seeded into _STATIC_TRANSLATION_CACHE below — it must NOT go through
 # machine translation. Other languages fall back to the LLM translator.
 
-# Privacy promise, sent as a short note right after Sofia's introduction (client
-# 2026-07: the GDPR/LGPD reassurance belongs early, when the owner arrives — not
-# buried inside the pre-pairing trust block). Deliberately 2 short lines.
-_PRIVACY_NOTE_EN = (
-    "🔒 Safe Connection - before we start: your data is yours alone. "
-    "we never share our conversations with anyone. (GDPR & LGPD)\n\n"
-    "🔎 Want to check we're real? www.recepte.co"
-)
-_PRIVACY_NOTE_PT = (
-    "🔒 Uma promessa antes de começar: seus dados são só seus. "
-    "Nunca compartilho suas conversas com ninguém. (GDPR e LGPD)\n\n"
-    "🔎 Quer confirmar que a gente é de verdade? www.recepte.co"
-)
-_PRIVACY_NOTE_ES = (
-    "🔒 Una promesa antes de empezar: tus datos son solo tuyos. "
-    "Nunca comparto tus conversaciones con nadie. (GDPR y LGPD)\n\n"
-    "🔎 ¿Quieres comprobar que somos reales? www.recepte.co"
-)
+# NOTE (client 2026-07-23): all proactive trust-building / scam-alert /
+# confidence copy was REMOVED at the client's request. The ONE thing kept is the
+# demo offer (_TRUST_DEMO_OFFER_*), which invites the owner to try Sofia live.
+# The post-greeting privacy note is replaced by an intro VIDEO note (see
+# _maybe_send_intro_video). The QR caption and post-pairing message are trimmed
+# to plain functional instructions with no trust/reassurance language.
 
-# Item 1+3: trust reassurance shown BEFORE the QR/pairing choice, so the QR code
-# is never the first thing the owner sees. Split into two SHORT messages (client
-# 2026-07: "msgs that take the whole screen are a headache") and written in plain,
-# confident language — no jargon, no "Linked Devices" (that name only appears in
-# the QR instructions, where the owner must actually tap it). The GDPR/LGPD line
-# and the "verify us" link moved earlier, into _PRIVACY_NOTE_* after the intro.
-#
-# Message 1 of 2: you stay in control.
-_TRUST_INTERSTITIAL_EN = (
-    "🔒 *You stay in control — always.*\n\n"
-    "It works just like WhatsApp Web: you keep using WhatsApp exactly as you do "
-    "today, and you see every message.\n\n"
-    "✅ Your number stays yours\n"
-    "✅ Disconnect anytime, in 2 taps"
-)
-_TRUST_INTERSTITIAL_PT = (
-    "🔒 *Você no controle — sempre.*\n\n"
-    "Funciona igual ao WhatsApp Web: você continua usando o WhatsApp exatamente "
-    "como hoje, e vê todas as mensagens.\n\n"
-    "✅ Seu número continua seu\n"
-    "✅ Desconecta quando quiser, em 2 toques"
-)
-_TRUST_INTERSTITIAL_ES = (
-    "🔒 *Tú tienes el control — siempre.*\n\n"
-    "Funciona igual que WhatsApp Web: sigues usando WhatsApp exactamente como "
-    "hoy, y ves todos los mensajes.\n\n"
-    "✅ Tu número sigue siendo tuyo\n"
-    "✅ Te desconectas cuando quieras, en 2 toques"
-)
-
-# Message 2 of 2: the low-risk options. Item 2 (demo-before-commitment) is
-# included only when settings.DEMO_WA_NUMBER is configured; {demo_link} is
-# replaced after localization — same placeholder pattern as the calendar link.
+# The demo-before-commitment offer (KEPT). Included only when
+# settings.DEMO_WA_NUMBER is configured; {demo_link} is replaced after
+# localization — same placeholder pattern as the calendar link.
 _TRUST_DEMO_OFFER_EN = (
     "👀 *Want to see it working first?*\n"
     "Try me live — no signup, no connection: {demo_link}"
@@ -1271,95 +1229,41 @@ _TRUST_DEMO_OFFER_ES = (
     "Pruébame en vivo — sin registro, sin conexión: {demo_link}"
 )
 
-# Item 3: naming the spare-number option lowers the stakes even when unused.
-_TRUST_SPARE_NUMBER_EN = "_Prefer to test with a spare number first? That works too._"
-_TRUST_SPARE_NUMBER_PT = "_Prefere testar com um número reserva primeiro? Também funciona._"
-_TRUST_SPARE_NUMBER_ES = "_¿Prefieres probar primero con un número de repuesto? También funciona._"
-
-# Item 5: one trust line under the QR code + "verify us" link.
+# QR caption — scan instruction only (the trust/"verify us" line was removed).
 _QR_CAPTION_EN = (
-    "📲 Scan this QR code in WhatsApp → Settings → Linked Devices → Link a Device\n\n"
-    "🔒 Official connection via Linked Devices. You can disconnect anytime in "
-    "Settings > Linked Devices. Verify us → www.recepte.co"
+    "📲 Scan this QR code in WhatsApp → Settings → Linked Devices → Link a Device"
 )
 _QR_CAPTION_PT = (
-    "📲 Escaneie este código QR no WhatsApp → Configurações → Aparelhos conectados → Conectar um aparelho\n\n"
-    "🔒 Conexão oficial via Aparelhos conectados. Você pode desconectar a qualquer momento em "
-    "Configurações > Aparelhos conectados. Verifique a gente → www.recepte.co"
+    "📲 Escaneie este código QR no WhatsApp → Configurações → Aparelhos conectados → Conectar um aparelho"
 )
 _QR_CAPTION_ES = (
-    "📲 Escanea este código QR en WhatsApp → Ajustes → Dispositivos vinculados → Vincular un dispositivo\n\n"
-    "🔒 Conexión oficial vía Dispositivos vinculados. Puedes desconectarte cuando quieras en "
-    "Ajustes > Dispositivos vinculados. Verifícanos → www.recepte.co"
+    "📲 Escanea este código QR en WhatsApp → Ajustes → Dispositivos vinculados → Vincular un dispositivo"
 )
 
-# Item 6: pairing-code heads-up, REFRAMED — leads with the positive official-
-# feature explanation, then normalises WhatsApp's caution screen, then the
-# explicit "we never ask for an SMS code" disclaimer (#1 scam vector in Brazil).
-_SCAM_WARNING_EN = (
-    "Quick heads-up before we connect 🔒\n\n"
-    "We use WhatsApp's official *Linked Devices* feature — the same one behind WhatsApp Web. "
-    "Your number stays yours, and you can unlink anytime, in 2 taps, from your own phone.\n\n"
-    "WhatsApp may show a caution screen saying “This may be a scam”. That's normal — "
-    "it appears whenever you link with a code instead of scanning a QR.\n\n"
-    "⚠️ Important: we will *never* ask you for an SMS verification code. Nobody legitimate does.\n\n"
-    "🔎 Verify us: www.recepte.co\n\n"
-    "Reply *YES* and let's go 🚀"
-)
-_SCAM_WARNING_PT = (
-    "Um aviso rápido antes de conectar 🔒\n\n"
-    "Usamos o recurso oficial *Aparelhos conectados* do WhatsApp — o mesmo do WhatsApp Web. "
-    "Seu número continua seu, e você desvincula quando quiser, em 2 toques, direto do seu celular.\n\n"
-    "O WhatsApp pode mostrar uma tela dizendo “Isso pode ser um golpe”. É normal — "
-    "aparece sempre que você conecta com código em vez de escanear o QR.\n\n"
-    "⚠️ Importante: nós *nunca* pedimos código de verificação por SMS. Ninguém legítimo pede.\n\n"
-    "🔎 Verifique a gente: www.recepte.co\n\n"
-    "Responda *SIM* e vamos lá 🚀"
-)
-_SCAM_WARNING_ES = (
-    "Un aviso rápido antes de conectar 🔒\n\n"
-    "Usamos la función oficial *Dispositivos vinculados* de WhatsApp — la misma de WhatsApp Web. "
-    "Tu número sigue siendo tuyo y puedes desvincularlo cuando quieras, en 2 toques, desde tu teléfono.\n\n"
-    "WhatsApp puede mostrar una pantalla que dice “Esto puede ser una estafa”. Es normal — "
-    "aparece siempre que vinculas con un código en lugar de escanear el QR.\n\n"
-    "⚠️ Importante: *nunca* te pediremos un código de verificación por SMS. Nadie legítimo lo pide.\n\n"
-    "🔎 Verifícanos: www.recepte.co\n\n"
-    "Responde *SÍ* y vamos 🚀"
-)
-
-# Items 7+8: first message after successful pairing — reassurance + control
-# first (not features), then the guided self-test invitation.
+# First message after successful pairing — plain confirmation + the self-test
+# invite (the "disconnect anytime / your number stays yours" reassurance was
+# removed).
 _PAIRED_SUCCESS_EN = (
-    "✅ Connected! I'm Sofia — we're officially a team now 🤝\n\n"
-    "Remember: you can disconnect me anytime, in 2 taps, in WhatsApp → Settings → Linked Devices. "
-    "Your number stays yours and you see everything, always.\n\n"
-    "Want to see how I treat your customers? Ask a friend or family member to message your "
+    "✅ Connected! I'm Sofia — we're a team now 🤝\n\n"
+    "Want to see how I treat your customers? Ask a friend to message your "
     "business number and watch me reply ✨ Or just send *test* here for a quick preview."
 )
 _PAIRED_SUCCESS_PT = (
-    "✅ Conectado! Sou a Sofia — agora somos oficialmente um time 🤝\n\n"
-    "Lembre-se: você pode me desconectar a qualquer momento, em 2 toques, em WhatsApp → "
-    "Configurações → Aparelhos conectados. Seu número continua seu e você vê tudo, sempre.\n\n"
-    "Quer ver como eu atendo seus clientes? Peça pra um amigo ou familiar mandar mensagem "
+    "✅ Conectado! Sou a Sofia — agora somos um time 🤝\n\n"
+    "Quer ver como eu atendo seus clientes? Peça pra um amigo mandar mensagem "
     "pro número do seu negócio e veja eu responder ✨ Ou manda *teste* aqui pra uma prévia rápida."
 )
 _PAIRED_SUCCESS_ES = (
-    "✅ ¡Conectado! Soy Sofia — ahora somos oficialmente un equipo 🤝\n\n"
-    "Recuerda: puedes desconectarme cuando quieras, en 2 toques, en WhatsApp → Ajustes → "
-    "Dispositivos vinculados. Tu número sigue siendo tuyo y lo ves todo, siempre.\n\n"
-    "¿Quieres ver cómo atiendo a tus clientes? Pide a un amigo o familiar que escriba al "
+    "✅ ¡Conectado! Soy Sofia — ahora somos un equipo 🤝\n\n"
+    "¿Quieres ver cómo atiendo a tus clientes? Pide a un amigo que escriba al "
     "número de tu negocio y mira cómo respondo ✨ O envía *test* aquí para una vista previa."
 )
 
-# Pre-seed the static translation cache so PT-BR / ES trust copy is served
+# Pre-seed the static translation cache so PT-BR / ES copy is served
 # verbatim (hand-written, client-approved) instead of machine-translated.
 for _en_txt, _pt_txt, _es_txt in (
-    (_PRIVACY_NOTE_EN, _PRIVACY_NOTE_PT, _PRIVACY_NOTE_ES),
-    (_TRUST_INTERSTITIAL_EN, _TRUST_INTERSTITIAL_PT, _TRUST_INTERSTITIAL_ES),
     (_TRUST_DEMO_OFFER_EN, _TRUST_DEMO_OFFER_PT, _TRUST_DEMO_OFFER_ES),
-    (_TRUST_SPARE_NUMBER_EN, _TRUST_SPARE_NUMBER_PT, _TRUST_SPARE_NUMBER_ES),
     (_QR_CAPTION_EN, _QR_CAPTION_PT, _QR_CAPTION_ES),
-    (_SCAM_WARNING_EN, _SCAM_WARNING_PT, _SCAM_WARNING_ES),
     (_PAIRED_SUCCESS_EN, _PAIRED_SUCCESS_PT, _PAIRED_SUCCESS_ES),
 ):
     _STATIC_TRANSLATION_CACHE[("pt", _en_txt)] = _pt_txt
@@ -2272,6 +2176,10 @@ class OnboardingService:
     complete business profile.  Only the pairing step remains code-driven.
     """
 
+    # Process-wide cache for the intro video note bytes, keyed by URL, so the
+    # clip is downloaded once per process rather than once per onboarding.
+    _intro_video_cache: dict = {}
+
     def __init__(self) -> None:
         self.wa = WhatsmeowClient()
         self.ai = AIService()
@@ -2921,7 +2829,7 @@ class OnboardingService:
         url = _extract_url(body)
         if url:
             await self._handle_website_url(session_data, phone, url, push_name)
-            await self._maybe_send_privacy_note(phone, lang, session_data)
+            await self._maybe_send_intro_video(phone, lang, session_data)
             return
 
         # Fast-path: if first message is a demo request (e.g. from the "feel it
@@ -2942,7 +2850,7 @@ class OnboardingService:
                 "askedForLink": True,
             })
             await self._send(phone, reply)
-            await self._maybe_send_privacy_note(phone, lang, session_data)
+            await self._maybe_send_intro_video(phone, lang, session_data)
             logger.info("[ONBOARDING] Link request sent for %s (start intent)", phone)
             return
 
@@ -2959,8 +2867,8 @@ class OnboardingService:
         })
 
         await self._send(phone, clean_reply)
-        # Privacy promise right after Sofia's introduction (client 2026-07).
-        await self._maybe_send_privacy_note(phone, lang, session_data)
+        # Intro video note right after Sofia's greeting (client 2026-07-23).
+        await self._maybe_send_intro_video(phone, lang, session_data)
         logger.info("Onboarding started for %s (lang=%s, pushName=%s)", phone, lang, push_name)
 
     # ── recepte.co onboarding path ────────────────────────────────────────
@@ -6193,42 +6101,29 @@ class OnboardingService:
         """Ask the owner whether they want to link via QR code (another device)
         or via pairing code (same phone), then transition to the appropriate sub-step.
 
-        Before the choice, a "Como funciona" trust interstitial is sent (client
-        trust spec item 1) so the QR/pairing ask is never the first thing the
-        owner sees. Shown once per onboarding; skipped on reconnects.
+        The trust interstitial that used to precede this was REMOVED (client
+        2026-07-23). Only the demo offer is kept, sent once before the choice.
         """
         db.upsert_onboarding_session(phone, {"currentStep": "pairing_mode_choice"})
         lang = session.get("language", "en")
 
-        # ── Trust interstitial (items 1, 2, 3) ────────────────────────────
-        # Sent as two SHORT messages instead of one wall of text (client 2026-07):
-        #   1. you stay in control
-        #   2. your low-risk options — try the demo / use a spare number
+        # ── Demo offer (KEPT — the only pre-pairing message that remains) ─────
+        # A DIRECT wa.me link straight into the demo chat. It MUST point at the
+        # DEDICATED demo number (settings.DEMO_WA_NUMBER — a separate global demo
+        # line), never the onboarding number, or the link would just reopen THIS
+        # chat. The pre-filled text is localized to the owner's conversation
+        # language. When no demo number is configured the offer is simply omitted.
         if not session.get("reconnectMode") and not session.get("trustInterstitialShown"):
-            await self._send(phone, await self._localize_static(_TRUST_INTERSTITIAL_EN, "", lang))
-            await asyncio.sleep(1)
-
-            # "Feel it first" demo link — a DIRECT wa.me link straight into the
-            # demo chat (client 2026-07 reverted the recepte.co/demo hop: fewer
-            # steps for the owner). It MUST point at the DEDICATED demo number
-            # (settings.DEMO_WA_NUMBER — a separate global demo line), never the
-            # onboarding number, or the link would just reopen THIS chat. The
-            # pre-filled text is localized to the owner's conversation language.
-            # When no demo number is configured the demo line is simply omitted.
-            options_msg = await self._localize_static(_TRUST_SPARE_NUMBER_EN, "", lang)
             demo_number = settings.DEMO_WA_NUMBER
             if demo_number:
                 prefill = _demo_prefill_text(lang)
                 demo_link = f"https://wa.me/{demo_number}?text={quote(prefill)}"
                 demo_offer = await self._localize_static(_TRUST_DEMO_OFFER_EN, "", lang)
-                options_msg = (
-                    f"{demo_offer.replace('{demo_link}', demo_link)}\n\n{options_msg}"
-                )
-            await self._send(phone, options_msg)
+                await self._send(phone, demo_offer.replace("{demo_link}", demo_link))
+                await asyncio.sleep(1)
 
             db.upsert_onboarding_session(phone, {"trustInterstitialShown": True})
             session["trustInterstitialShown"] = True
-            await asyncio.sleep(1)
 
         msg = (
             f"🎉 {biz_name} is officially LIVE! Big moment 🥳 "
@@ -6440,29 +6335,16 @@ class OnboardingService:
         )
 
     async def _start_scam_warning(self, session: dict, phone: str) -> None:
-        """Send the regulatory scam-warning required before generating a
-        pairing code, then transition to ``pairing_scam_warning`` step.
+        """Go straight to the pairing code.
 
-        Once an owner has acknowledged the warning at least once (either on
-        the business doc or stored on the onboarding session), we skip it on
-        every subsequent re-link / unlink-re-link cycle and go straight to
-        the pairing code. The owner has already seen the message.
+        Client 2026-07-23: the scam / "we never ask for an SMS code" warning was
+        REMOVED. This method is kept (callers unchanged) but now simply generates
+        the pairing code — no warning message, no YES gate. The
+        ``pairing_scam_warning`` step + handler stay only so any session already
+        parked there before this change can still complete on a YES.
         """
-        if self._scam_warning_already_acknowledged(session):
-            logger.info(
-                "[PAIRING] scam warning already acknowledged — skipping for phone=%s",
-                phone,
-            )
-            db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
-            await self._send_pairing_code(session, phone)
-            return
-
-        db.upsert_onboarding_session(phone, {"currentStep": "pairing_scam_warning"})
-        # Reframed copy (client trust spec item 6): positive official-feature
-        # explanation first, then the caution-screen heads-up, then the explicit
-        # "we never ask for an SMS code" disclaimer — the #1 scam vector in Brazil.
-        msg = await self._localize_static(_SCAM_WARNING_EN, "", session.get("language", "en"))
-        await self._send(phone, msg)
+        db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
+        await self._send_pairing_code(session, phone)
 
     def _scam_warning_already_acknowledged(self, session: dict | None) -> bool:
         """True if this owner has already confirmed the scam warning before.
@@ -8468,26 +8350,68 @@ class OnboardingService:
 
     # ── messaging ─────────────────────────────────────────────────────────
 
-    async def _maybe_send_privacy_note(
+    async def _maybe_send_intro_video(
         self, phone: str, lang: str, session: dict | None = None
     ) -> None:
-        """Send the short privacy promise once, right after Sofia's introduction.
+        """Send the intro VIDEO NOTE once, right after Sofia's first greeting.
 
-        Client 2026-07: the GDPR/LGPD + "verify us" reassurance belongs here, when
-        the owner first arrives, instead of inside the pre-pairing trust block
-        (which had grown into a full-screen wall of text). One short message, at
-        most once per session — never repeated, never blocks the flow on failure.
+        Client 2026-07-23: replaces the old post-greeting privacy note with a
+        round video note (like the ones WhatsApp records). The clip is fetched
+        from settings.ONBOARDING_VIDEO_NOTE_URL (an already-WhatsApp-ready MP4,
+        e.g. on S3) and cached in memory. Sent at most once per session, from the
+        SAME global number the owner is messaging, and NEVER blocks or breaks the
+        onboarding flow on any failure. When no URL is configured this is a no-op,
+        so onboarding is unaffected until the video is provisioned.
         """
-        if (session or {}).get("privacyNoteShown"):
+        if not settings.ONBOARDING_VIDEO_NOTE_URL:
             return
+        if (session or {}).get("introVideoShown"):
+            return
+        # Mark shown up-front so a slow download can't cause a double-send on a
+        # rapid second message; a failure below is logged, not retried in-band.
+        db.upsert_onboarding_session(phone, {"introVideoShown": True})
+        if session is not None:
+            session["introVideoShown"] = True
         try:
+            video_bytes = await self._get_intro_video_bytes()
+            if not video_bytes:
+                return
             await asyncio.sleep(1)
-            await self._send(phone, await self._localize_static(_PRIVACY_NOTE_EN, "", lang))
-            db.upsert_onboarding_session(phone, {"privacyNoteShown": True})
+            device = None
             if session is not None:
-                session["privacyNoteShown"] = True
+                device = session.get("onboardingDeviceId") or None
+            await self.wa.send_video_note(
+                phone, video_bytes, device_id=device,
+                ptv=bool(settings.ONBOARDING_VIDEO_NOTE_PTV),
+            )
         except Exception as exc:
-            logger.error("[ONBOARDING] privacy note failed for %s: %s", phone, exc)
+            logger.error("[ONBOARDING] intro video failed for %s: %s", phone, exc)
+
+    async def _get_intro_video_bytes(self) -> bytes | None:
+        """Fetch (and memoize) the intro video from ONBOARDING_VIDEO_NOTE_URL.
+
+        Cached on the class by URL so we download it once per process, not once
+        per onboarding. Returns None on any download problem.
+        """
+        url = settings.ONBOARDING_VIDEO_NOTE_URL
+        cache = OnboardingService._intro_video_cache
+        if cache.get("url") == url and cache.get("bytes"):
+            return cache["bytes"]
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.content
+            if not data:
+                logger.warning("[ONBOARDING] intro video URL returned empty body: %s", url)
+                return None
+            OnboardingService._intro_video_cache = {"url": url, "bytes": data}
+            logger.info("[ONBOARDING] intro video cached (%d bytes) from %s", len(data), url)
+            return data
+        except Exception as exc:
+            logger.error("[ONBOARDING] could not download intro video from %s: %s", url, exc)
+            return None
 
     async def _send(self, phone: str, message: str) -> None:
         try:
