@@ -149,6 +149,17 @@ class Settings(BaseSettings):
     # language and which demo number to open.
     DEMO_PAGE_URL: str = "https://recepte.co/demo"
 
+    # Intro VIDEO NOTE (round tap-to-play bubble) sent once, right after Sofia's
+    # first greeting (client 2026-07-23 — replaces the old post-greeting privacy
+    # note). ONBOARDING_VIDEO_NOTE_URL must point at an ALREADY WhatsApp-ready MP4
+    # (H.264/AAC, ideally SQUARE and ≤60s for the round bubble) — e.g. a public or
+    # presigned S3 URL. The bridge does NOT transcode video. When empty, no video
+    # is sent (the greeting simply stands alone), so this is safe to leave unset
+    # until the file is uploaded. ONBOARDING_VIDEO_NOTE_PTV=false sends it as a
+    # normal (rectangular) video instead of a round note.
+    ONBOARDING_VIDEO_NOTE_URL: str = ""
+    ONBOARDING_VIDEO_NOTE_PTV: bool = True
+
     # Call-forwarding destination numbers, keyed by country calling code.
     # JSON object stored as a string, e.g.:
     #   CALL_FORWARDING_NUMBERS_JSON='{"351": "+351200010001", "1": "+12125550100", "44": "+441234567890"}'
