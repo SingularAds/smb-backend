@@ -8390,6 +8390,13 @@ class OnboardingService:
     async def _get_intro_video_bytes(self) -> bytes | None:
         """Fetch (and memoize) the intro video from ONBOARDING_VIDEO_NOTE_URL.
 
+        Supports two forms:
+          - "gs://bucket/path.mp4"  — read via the GCS client using this Cloud
+            Run service's own credentials. PREFERRED: the bucket stays private
+            (no public-access-prevention fight needed) — our service account
+            already has storage.objectAdmin on every bucket in the project.
+          - "https://…"             — plain HTTP GET (for a public URL / CDN).
+
         Cached on the class by URL so we download it once per process, not once
         per onboarding. Returns None on any download problem.
         """
@@ -8398,11 +8405,14 @@ class OnboardingService:
         if cache.get("url") == url and cache.get("bytes"):
             return cache["bytes"]
         try:
-            import httpx
-            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
-                data = resp.content
+            if url.startswith("gs://"):
+                data = await asyncio.to_thread(self._download_gcs_blob, url)
+            else:
+                import httpx
+                async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                    data = resp.content
             if not data:
                 logger.warning("[ONBOARDING] intro video URL returned empty body: %s", url)
                 return None
@@ -8412,6 +8422,24 @@ class OnboardingService:
         except Exception as exc:
             logger.error("[ONBOARDING] could not download intro video from %s: %s", url, exc)
             return None
+
+    @staticmethod
+    def _download_gcs_blob(gs_url: str) -> bytes:
+        """Download a "gs://bucket/path" object's bytes.
+
+        Runs synchronously (called via asyncio.to_thread) — the google-cloud-
+        storage client is sync-only. Uses Application Default Credentials, i.e.
+        whatever service account this process is already running as (on Cloud
+        Run: the attached runtime service account — no key file, no public
+        bucket access, and no extra IAM grant needed as long as that service
+        account can read objects in the project, which it already can here).
+        """
+        from google.cloud import storage as gcs_storage
+        without_scheme = gs_url[len("gs://"):]
+        bucket_name, _, blob_path = without_scheme.partition("/")
+        client = gcs_storage.Client()
+        blob = client.bucket(bucket_name).blob(blob_path)
+        return blob.download_as_bytes()
 
     async def _send(self, phone: str, message: str) -> None:
         try:

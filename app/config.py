@@ -152,11 +152,17 @@ class Settings(BaseSettings):
     # Intro VIDEO NOTE (round tap-to-play bubble) sent once, right after Sofia's
     # first greeting (client 2026-07-23 — replaces the old post-greeting privacy
     # note). ONBOARDING_VIDEO_NOTE_URL must point at an ALREADY WhatsApp-ready MP4
-    # (H.264/AAC, ideally SQUARE and ≤60s for the round bubble) — e.g. a public or
-    # presigned S3 URL. The bridge does NOT transcode video. When empty, no video
-    # is sent (the greeting simply stands alone), so this is safe to leave unset
-    # until the file is uploaded. ONBOARDING_VIDEO_NOTE_PTV=false sends it as a
-    # normal (rectangular) video instead of a round note.
+    # (H.264/AAC, ideally SQUARE and ≤60s for the round bubble). The bridge does
+    # NOT transcode video. Two accepted forms:
+    #   "gs://bucket/path.mp4"  — PREFERRED. Read via the GCS client using this
+    #     service's own Cloud Run credentials. The bucket can (and should) stay
+    #     PRIVATE — no public-access-prevention changes needed, since our
+    #     runtime service account already has storage.objectAdmin project-wide.
+    #   "https://…"             — plain HTTP GET, for a public URL / CDN.
+    # When empty, no video is sent (the greeting simply stands alone), so this
+    # is safe to leave unset until the file is uploaded.
+    # ONBOARDING_VIDEO_NOTE_PTV=false sends it as a normal (rectangular) video
+    # instead of a round note.
     ONBOARDING_VIDEO_NOTE_URL: str = ""
     ONBOARDING_VIDEO_NOTE_PTV: bool = True
 
