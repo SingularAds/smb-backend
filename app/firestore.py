@@ -818,11 +818,36 @@ def get_onboarding_session(phone: str) -> dict | None:
     return data
 
 
+def _expand_dotted_keys(data: dict) -> dict:
+    """Expand dot-notation keys into nested dicts for set().
+
+    update() interprets ``"timestamps.lastActivityAt"`` as a nested path, but
+    set() stores it as a LITERAL field name containing a dot — which produced
+    corrupt session docs (seen in prod) whenever the first write for a phone
+    carried a dotted key.
+    """
+    out: dict = {}
+    for key, value in data.items():
+        if "." not in key:
+            out[key] = value
+            continue
+        node = out
+        parts = key.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                break
+        else:
+            node[parts[-1]] = value
+    return out
+
+
 def upsert_onboarding_session(phone: str, data: dict) -> dict:
     """Create or update an onboarding session.
 
     For existing docs, uses update() which supports Firestore dot-notation
-    for nested fields (e.g. ``discovery.name``).  For new docs, uses set().
+    for nested fields (e.g. ``discovery.name``).  For new docs, uses set()
+    with dotted keys expanded to real nested fields first.
     """
     phone_clean = _clean_phone(phone)
     ref = _db().collection("onboarding_sessions").document(phone_clean)
@@ -831,7 +856,7 @@ def upsert_onboarding_session(phone: str, data: dict) -> dict:
     if doc.exists:
         ref.update(data)
     else:
-        ref.set(data)
+        ref.set(_expand_dotted_keys(data))
 
     result = ref.get().to_dict()
     result["id"] = phone_clean

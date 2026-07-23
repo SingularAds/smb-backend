@@ -514,18 +514,53 @@ def _onboarding_turns(session: dict) -> list[dict]:
     return turns
 
 
+def _transcript_turns(owner_phone: str | None) -> list[dict]:
+    """Turns from the append-only ``onboarding_transcripts`` archive.
+
+    The archive records every inbound/outbound message centrally (with real
+    per-turn timestamps), unlike ``conversationHistory`` which the structured
+    onboarding steps never appended to. Empty list on any failure so callers
+    can fall back to the session history.
+    """
+    if not owner_phone:
+        return []
+    try:
+        from app.services.onboarding_transcript import list_transcript
+        entries = list_transcript(owner_phone)
+    except Exception:
+        return []
+    turns: list[dict] = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        text = e.get("content")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        turns.append({
+            "role": "assistant" if e.get("role") == "assistant" else "user",
+            "text": text,
+            "ts": e.get("ts") or None,
+        })
+    return turns
+
+
 def _build_onboarding_chat(session: dict | None, owner_phone: str | None) -> dict | None:
     """Package the onboarding conversation for the dashboard, or None.
 
     Returned even when the owner never paired — that is exactly the case the
     team needs to read. None only when there is no session or it holds no
     renderable messages.
+
+    Prefers the transcript archive (complete, timestamped). Sessions that ran
+    before the archive existed fall back to ``conversationHistory``; for
+    sessions spanning the cutover, whichever source holds MORE turns wins.
     """
-    if not session:
-        return None
-    turns = _onboarding_turns(session)
+    archive_turns = _transcript_turns(owner_phone)
+    session_turns = _onboarding_turns(session) if session else []
+    turns = archive_turns if len(archive_turns) >= len(session_turns) else session_turns
     if not turns:
         return None
+    session = session or {}
     device_id = session_device(session)
     started = _session_started_dt(session)
     return {
@@ -538,6 +573,7 @@ def _build_onboarding_chat(session: dict | None, owner_phone: str | None) -> dic
         "ownerMessageCount": sum(1 for t in turns if t["role"] == "user"),
         "onboardingDeviceId": device_id,
         "onboardingNumber": global_numbers.number_for_device(device_id) or None,
+        "transcriptSource": "archive" if turns is archive_turns else "session",
         "turns": turns,
     }
 

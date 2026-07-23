@@ -30,6 +30,7 @@ from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
 from app.config import settings
 from app import firestore as db
 from app.services import global_numbers
+from app.services import onboarding_transcript as transcript
 from app.integrations import posthog_client
 from app.services.attribution import build_attribution, is_ad_channel
 from app.services.whatsmeow_client import PairingStateConflict, ReachoutTimelocked, WhatsmeowClient
@@ -2424,6 +2425,17 @@ class OnboardingService:
 
         # 1. Check for existing session
         session = db.get_onboarding_session(phone)
+
+        # Archive EVERY inbound owner message, no matter which handler ends up
+        # processing it. conversationHistory is only appended by the free-chat
+        # handlers, so the structured steps (pairing, referral, billing, …)
+        # were invisible to the dashboard before this hook existed.
+        transcript.record_message(
+            phone, "user", body,
+            step=(session or {}).get("currentStep"),
+            kind=message_type,
+            message_id=message_id,
+        )
 
         # Remember which global onboarding number this owner is messaging, so
         # every reply goes back out on the SAME number (multi-global-number
@@ -6181,6 +6193,10 @@ class OnboardingService:
             )
             print(f"[QR] Image sent successfully to {phone}")
             logger.info("[QR] QR image sent to %s (session=%s)", phone, pairing_sid)
+            transcript.record_message(
+                phone, "assistant", f"[QR code image]\n{qr_caption}",
+                step=session.get("currentStep"), kind="image",
+            )
             return True
         except Exception as exc:
             print(f"[QR] send_image FAILED to {phone}: {exc}")
@@ -6399,6 +6415,10 @@ class OnboardingService:
                     caption=qr_caption,
                     mime_type="image/png",
                     device_id=session.get("onboardingDeviceId") or self.wa.default_device_id,
+                )
+                transcript.record_message(
+                    phone, "assistant", f"[QR code image]\n{qr_caption}",
+                    step=session.get("currentStep"), kind="image",
                 )
                 await asyncio.sleep(1)
                 await self._send(
@@ -8253,8 +8273,13 @@ class OnboardingService:
             return
 
         # ── AI handles everything else (with billing tools) ─────────────
-        history = (session.get("conversationHistory", []) if session else [])[-10:]
+        # Keep the FULL stored history — overwriting it with a trimmed slice
+        # here is what used to erase the onboarding transcript the moment the
+        # owner sent any post-completion message. Only the AI call gets a
+        # short window; storage is capped far higher (Firestore 1MB doc limit).
+        history = list(session.get("conversationHistory", []) if session else [])
         history.append({"role": "user", "content": body})
+        ai_window = history[-11:]
 
         extra_context = (
             f"The owner's business '{biz_name}' is ALREADY LIVE AND FULLY SET UP.\n"
@@ -8273,7 +8298,7 @@ class OnboardingService:
         )
 
         clean_reply = await self._get_post_onboarding_ai_response(
-            history, push, lang, phone, biz, extra_context=extra_context
+            ai_window, push, lang, phone, biz, extra_context=extra_context
         )
 
         history.append({"role": "assistant", "content": clean_reply})
@@ -8284,7 +8309,7 @@ class OnboardingService:
             "currentStep": "post_onboarding",
             "language": lang,
             "businessId": biz_id,
-            "conversationHistory": history[-20:],
+            "conversationHistory": history[-400:],
             "lastMessageId": message_id,
             "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
         })
@@ -8525,6 +8550,13 @@ class OnboardingService:
                 logger.exception("Onboarding AI -> (logging failed)")
             try:
                 await self.wa.send_message(phone, message, device_id=onb_device)
+                # Archive every outbound Sofia message centrally — most step
+                # handlers never touch conversationHistory, so this hook is
+                # what makes the dashboard transcript complete.
+                transcript.record_message(
+                    phone, "assistant", message,
+                    step=session.get("currentStep") if session else None,
+                )
             except ReachoutTimelocked as exc:
                 # Cold-contact rate-limit. The reply was NOT delivered. We log
                 # this distinctly so it's separable from real bridge crashes in
@@ -8534,6 +8566,11 @@ class OnboardingService:
                 logger.warning(
                     "[463] Onboarding reply NOT delivered to %s (retry_after=%ds): %s",
                     phone, exc.retry_after_seconds, message[:120],
+                )
+                transcript.record_message(
+                    phone, "assistant", message,
+                    step=session.get("currentStep") if session else None,
+                    delivered=False,
                 )
                 try:
                     db.upsert_onboarding_session(phone, {
