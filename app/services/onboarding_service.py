@@ -2790,6 +2790,7 @@ class OnboardingService:
         lang_override: str | None = None,
         referral: dict | None = None,
         onboarding_device: str | None = None,
+        onboarding_number: str | None = None,
     ) -> None:
         lang = lang_override
         if not lang:
@@ -2823,8 +2824,11 @@ class OnboardingService:
             "onboardingDeviceId": onboarding_device or None,
             # Immutable phone digits of that number, captured now so analytics
             # attribution survives a later device→number re-point (the device id
-            # is only a live routing pointer).
-            "onboardingNumber": global_numbers.number_for_device(onboarding_device) or None,
+            # is only a live routing pointer). A caller carrying a previously
+            # captured number (e.g. the new-biz-confirm wipe) passes it through
+            # so history is preserved verbatim, not re-derived.
+            "onboardingNumber": onboarding_number
+            or global_numbers.number_for_device(onboarding_device) or None,
             # Acquisition attribution (canonical — see app/services/attribution.py)
             "attribution": attribution,
             # Sales-phase tracking. Ad-sourced leads first go through a Global-KB
@@ -5659,6 +5663,23 @@ class OnboardingService:
         if session.get("attribution"):
             business_data["attribution"] = session["attribution"]
 
+        # Global-number attribution — denormalized onto the business doc so it
+        # SURVIVES the session doc (sessions can be wiped: new-biz confirm, or
+        # manual cleanup during testing). Without this, analytics can only
+        # attribute a business via ownerPhone → session, and a deleted session
+        # silently turns the business "unattributed" (invisible under the
+        # per-number dashboard filter). Same denormalize-at-creation pattern as
+        # ``attribution`` above. The number is the immutable digits captured at
+        # onboarding time — never re-derived from the mutable device registry.
+        _onb_dev = (session.get("onboardingDeviceId") or "").strip()
+        _onb_num = (session.get("onboardingNumber") or "").strip() or (
+            global_numbers.number_for_device(_onb_dev) if _onb_dev else ""
+        )
+        if _onb_dev:
+            business_data["onboardingDeviceId"] = _onb_dev
+        if _onb_num:
+            business_data["onboardingNumber"] = _onb_num
+
         existing_business_id = session.get("businessId")
         if existing_business_id:
             # User changed details after earlier confirmation → UPDATE the existing doc
@@ -7595,8 +7616,11 @@ class OnboardingService:
                 phone,
             )
             # Preserve which global number this owner is on across the wipe, so
-            # the fresh session still replies from the same number.
+            # the fresh session still replies from the same number. The CAPTURED
+            # number travels too — re-deriving it from the mutable device→number
+            # registry after a re-point would rewrite this owner's history.
             _onb_device = session.get("onboardingDeviceId")
+            _onb_number = session.get("onboardingNumber")
             db.delete_onboarding_session(phone)
             await self._start_new(
                 phone,
@@ -7605,6 +7629,7 @@ class OnboardingService:
                 message_id,
                 lang_override=lang,
                 onboarding_device=_onb_device,
+                onboarding_number=_onb_number,
             )
             return
 

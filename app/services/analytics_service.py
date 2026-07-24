@@ -803,6 +803,15 @@ def business_profile(biz_id: str, biz: dict, now: datetime) -> dict:
         "whatsappPaired": bool(biz.get("waSessionId")),
         "waPhoneNumber": biz.get("waPhoneNumber") or None,
         "isTest": is_test_business(biz_id, biz),
+        # Global-number attribution denormalized onto the business doc at
+        # creation (onboarding_service) so it survives session deletion.
+        # None on businesses created before this capture existed — callers
+        # fall back to the owner's onboarding session for those.
+        "onboardingDeviceId": (biz.get("onboardingDeviceId") or "").strip() or None,
+        "onboardingNumber": (
+            "".join(ch for ch in str(biz.get("onboardingNumber") or "") if ch.isdigit())
+            or None
+        ),
     }
 
 
@@ -934,10 +943,13 @@ def get_platform_overview(
     profiles: dict[str, dict] = {bid: business_profile(bid, b, now) for bid, b in all_businesses}
 
     # ── Global-number attribution ─────────────────────────────────────────────
-    # An onboarding session records the IMMUTABLE number it arrived on
-    # (onboardingNumber); a business inherits its owner's attribution (the
-    # business doc itself stores no number). Attribution/filtering key on the
-    # number, never the mutable device pointer — see session_number().
+    # Two sources, in priority order:
+    #   1. The business doc's own denormalized onboardingNumber/DeviceId
+    #      (stamped at creation — survives session deletion).
+    #   2. The owner's onboarding session (legacy businesses created before the
+    #      stamp existed; the session can be wiped, hence source 1).
+    # Attribution/filtering key on the immutable NUMBER, never the mutable
+    # device pointer — see session_number().
     sessions = loaded["sessions"]
     number_by_owner: dict[str, str] = {}
     device_by_owner: dict[str, str] = {}
@@ -954,12 +966,16 @@ def get_platform_overview(
         return device_by_owner.get(profile.get("ownerPhone") or "", UNATTRIBUTED_DEVICE)
 
     for _bid, _p in profiles.items():
-        _num = account_number(_p)
-        _p["onboardingDeviceId"] = account_device(_p)
-        # Public field: real digits, or None for a session with no captured
-        # number. This IS the matching key (no internal sentinel field is added
-        # to the profile, so nothing extra leaks into the accounts payload).
-        _p["onboardingNumber"] = None if _num == UNATTRIBUTED_DEVICE else _num
+        # Business-doc stamp wins (survives session deletion); session fallback.
+        if not _p["onboardingDeviceId"]:
+            _p["onboardingDeviceId"] = account_device(_p)
+        # Public field: real digits, or None when neither the business doc nor
+        # the owner's session captured a number. This IS the matching key (no
+        # internal sentinel field is added to the profile, so nothing extra
+        # leaks into the accounts payload).
+        if not _p["onboardingNumber"]:
+            _num = account_number(_p)
+            _p["onboardingNumber"] = None if _num == UNATTRIBUTED_DEVICE else _num
 
     # What the selected filter value scopes the screen to (immutable number).
     target_number = resolve_target_number(global_device)
@@ -1477,13 +1493,18 @@ def get_business_detail(
     else:
         profile["lastOwnerActivityAt"] = None
         profile["onboardingStep"] = None
-    # Which global onboarding number this owner talks to us on. Use the IMMUTABLE
-    # number captured on the session (session_number), NOT a live device→number
-    # lookup — otherwise this screen would show a different number than the
-    # overview for the same business once a device is re-pointed.
-    profile["onboardingDeviceId"] = session_device(session) if session else None
-    _detail_num = session_number(session) if session else UNATTRIBUTED_DEVICE
-    profile["onboardingNumber"] = None if _detail_num == UNATTRIBUTED_DEVICE else _detail_num
+    # Which global onboarding number this owner talks to us on. Priority matches
+    # the overview: the business doc's own stamp first (survives session
+    # deletion), then the IMMUTABLE number captured on the session
+    # (session_number). NEVER a live device→number lookup — otherwise this
+    # screen would show a different number than the overview for the same
+    # business once a device is re-pointed.
+    if not profile["onboardingDeviceId"]:
+        _detail_dev = session_device(session) if session else UNATTRIBUTED_DEVICE
+        profile["onboardingDeviceId"] = None if _detail_dev == UNATTRIBUTED_DEVICE else _detail_dev
+    if not profile["onboardingNumber"]:
+        _detail_num = session_number(session) if session else UNATTRIBUTED_DEVICE
+        profile["onboardingNumber"] = None if _detail_num == UNATTRIBUTED_DEVICE else _detail_num
 
     # ── The owner's own chat with Sofia on the global number ─────────────────
     # This is the conversation that ONBOARDED them (or stalled part-way). It
