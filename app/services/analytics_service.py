@@ -1146,8 +1146,8 @@ def get_platform_overview(
         p for bid, p in profiles.items()
         if _visible(bid) and _in_range(_parse_dt(p["createdAt"]), start, end)
     ]
-    non_test_created = sum(
-        1 for p in profiles.values()
+    funnel_completed_profiles = [
+        p for p in profiles.values()
         if not p["isTest"]
         # This cross-check feeds the FUNNEL, so it uses the funnel's window —
         # otherwise an all-time funnel would be capped by a 30-day business count.
@@ -1155,8 +1155,32 @@ def get_platform_overview(
         # Respect the global-number filter, or "completed" would count owners
         # who onboarded on a DIFFERENT number and invert the scoped funnel.
         and _profile_matches(p)
-    )
-    stage_counts["completed"] = max(stage_counts["completed"], non_test_created)
+    ]
+
+    # Some of the above are "completed" ONLY via this cross-check: their
+    # owner's onboarding_sessions doc no longer exists (deleted after
+    # completion, or scrubbed manually), so the session loop above never saw
+    # them and never counted them into any stage. Reaching "completed"
+    # necessarily means having passed through every earlier stage too, so
+    # count each of them into started/details_collected/whatsapp_paired as
+    # well — otherwise those bars would undercount relative to "completed"
+    # and relative to the drill-down rows built below (which, once reachable
+    # only through "completed", cascade into every earlier stage's list).
+    session_backed_owner_phones = {
+        entry["phone"]
+        for entries in stage_sessions.values()
+        for entry in entries
+        if entry.get("phone")
+    }
+    reconstructed_profiles = [
+        p for p in funnel_completed_profiles
+        if p.get("ownerPhone") and p["ownerPhone"] not in session_backed_owner_phones
+    ]
+    for _ in reconstructed_profiles:
+        stage_counts["started"] += 1
+        stage_counts["details_collected"] += 1
+        stage_counts["whatsapp_paired"] += 1
+    stage_counts["completed"] = max(stage_counts["completed"], len(funnel_completed_profiles))
 
     # Authoritative per-channel "completed": businesses carrying an
     # attribution.channel that were created in range (visible only). Feeds the
@@ -1188,6 +1212,32 @@ def get_platform_overview(
         "whatsapp_paired": "WhatsApp paired",
         "completed": "Fully onboarded (business created)",
     }
+    # Drill-down rows for the reconstructed completions counted above — built
+    # straight from the business record since no onboarding_sessions doc
+    # survives for these owners. Appended to "completed" only; the cumulative
+    # merge below cascades each row into every earlier stage's list too.
+    biz_raw_by_id = dict(all_businesses)
+    for p in reconstructed_profiles:
+        raw_attribution = biz_raw_by_id.get(p["id"], {}).get("attribution")
+        attribution = raw_attribution if isinstance(raw_attribution, dict) else {}
+        stage_sessions["completed"].append({
+            "phone": p["ownerPhone"],
+            "name": p.get("ownerName"),
+            "businessName": p.get("name"),
+            "currentStep": None,
+            "startedAt": p.get("createdAt"),
+            "businessId": p.get("id"),
+            "onboardingDeviceId": p.get("onboardingDeviceId"),
+            "onboardingNumber": p.get("onboardingNumber"),
+            "channel": attribution.get("channel"),
+            "adId": attribution.get("adId"),
+            "campaign": attribution.get("campaign"),
+            # No live onboarding_sessions doc backs this row — rebuilt from
+            # the business record. Surfaced to the UI so it can be labeled
+            # instead of looking like an ordinary session.
+            "reconstructed": True,
+        })
+
     # Make stage_sessions cumulative to match stage_counts.
     # A session in the "completed" bucket must also appear when the user clicks
     # "WhatsApp paired", "Business details collected", or "Started chatting"

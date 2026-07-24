@@ -21,6 +21,9 @@ export interface FunnelSessionEntry {
   channel?: string | null;
   adId?: string | null;
   campaign?: string | null;
+  /** true when there is no live onboarding_sessions doc for this owner (it was
+   *  deleted after completion) — the row is rebuilt from the business record. */
+  reconstructed?: boolean;
 }
 
 /** One selectable global onboarding number (bridge session + phone). */
