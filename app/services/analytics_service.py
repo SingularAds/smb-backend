@@ -204,12 +204,56 @@ UNATTRIBUTED_DEVICE = "_unattributed"
 
 
 def session_device(session: dict) -> str:
-    """Which global number this onboarding session arrived on.
+    """Which bridge device this onboarding session arrived on.
 
     Returns the bridge/session id (e.g. "smba"), or UNATTRIBUTED_DEVICE for
-    sessions that predate multi-number support.
+    sessions that predate multi-number support. NOTE: a device id is a MUTABLE
+    pointer — the phone number behind it can be re-assigned — so it must not be
+    used for historical number attribution. Use ``session_number`` for that.
     """
     return (session.get("onboardingDeviceId") or "").strip() or UNATTRIBUTED_DEVICE
+
+
+def session_number(session: dict) -> str:
+    """The immutable global NUMBER this onboarding session arrived on.
+
+    Prefers the phone digits captured on the session at onboarding time
+    (``onboardingNumber``) — stable even after the bridge device is later
+    re-pointed to a different number. We deliberately do NOT fall back to
+    deriving the number from the live device→number registry: that map is
+    mutable, so deriving it would silently re-attribute every historical
+    session on a device to whatever number the device points to TODAY (the
+    bug this function exists to prevent). Legacy sessions that only recorded a
+    device id are therefore reported as UNATTRIBUTED_DEVICE until a
+    correct-environment backfill stamps their number.
+    """
+    return (session.get("onboardingNumber") or "").strip() or UNATTRIBUTED_DEVICE
+
+
+def resolve_target_number(global_device: str | None) -> str | None:
+    """Map a selected filter value (a bridge device id, as the dashboard still
+    sends) to the immutable number the whole screen should be scoped to.
+
+    - None / ""              → None  (no scoping; all numbers combined)
+    - UNATTRIBUTED_DEVICE    → UNATTRIBUTED_DEVICE  (match sessions with no number)
+    - a configured device    → its number digits
+    - a device with no digits configured, or an unknown id → None, and callers
+      fall back to a raw device-id match so the filter still does *something*
+      sensible for an exotic config.
+    """
+    if not global_device:
+        return None
+    if global_device == UNATTRIBUTED_DEVICE:
+        return UNATTRIBUTED_DEVICE
+    num = global_numbers.number_for_device(global_device)
+    if num:
+        return num
+    # Not a configured device id. The "not configured" dropdown bucket passes
+    # the raw number digits as its filter value (there is no device to name),
+    # so accept an all-digits value as the target number directly.
+    if global_device.isdigit():
+        return global_device
+    return None
 
 
 def global_number_options(
@@ -222,29 +266,39 @@ def global_number_options(
     can see a newly added line exists), plus an "unattributed" bucket when older
     sessions carry no device. Counts are optional and purely informational.
     """
+    # Counts are keyed by immutable NUMBER (or UNATTRIBUTED_DEVICE for sessions
+    # with no captured number) — see session_number(). The filter key exposed to
+    # the frontend stays the bridge ``deviceId`` for backward compatibility; the
+    # backend resolves it to a number (resolve_target_number).
     session_counts = session_counts or {}
     account_counts = account_counts or {}
     options: list[dict] = []
+    seen_numbers: set[str] = set()
     for device_id, number in global_numbers.registry():
+        num_key = number or ""
+        seen_numbers.add(num_key)
         options.append({
             "deviceId": device_id,
             "number": number or None,
             "label": number or device_id,
-            "sessions": session_counts.get(device_id, 0),
-            "accounts": account_counts.get(device_id, 0),
+            "sessions": session_counts.get(num_key, 0),
+            "accounts": account_counts.get(num_key, 0),
         })
-    known = {o["deviceId"] for o in options}
-    # Surface traffic on devices that are no longer configured (renamed/removed)
-    # rather than hiding it — otherwise the numbers would silently not add up.
-    for device_id in sorted(set(session_counts) | set(account_counts)):
-        if device_id in known or device_id == UNATTRIBUTED_DEVICE:
+    # Surface traffic on numbers that are no longer configured (a number whose
+    # device was renamed/removed) rather than hiding it — otherwise the counts
+    # would silently not add up.
+    for num_key in sorted(set(session_counts) | set(account_counts)):
+        if num_key in seen_numbers or num_key == UNATTRIBUTED_DEVICE or not num_key:
             continue
         options.append({
-            "deviceId": device_id,
-            "number": None,
-            "label": f"{device_id} (not configured)",
-            "sessions": session_counts.get(device_id, 0),
-            "accounts": account_counts.get(device_id, 0),
+            # No configured device backs this number; expose the number itself
+            # as the filter value (deviceId stays a non-null, unique, selectable
+            # key — resolve_target_number accepts raw digits).
+            "deviceId": num_key,
+            "number": num_key,
+            "label": f"{num_key} (not configured)",
+            "sessions": session_counts.get(num_key, 0),
+            "accounts": account_counts.get(num_key, 0),
         })
     unattributed = session_counts.get(UNATTRIBUTED_DEVICE, 0)
     unattributed_accounts = account_counts.get(UNATTRIBUTED_DEVICE, 0)
@@ -252,7 +306,7 @@ def global_number_options(
         options.append({
             "deviceId": UNATTRIBUTED_DEVICE,
             "number": None,
-            "label": "Not recorded (before multi-number)",
+            "label": "Not recorded (before per-number capture)",
             "sessions": unattributed,
             "accounts": unattributed_accounts,
         })
@@ -514,19 +568,55 @@ def _onboarding_turns(session: dict) -> list[dict]:
     return turns
 
 
+def _transcript_turns(owner_phone: str | None) -> list[dict]:
+    """Turns from the append-only ``onboarding_transcripts`` archive.
+
+    The archive records every inbound/outbound message centrally (with real
+    per-turn timestamps), unlike ``conversationHistory`` which the structured
+    onboarding steps never appended to. Empty list on any failure so callers
+    can fall back to the session history.
+    """
+    if not owner_phone:
+        return []
+    try:
+        from app.services.onboarding_transcript import list_transcript
+        entries = list_transcript(owner_phone)
+    except Exception:
+        return []
+    turns: list[dict] = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        text = e.get("content")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        turns.append({
+            "role": "assistant" if e.get("role") == "assistant" else "user",
+            "text": text,
+            "ts": e.get("ts") or None,
+        })
+    return turns
+
+
 def _build_onboarding_chat(session: dict | None, owner_phone: str | None) -> dict | None:
     """Package the onboarding conversation for the dashboard, or None.
 
     Returned even when the owner never paired — that is exactly the case the
     team needs to read. None only when there is no session or it holds no
     renderable messages.
+
+    Prefers the transcript archive (complete, timestamped). Sessions that ran
+    before the archive existed fall back to ``conversationHistory``; for
+    sessions spanning the cutover, whichever source holds MORE turns wins.
     """
-    if not session:
-        return None
-    turns = _onboarding_turns(session)
+    archive_turns = _transcript_turns(owner_phone)
+    session_turns = _onboarding_turns(session) if session else []
+    turns = archive_turns if len(archive_turns) >= len(session_turns) else session_turns
     if not turns:
         return None
+    session = session or {}
     device_id = session_device(session)
+    _num = session_number(session)
     started = _session_started_dt(session)
     return {
         "ownerPhone": owner_phone,
@@ -537,7 +627,10 @@ def _build_onboarding_chat(session: dict | None, owner_phone: str | None) -> dic
         "messageCount": len(turns),
         "ownerMessageCount": sum(1 for t in turns if t["role"] == "user"),
         "onboardingDeviceId": device_id,
-        "onboardingNumber": global_numbers.number_for_device(device_id) or None,
+        # Immutable captured number (consistent with the profile header and the
+        # overview); NOT a live device→number lookup that drifts after a re-point.
+        "onboardingNumber": None if _num == UNATTRIBUTED_DEVICE else _num,
+        "transcriptSource": "archive" if turns is archive_turns else "session",
         "turns": turns,
     }
 
@@ -710,6 +803,15 @@ def business_profile(biz_id: str, biz: dict, now: datetime) -> dict:
         "whatsappPaired": bool(biz.get("waSessionId")),
         "waPhoneNumber": biz.get("waPhoneNumber") or None,
         "isTest": is_test_business(biz_id, biz),
+        # Global-number attribution denormalized onto the business doc at
+        # creation (onboarding_service) so it survives session deletion.
+        # None on businesses created before this capture existed — callers
+        # fall back to the owner's onboarding session for those.
+        "onboardingDeviceId": (biz.get("onboardingDeviceId") or "").strip() or None,
+        "onboardingNumber": (
+            "".join(ch for ch in str(biz.get("onboardingNumber") or "") if ch.isdigit())
+            or None
+        ),
     }
 
 
@@ -775,9 +877,13 @@ def get_platform_overview(
     """Funnel + growth + aggregate KPIs + accounts table for Screen 1.
 
     ``global_device`` scopes the ENTIRE screen to prospects/businesses that came
-    in on one global onboarding number (a bridge session id such as "smba", or
-    UNATTRIBUTED_DEVICE). None = all numbers combined (the default, and exactly
-    the previous behaviour).
+    in on one global onboarding number. The dashboard still passes it as a bridge
+    session id (e.g. "smba", or UNATTRIBUTED_DEVICE); internally we resolve it to
+    that number's IMMUTABLE phone digits (resolve_target_number) and match each
+    session on the number it captured at onboarding time — never on the mutable
+    device pointer, so re-pointing a device to a new number can no longer make
+    old sessions leak into the new number's view. None = all numbers combined
+    (the default, and exactly the previous behaviour).
 
     ``funnel_start``/``funnel_end`` scope ONLY the onboarding funnel (and the
     demo-session count shown beside it). Both None — the default — means ALL
@@ -837,23 +943,51 @@ def get_platform_overview(
     profiles: dict[str, dict] = {bid: business_profile(bid, b, now) for bid, b in all_businesses}
 
     # ── Global-number attribution ─────────────────────────────────────────────
-    # An onboarding session records which global number it arrived on; a business
-    # inherits its owner's attribution (the business doc itself stores no device).
+    # Two sources, in priority order:
+    #   1. The business doc's own denormalized onboardingNumber/DeviceId
+    #      (stamped at creation — survives session deletion).
+    #   2. The owner's onboarding session (legacy businesses created before the
+    #      stamp existed; the session can be wiped, hence source 1).
+    # Attribution/filtering key on the immutable NUMBER, never the mutable
+    # device pointer — see session_number().
     sessions = loaded["sessions"]
+    number_by_owner: dict[str, str] = {}
     device_by_owner: dict[str, str] = {}
     for _sess_doc_id, _sess in sessions:
         _owner = (_sess.get("ownerPhone") or _sess_doc_id or "").strip()
         if _owner:
+            number_by_owner[_owner] = session_number(_sess)
             device_by_owner[_owner] = session_device(_sess)
+
+    def account_number(profile: dict) -> str:
+        return number_by_owner.get(profile.get("ownerPhone") or "", UNATTRIBUTED_DEVICE)
 
     def account_device(profile: dict) -> str:
         return device_by_owner.get(profile.get("ownerPhone") or "", UNATTRIBUTED_DEVICE)
 
     for _bid, _p in profiles.items():
-        _p["onboardingDeviceId"] = account_device(_p)
-        _p["onboardingNumber"] = (
-            global_numbers.number_for_device(_p["onboardingDeviceId"]) or None
-        )
+        # Business-doc stamp wins (survives session deletion); session fallback.
+        if not _p["onboardingDeviceId"]:
+            _p["onboardingDeviceId"] = account_device(_p)
+        # Public field: real digits, or None when neither the business doc nor
+        # the owner's session captured a number. This IS the matching key (no
+        # internal sentinel field is added to the profile, so nothing extra
+        # leaks into the accounts payload).
+        if not _p["onboardingNumber"]:
+            _num = account_number(_p)
+            _p["onboardingNumber"] = None if _num == UNATTRIBUTED_DEVICE else _num
+
+    # What the selected filter value scopes the screen to (immutable number).
+    target_number = resolve_target_number(global_device)
+
+    def _profile_matches(p: dict) -> bool:
+        if not global_device:
+            return True
+        if target_number is None:
+            return p["onboardingDeviceId"] == global_device  # exotic config fallback
+        if target_number == UNATTRIBUTED_DEVICE:
+            return p["onboardingNumber"] is None
+        return p["onboardingNumber"] == target_number
 
     # Test filter first, so the per-number counts in the dropdown reflect the
     # same population the table shows (minus the number filter itself).
@@ -863,12 +997,13 @@ def get_platform_overview(
         base_visible_ids = {bid for bid, p in profiles.items() if not p["isTest"]}
     device_account_counts: dict[str, int] = defaultdict(int)
     for bid in base_visible_ids:
-        device_account_counts[profiles[bid]["onboardingDeviceId"]] += 1
+        _num = profiles[bid]["onboardingNumber"]
+        device_account_counts[_num if _num is not None else UNATTRIBUTED_DEVICE] += 1
 
     if global_device:
         visible_ids = {
             bid for bid in base_visible_ids
-            if profiles[bid]["onboardingDeviceId"] == global_device
+            if _profile_matches(profiles[bid])
         }
     else:
         visible_ids = base_visible_ids
@@ -932,15 +1067,20 @@ def get_platform_overview(
         if is_test_session(doc_id, sess):
             continue
         sess_device = session_device(sess)
-        device_match = not global_device or sess_device == global_device
+        sess_number = session_number(sess)
+        if target_number is not None:
+            device_match = not global_device or sess_number == target_number
+        else:
+            device_match = not global_device or sess_device == global_device
         if not is_registration_session(sess):
             # Reported next to the funnel, so it follows the funnel's window.
             if in_funnel and device_match:
                 excluded_demo_sessions += 1
             continue
         # Unfiltered per-number volume (drives the number picker) — main window.
+        # Keyed by immutable number so the picker counts match the filter result.
         if in_main:
-            device_session_counts[sess_device] += 1
+            device_session_counts[sess_number] += 1
         # Scope to one global number when asked.
         if not device_match:
             continue
@@ -976,9 +1116,10 @@ def get_platform_overview(
             "currentStep": sess.get("currentStep"),
             "startedAt": started.isoformat() if started else None,
             "businessId": (biz_data or {}).get("id"),
-            # Which global onboarding number this prospect came in on.
+            # Which global onboarding number this prospect came in on (immutable
+            # captured number; device id kept for routing/debug only).
             "onboardingDeviceId": sess_device,
-            "onboardingNumber": global_numbers.number_for_device(sess_device) or None,
+            "onboardingNumber": None if sess_number == UNATTRIBUTED_DEVICE else sess_number,
             # Acquisition context (present only for attributed sessions).
             "channel": attribution.get("channel"),
             "adId": attribution.get("adId"),
@@ -1005,17 +1146,41 @@ def get_platform_overview(
         p for bid, p in profiles.items()
         if _visible(bid) and _in_range(_parse_dt(p["createdAt"]), start, end)
     ]
-    non_test_created = sum(
-        1 for p in profiles.values()
+    funnel_completed_profiles = [
+        p for p in profiles.values()
         if not p["isTest"]
         # This cross-check feeds the FUNNEL, so it uses the funnel's window —
         # otherwise an all-time funnel would be capped by a 30-day business count.
         and _in_funnel_window(_parse_dt(p["createdAt"]))
         # Respect the global-number filter, or "completed" would count owners
         # who onboarded on a DIFFERENT number and invert the scoped funnel.
-        and (not global_device or p["onboardingDeviceId"] == global_device)
-    )
-    stage_counts["completed"] = max(stage_counts["completed"], non_test_created)
+        and _profile_matches(p)
+    ]
+
+    # Some of the above are "completed" ONLY via this cross-check: their
+    # owner's onboarding_sessions doc no longer exists (deleted after
+    # completion, or scrubbed manually), so the session loop above never saw
+    # them and never counted them into any stage. Reaching "completed"
+    # necessarily means having passed through every earlier stage too, so
+    # count each of them into started/details_collected/whatsapp_paired as
+    # well — otherwise those bars would undercount relative to "completed"
+    # and relative to the drill-down rows built below (which, once reachable
+    # only through "completed", cascade into every earlier stage's list).
+    session_backed_owner_phones = {
+        entry["phone"]
+        for entries in stage_sessions.values()
+        for entry in entries
+        if entry.get("phone")
+    }
+    reconstructed_profiles = [
+        p for p in funnel_completed_profiles
+        if p.get("ownerPhone") and p["ownerPhone"] not in session_backed_owner_phones
+    ]
+    for _ in reconstructed_profiles:
+        stage_counts["started"] += 1
+        stage_counts["details_collected"] += 1
+        stage_counts["whatsapp_paired"] += 1
+    stage_counts["completed"] = max(stage_counts["completed"], len(funnel_completed_profiles))
 
     # Authoritative per-channel "completed": businesses carrying an
     # attribution.channel that were created in range (visible only). Feeds the
@@ -1047,6 +1212,32 @@ def get_platform_overview(
         "whatsapp_paired": "WhatsApp paired",
         "completed": "Fully onboarded (business created)",
     }
+    # Drill-down rows for the reconstructed completions counted above — built
+    # straight from the business record since no onboarding_sessions doc
+    # survives for these owners. Appended to "completed" only; the cumulative
+    # merge below cascades each row into every earlier stage's list too.
+    biz_raw_by_id = dict(all_businesses)
+    for p in reconstructed_profiles:
+        raw_attribution = biz_raw_by_id.get(p["id"], {}).get("attribution")
+        attribution = raw_attribution if isinstance(raw_attribution, dict) else {}
+        stage_sessions["completed"].append({
+            "phone": p["ownerPhone"],
+            "name": p.get("ownerName"),
+            "businessName": p.get("name"),
+            "currentStep": None,
+            "startedAt": p.get("createdAt"),
+            "businessId": p.get("id"),
+            "onboardingDeviceId": p.get("onboardingDeviceId"),
+            "onboardingNumber": p.get("onboardingNumber"),
+            "channel": attribution.get("channel"),
+            "adId": attribution.get("adId"),
+            "campaign": attribution.get("campaign"),
+            # No live onboarding_sessions doc backs this row — rebuilt from
+            # the business record. Surfaced to the UI so it can be labeled
+            # instead of looking like an ordinary session.
+            "reconstructed": True,
+        })
+
     # Make stage_sessions cumulative to match stage_counts.
     # A session in the "completed" bucket must also appear when the user clicks
     # "WhatsApp paired", "Business details collected", or "Started chatting"
@@ -1352,13 +1543,18 @@ def get_business_detail(
     else:
         profile["lastOwnerActivityAt"] = None
         profile["onboardingStep"] = None
-    # Which global onboarding number this owner talks to us on.
-    profile["onboardingDeviceId"] = session_device(session) if session else None
-    profile["onboardingNumber"] = (
-        global_numbers.number_for_device(profile["onboardingDeviceId"]) or None
-        if profile["onboardingDeviceId"]
-        else None
-    )
+    # Which global onboarding number this owner talks to us on. Priority matches
+    # the overview: the business doc's own stamp first (survives session
+    # deletion), then the IMMUTABLE number captured on the session
+    # (session_number). NEVER a live device→number lookup — otherwise this
+    # screen would show a different number than the overview for the same
+    # business once a device is re-pointed.
+    if not profile["onboardingDeviceId"]:
+        _detail_dev = session_device(session) if session else UNATTRIBUTED_DEVICE
+        profile["onboardingDeviceId"] = None if _detail_dev == UNATTRIBUTED_DEVICE else _detail_dev
+    if not profile["onboardingNumber"]:
+        _detail_num = session_number(session) if session else UNATTRIBUTED_DEVICE
+        profile["onboardingNumber"] = None if _detail_num == UNATTRIBUTED_DEVICE else _detail_num
 
     # ── The owner's own chat with Sofia on the global number ─────────────────
     # This is the conversation that ONBOARDED them (or stalled part-way). It

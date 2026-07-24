@@ -30,6 +30,7 @@ from app.integrations.openai_adapter import AsyncOpenAIAnthropicWrapper
 from app.config import settings
 from app import firestore as db
 from app.services import global_numbers
+from app.services import onboarding_transcript as transcript
 from app.integrations import posthog_client
 from app.services.attribution import build_attribution, is_ad_channel
 from app.services.whatsmeow_client import PairingStateConflict, ReachoutTimelocked, WhatsmeowClient
@@ -2333,16 +2334,42 @@ class OnboardingService:
         # 1. Check for existing session
         session = db.get_onboarding_session(phone)
 
+        # Archive EVERY inbound owner message, no matter which handler ends up
+        # processing it. conversationHistory is only appended by the free-chat
+        # handlers, so the structured steps (pairing, referral, billing, …)
+        # were invisible to the dashboard before this hook existed.
+        transcript.record_message(
+            phone, "user", body,
+            step=(session or {}).get("currentStep"),
+            kind=message_type,
+            message_id=message_id,
+        )
+
         # Remember which global onboarding number this owner is messaging, so
         # every reply goes back out on the SAME number (multi-global-number
         # support — app/services/global_numbers.py). Stored on the session;
         # _send() reads it and falls back to the default device when unset.
         # Only trusts a recognised onboarding device (never a stray device_id).
         onb_device = device_id if global_numbers.is_onboarding_device(device_id) else None
-        if onb_device and session and session.get("onboardingDeviceId") != onb_device:
-            # Existing session → update() merges this field in safely.
-            db.upsert_onboarding_session(phone, {"onboardingDeviceId": onb_device})
-            session["onboardingDeviceId"] = onb_device
+        if onb_device and session:
+            # Store the NUMBER (immutable phone digits) alongside the device id
+            # (a mutable bridge pointer) so analytics can attribute this session
+            # to the number it actually arrived on even after the device is
+            # later re-pointed. Also self-heals a pre-existing session that never
+            # captured a number — but ONLY when we actually have a number to
+            # write, so an un-configured device (no digits) can't trigger a
+            # redundant Firestore write on every inbound message.
+            _onb_number = global_numbers.number_for_device(onb_device) or None
+            _device_changed = session.get("onboardingDeviceId") != onb_device
+            _needs_number = bool(_onb_number) and not session.get("onboardingNumber")
+            if _device_changed or _needs_number:
+                # update() merges these fields in safely on the existing doc.
+                db.upsert_onboarding_session(phone, {
+                    "onboardingDeviceId": onb_device,
+                    "onboardingNumber": _onb_number,
+                })
+                session["onboardingDeviceId"] = onb_device
+                session["onboardingNumber"] = _onb_number
 
         # 2. Look up existing business BEFORE the recepte activation check.
         #    EC10: prevents re-triggering onboarding for an owner who already
@@ -2763,6 +2790,7 @@ class OnboardingService:
         lang_override: str | None = None,
         referral: dict | None = None,
         onboarding_device: str | None = None,
+        onboarding_number: str | None = None,
     ) -> None:
         lang = lang_override
         if not lang:
@@ -2794,6 +2822,13 @@ class OnboardingService:
             # -number support). Included here so a brand-new session records it
             # even on the reset/new-business path; _send() replies from it.
             "onboardingDeviceId": onboarding_device or None,
+            # Immutable phone digits of that number, captured now so analytics
+            # attribution survives a later device→number re-point (the device id
+            # is only a live routing pointer). A caller carrying a previously
+            # captured number (e.g. the new-biz-confirm wipe) passes it through
+            # so history is preserved verbatim, not re-derived.
+            "onboardingNumber": onboarding_number
+            or global_numbers.number_for_device(onboarding_device) or None,
             # Acquisition attribution (canonical — see app/services/attribution.py)
             "attribution": attribution,
             # Sales-phase tracking. Ad-sourced leads first go through a Global-KB
@@ -2964,7 +2999,10 @@ class OnboardingService:
         # always creates the full session a few lines below, so this never leaves
         # a stray doc behind).
         if onboarding_device:
-            db.upsert_onboarding_session(phone, {"onboardingDeviceId": onboarding_device})
+            db.upsert_onboarding_session(phone, {
+                "onboardingDeviceId": onboarding_device,
+                "onboardingNumber": global_numbers.number_for_device(onboarding_device) or None,
+            })
 
         logger.info("[RECEPTE] Showing lead confirmation for %s: businessName=%r", phone, biz_name)
         print(f"[LEAD-LOOKUP] Sending confirmation card to {phone}: businessName={biz_name!r}")
@@ -2993,6 +3031,7 @@ class OnboardingService:
             "businessId": None,
             "lastMessageId": message_id,
             "onboardingDeviceId": onboarding_device or None,
+            "onboardingNumber": global_numbers.number_for_device(onboarding_device) or None,
             "recepteLeadData": lead,
             "registrationSource": "recepte.co",
             "attribution": attribution,
@@ -5624,6 +5663,23 @@ class OnboardingService:
         if session.get("attribution"):
             business_data["attribution"] = session["attribution"]
 
+        # Global-number attribution — denormalized onto the business doc so it
+        # SURVIVES the session doc (sessions can be wiped: new-biz confirm, or
+        # manual cleanup during testing). Without this, analytics can only
+        # attribute a business via ownerPhone → session, and a deleted session
+        # silently turns the business "unattributed" (invisible under the
+        # per-number dashboard filter). Same denormalize-at-creation pattern as
+        # ``attribution`` above. The number is the immutable digits captured at
+        # onboarding time — never re-derived from the mutable device registry.
+        _onb_dev = (session.get("onboardingDeviceId") or "").strip()
+        _onb_num = (session.get("onboardingNumber") or "").strip() or (
+            global_numbers.number_for_device(_onb_dev) if _onb_dev else ""
+        )
+        if _onb_dev:
+            business_data["onboardingDeviceId"] = _onb_dev
+        if _onb_num:
+            business_data["onboardingNumber"] = _onb_num
+
         existing_business_id = session.get("businessId")
         if existing_business_id:
             # User changed details after earlier confirmation → UPDATE the existing doc
@@ -6089,6 +6145,10 @@ class OnboardingService:
             )
             print(f"[QR] Image sent successfully to {phone}")
             logger.info("[QR] QR image sent to %s (session=%s)", phone, pairing_sid)
+            transcript.record_message(
+                phone, "assistant", f"[QR code image]\n{qr_caption}",
+                step=session.get("currentStep"), kind="image",
+            )
             return True
         except Exception as exc:
             print(f"[QR] send_image FAILED to {phone}: {exc}")
@@ -6294,6 +6354,10 @@ class OnboardingService:
                     caption=qr_caption,
                     mime_type="image/png",
                     device_id=session.get("onboardingDeviceId") or self.wa.default_device_id,
+                )
+                transcript.record_message(
+                    phone, "assistant", f"[QR code image]\n{qr_caption}",
+                    step=session.get("currentStep"), kind="image",
                 )
                 await asyncio.sleep(1)
                 await self._send(
@@ -7552,8 +7616,11 @@ class OnboardingService:
                 phone,
             )
             # Preserve which global number this owner is on across the wipe, so
-            # the fresh session still replies from the same number.
+            # the fresh session still replies from the same number. The CAPTURED
+            # number travels too — re-deriving it from the mutable device→number
+            # registry after a re-point would rewrite this owner's history.
             _onb_device = session.get("onboardingDeviceId")
+            _onb_number = session.get("onboardingNumber")
             db.delete_onboarding_session(phone)
             await self._start_new(
                 phone,
@@ -7562,6 +7629,7 @@ class OnboardingService:
                 message_id,
                 lang_override=lang,
                 onboarding_device=_onb_device,
+                onboarding_number=_onb_number,
             )
             return
 
@@ -8135,8 +8203,13 @@ class OnboardingService:
             return
 
         # ── AI handles everything else (with billing tools) ─────────────
-        history = (session.get("conversationHistory", []) if session else [])[-10:]
+        # Keep the FULL stored history — overwriting it with a trimmed slice
+        # here is what used to erase the onboarding transcript the moment the
+        # owner sent any post-completion message. Only the AI call gets a
+        # short window; storage is capped far higher (Firestore 1MB doc limit).
+        history = list(session.get("conversationHistory", []) if session else [])
         history.append({"role": "user", "content": body})
+        ai_window = history[-11:]
 
         extra_context = (
             f"The owner's business '{biz_name}' is ALREADY LIVE AND FULLY SET UP.\n"
@@ -8155,7 +8228,7 @@ class OnboardingService:
         )
 
         clean_reply = await self._get_post_onboarding_ai_response(
-            history, push, lang, phone, biz, extra_context=extra_context
+            ai_window, push, lang, phone, biz, extra_context=extra_context
         )
 
         history.append({"role": "assistant", "content": clean_reply})
@@ -8166,7 +8239,7 @@ class OnboardingService:
             "currentStep": "post_onboarding",
             "language": lang,
             "businessId": biz_id,
-            "conversationHistory": history[-20:],
+            "conversationHistory": history[-400:],
             "lastMessageId": message_id,
             "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
         })
@@ -8477,6 +8550,13 @@ class OnboardingService:
                 logger.exception("Onboarding AI -> (logging failed)")
             try:
                 await self.wa.send_message(phone, message, device_id=onb_device)
+                # Archive every outbound Sofia message centrally — most step
+                # handlers never touch conversationHistory, so this hook is
+                # what makes the dashboard transcript complete.
+                transcript.record_message(
+                    phone, "assistant", message,
+                    step=session.get("currentStep") if session else None,
+                )
             except ReachoutTimelocked as exc:
                 # Cold-contact rate-limit. The reply was NOT delivered. We log
                 # this distinctly so it's separable from real bridge crashes in
@@ -8486,6 +8566,11 @@ class OnboardingService:
                 logger.warning(
                     "[463] Onboarding reply NOT delivered to %s (retry_after=%ds): %s",
                     phone, exc.retry_after_seconds, message[:120],
+                )
+                transcript.record_message(
+                    phone, "assistant", message,
+                    step=session.get("currentStep") if session else None,
+                    delivered=False,
                 )
                 try:
                     db.upsert_onboarding_session(phone, {

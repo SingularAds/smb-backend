@@ -99,6 +99,17 @@ export function FunnelDrillModal({
                     </span>
                   ) : null}
 
+                  {/* Reconstructed: no live onboarding session survives for this
+                      owner — this row was rebuilt from the business record. */}
+                  {s.reconstructed ? (
+                    <span
+                      className="rounded-full border border-[var(--hairline)] px-1.5 py-px text-[10px] text-muted"
+                      title="The original onboarding chat session no longer exists (deleted after completion). This row was reconstructed from the business record."
+                    >
+                      reconstructed
+                    </span>
+                  ) : null}
+
                   {/* Acquisition context — campaign / ad id when attributed */}
                   {s.campaign ? (
                     <span
