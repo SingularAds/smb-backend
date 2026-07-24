@@ -166,6 +166,31 @@ class Settings(BaseSettings):
     ONBOARDING_VIDEO_NOTE_URL: str = ""
     ONBOARDING_VIDEO_NOTE_PTV: bool = True
 
+    # ── Onboarding drop-off follow-ups ────────────────────────────────────────
+    # When an owner starts onboarding and then goes silent mid-flow, Sofia sends
+    # a small, non-intrusive nudge to invite them to pick up where they left off.
+    # Deliberately capped at TWO follow-ups total, ever — frequent nudges annoy.
+    #   • 1st nudge after ONBOARDING_FOLLOWUP_1_DELAY_MIN of no owner message.
+    #   • 2nd (final) nudge after ONBOARDING_FOLLOWUP_2_DELAY_MIN of no owner message.
+    # Both windows sit inside WhatsApp's 24-h customer-care window (the owner
+    # messaged us first), so no template / anti-ban gating is needed. Set
+    # ONBOARDING_FOLLOWUP_ENABLED=false to switch the whole mechanic off.
+    ONBOARDING_FOLLOWUP_ENABLED: bool = True
+    ONBOARDING_FOLLOWUP_1_DELAY_MIN: int = 60      # 1 hour after last owner message
+    ONBOARDING_FOLLOWUP_2_DELAY_MIN: int = 1080    # 18 hours after last owner message
+    # Sessions idle longer than this are considered abandoned — never nudged.
+    ONBOARDING_FOLLOWUP_MAX_AGE_MIN: int = 4320     # 72 hours
+
+    # ── Human-support alert number (stuck-conversation escalation) ────────────
+    # WhatsApp number (digits, no +) of a human support agent. When set, and an
+    # onboarding conversation gets genuinely stuck (e.g. the owner cannot share
+    # their location after repeated tries, a details lookup keeps failing, or the
+    # owner explicitly asks for a human), Sofia sends this number a short alert
+    # containing the client's phone + a one-line summary so the agent can jump
+    # into the chat and help. When EMPTY (default) the alert is simply skipped
+    # and everything behaves exactly as before.
+    ALERT_NUMBER: str = ""
+
     # Call-forwarding destination numbers, keyed by country calling code.
     # JSON object stored as a string, e.g.:
     #   CALL_FORWARDING_NUMBERS_JSON='{"351": "+351200010001", "1": "+12125550100", "44": "+441234567890"}'

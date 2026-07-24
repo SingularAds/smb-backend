@@ -31,6 +31,7 @@ from app.config import settings
 from app import firestore as db
 from app.services import global_numbers
 from app.services import onboarding_transcript as transcript
+from app.services import onboarding_alert
 from app.integrations import posthog_client
 from app.services.attribution import build_attribution, is_ad_channel
 from app.services.whatsmeow_client import PairingStateConflict, ReachoutTimelocked, WhatsmeowClient
@@ -1844,6 +1845,113 @@ def _is_instagram_url(url: str) -> bool:
     return "instagram.com" in host
 
 
+# ── Instagram-handle detection ────────────────────────────────────────────────
+# Owners frequently answer the "share your website / Maps / Instagram" ask with
+# just their handle ("@hotel.wang", "hotel.wang@") instead of a full profile URL.
+# We turn a clear handle straight into an instagram.com URL for the existing
+# Apify scrape path, and ask a one-line confirmation only when the format is
+# ambiguous (per client spec 2026-07-24).
+_IG_HANDLE_CHARS = r"[A-Za-z0-9._]"
+_EMAIL_LIKE_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+
+
+def _clean_instagram_handle(raw: str) -> str | None:
+    """Validate/normalize a candidate handle, or None if it isn't plausible."""
+    h = (raw or "").strip().strip(".").lower()
+    if not (2 <= len(h) <= 30):
+        return None
+    if not re.fullmatch(r"[a-z0-9._]+", h):
+        return None
+    if not re.search(r"[a-z]", h):  # pure digits/dots are never a real handle
+        return None
+    return h
+
+
+def _extract_instagram_handle(text: str) -> tuple[str | None, bool]:
+    """Detect a bare Instagram handle in a short owner message.
+
+    Returns ``(handle, confident)``:
+      • ``(handle, True)``  — message is exactly "@name" or "name@" → use directly.
+      • ``(handle, False)`` — an "@"-attached token in a messier message → confirm.
+      • ``(None, False)``   — no handle signal → let the normal flow handle it.
+
+    Conservative on purpose: a real URL, an email address, or a plain multi-word
+    business name (no "@") is never treated as a handle.
+    """
+    if not text:
+        return None, False
+    t = text.strip()
+    # Real URLs / instagram.com links go through the existing URL flow.
+    if "://" in t or "instagram.com" in t.lower() or "/" in t:
+        return None, False
+    # A normal email address is not an Instagram handle.
+    if _EMAIL_LIKE_RE.match(t):
+        return None, False
+    # Require an "@" signal, otherwise we'd poach ordinary business names.
+    if "@" not in t:
+        return None, False
+
+    # Confident: the whole message is the handle.
+    m = re.fullmatch(r"@(" + _IG_HANDLE_CHARS + r"+)", t)
+    if m:
+        h = _clean_instagram_handle(m.group(1))
+        if h:
+            return h, True
+    m = re.fullmatch(r"(" + _IG_HANDLE_CHARS + r"+)@", t)
+    if m:
+        h = _clean_instagram_handle(m.group(1))
+        if h:
+            return h, True
+
+    # Ambiguous: an "@" is directly attached to a handle-ish token somewhere in a
+    # longer message (e.g. "insta: @hotel.wang", "my ig hotelwang@"). Ask first.
+    # A floating "@" with spaces around it (e.g. "meet @ 5pm") never matches.
+    m = re.search(r"@(" + _IG_HANDLE_CHARS + r"{2,30})", t)
+    if not m:
+        m = re.search(r"(" + _IG_HANDLE_CHARS + r"{2,30})@", t)
+    if m:
+        h = _clean_instagram_handle(m.group(1))
+        if h:
+            return h, False
+    return None, False
+
+
+# Localized copy for the ambiguous-handle confirmation (en/pt/es; falls back to
+# English). ``{handle}`` is the detected handle (no leading "@").
+_IG_CONFIRM_MSG: dict[str, str] = {
+    "en": (
+        "Just to make sure I get it right — is *@{handle}* your business's "
+        "Instagram? 🙂\n\nReply *yes* and I'll pull your details from there. "
+        "Or send your website / Google Maps link instead."
+    ),
+    "pt": (
+        "Só pra eu não errar — *@{handle}* é o Instagram do seu negócio? 🙂\n\n"
+        "Responde *sim* que eu já puxo seus dados de lá. Ou, se preferir, manda "
+        "o link do seu site / Google Maps."
+    ),
+    "es": (
+        "Solo para asegurarme — ¿*@{handle}* es el Instagram de tu negocio? 🙂\n\n"
+        "Responde *sí* y saco tus datos de ahí. O envíame el enlace de tu web / "
+        "Google Maps."
+    ),
+}
+
+_IG_DECLINE_MSG: dict[str, str] = {
+    "en": (
+        "No problem! 😊 Just send your Instagram profile link, your website, or "
+        "your Google Maps link — or simply tell me your business name and city."
+    ),
+    "pt": (
+        "Sem problema! 😊 É só mandar o link do seu Instagram, do seu site ou do "
+        "Google Maps — ou me diz o nome do seu negócio e a cidade."
+    ),
+    "es": (
+        "¡Sin problema! 😊 Envíame el enlace de tu Instagram, tu web o tu Google "
+        "Maps — o dime el nombre de tu negocio y la ciudad."
+    ),
+}
+
+
 def _strip_code_fences(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
@@ -2345,6 +2453,17 @@ class OnboardingService:
             message_id=message_id,
         )
 
+        # Stamp the time of this inbound owner message. The onboarding drop-off
+        # follow-up sweep (app/services/automation/onboarding_followup.py)
+        # measures idle time from this field — never from our own outbound
+        # sends — so nudge #1 never resets the clock for nudge #2. Only existing
+        # sessions are stamped here; a brand-new session gets lastInboundAt in
+        # its creation payload (_start_new / lead / recepte paths).
+        if session is not None:
+            _inbound_at = datetime.utcnow().isoformat()
+            db.upsert_onboarding_session(phone, {"lastInboundAt": _inbound_at})
+            session["lastInboundAt"] = _inbound_at
+
         # Remember which global onboarding number this owner is messaging, so
         # every reply goes back out on the SAME number (multi-global-number
         # support — app/services/global_numbers.py). Stored on the session;
@@ -2448,6 +2567,7 @@ class OnboardingService:
             _TRANSIENT_GATE_STEPS = {
                 "location_request", "places_pick", "website_confirm",
                 "referral_offer", "referral_confirm", "recepte_confirm",
+                "instagram_confirm",
             }
             if step in _TRANSIENT_GATE_STEPS:
                 _last_raw = (
@@ -2670,6 +2790,14 @@ class OnboardingService:
                         "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
                     })
                     session["currentStep"] = "conversing"
+                    # Human-support alert: the owner couldn't share their location
+                    # even after a re-prompt — exactly the "no result" dead-end the
+                    # alert system is for. No-op unless ALERT_NUMBER is configured.
+                    await onboarding_alert.maybe_alert_human(
+                        phone, session,
+                        "Owner could not share their location after repeated "
+                        "prompts — location step released with no result.",
+                    )
                     await self._handle_conversation(session, phone, body, push_name, message_id)
                     return
 
@@ -2690,6 +2818,11 @@ class OnboardingService:
             # Website confirmation step
             if step == "website_confirm":
                 await self._handle_website_confirm(session, phone, body, push_name, message_id)
+                return
+
+            # Instagram-handle confirmation step (owner sent an ambiguous "@…")
+            if step == "instagram_confirm":
+                await self._handle_instagram_confirm(session, phone, body, push_name, message_id)
                 return
 
             # Deterministic referral-question flow (no LLM dependency)
@@ -2818,6 +2951,10 @@ class OnboardingService:
             "pairingSessionId": None,
             "businessId": None,
             "lastMessageId": message_id,
+            # Time of the owner's last inbound message — drives the drop-off
+            # follow-up sweep. Seeded here so a "said hi and vanished" first
+            # message is already a valid follow-up candidate.
+            "lastInboundAt": now,
             # Which global onboarding number this owner is messaging (multi-global
             # -number support). Included here so a brand-new session records it
             # even on the reset/new-business path; _send() replies from it.
@@ -2858,6 +2995,21 @@ class OnboardingService:
         if ad_sourced:
             session_data["currentStep"] = "conversing"
             await self._handle_ad_intro(session_data, phone, body, push_name, message_id)
+            return
+
+        # Instagram-handle fast-path: first message is just "@handle" / "handle@".
+        # Mirrors the check in _handle_conversation for the cold-start case. Runs
+        # before _extract_url so the handle isn't misread as a bare domain.
+        _ig_handle, _ig_confident = _extract_instagram_handle(body)
+        if _ig_handle:
+            if _ig_confident:
+                await self._handle_instagram_url(
+                    session_data, phone,
+                    f"https://www.instagram.com/{_ig_handle}/", push_name,
+                )
+            else:
+                await self._ask_instagram_confirm(session_data, phone, _ig_handle)
+            await self._maybe_send_intro_video(phone, lang, session_data)
             return
 
         # Fast-path: if first message is a website URL, extract info from it
@@ -3030,6 +3182,7 @@ class OnboardingService:
             "pairingSessionId": None,
             "businessId": None,
             "lastMessageId": message_id,
+            "lastInboundAt": now,
             "onboardingDeviceId": onboarding_device or None,
             "onboardingNumber": global_numbers.number_for_device(onboarding_device) or None,
             "recepteLeadData": lead,
@@ -3522,6 +3675,31 @@ class OnboardingService:
             )
             return
 
+        # Instagram-handle fast-path: owners often reply with just their handle
+        # ("@hotel.wang" / "hotel.wang@") instead of a full profile URL. Scoped to
+        # the early link-collection window (discovery, before a business has been
+        # identified) so it never poaches later free-chat containing an "@".
+        # Runs BEFORE _extract_url so a handle isn't misread as a bare domain.
+        if (
+            session.get("salesPhase", "discovery") == "discovery"
+            and not session.get("mandatoryFieldsRequired")
+            and not session.get("websiteExtractedData")
+        ):
+            _ig_handle, _ig_confident = _extract_instagram_handle(body)
+            if _ig_handle:
+                _h = session.get("conversationHistory", [])
+                _h.append({"role": "user", "content": body})
+                db.upsert_onboarding_session(phone, {"conversationHistory": _h})
+                session["conversationHistory"] = _h
+                if _ig_confident:
+                    await self._handle_instagram_url(
+                        session, phone,
+                        f"https://www.instagram.com/{_ig_handle}/", push_name,
+                    )
+                else:
+                    await self._ask_instagram_confirm(session, phone, _ig_handle)
+                return
+
         # Fast-path: if the owner sends a website URL, extract from it
         url = _extract_url(body)
         if url:
@@ -3734,6 +3912,14 @@ class OnboardingService:
             # Persist user message to history before returning early
             db.upsert_onboarding_session(phone, {"conversationHistory": history})
             await self._daniel_handoff(phone, session, context=body)
+            # Also ping the human-support WhatsApp number (if configured). The
+            # owner explicitly asked for a human, so bypass the cooldown (still
+            # capped per session). No-op unless ALERT_NUMBER is set.
+            await onboarding_alert.maybe_alert_human(
+                phone, session,
+                f"Owner explicitly asked for a human (said: {body!r}).",
+                force=True,
+            )
             await self._send(
                 phone,
                 "We have raised the issue — one of our team members will be connecting with you soon. 👋",
@@ -4771,6 +4957,15 @@ class OnboardingService:
                 "placesPickQuery": None,
                 "placesPickPromptCount": 0,
             })
+            # Only the exhausted-re-prompt case (not a clean "none") is a stuck
+            # signal — the owner kept replying but we couldn't land a match.
+            # Contributes to the stuck counter; no-op unless ALERT_NUMBER is set.
+            if _pick_prompts >= 1:
+                await onboarding_alert.note_stuck(
+                    phone, session,
+                    f"Owner could not pick their business from the Google Places "
+                    f"results for '{query}'.",
+                )
             history = session.get("conversationHistory", [])
             history.append({"role": "user", "content": body})
             push = push_name or session.get("pushName", "")
@@ -5338,6 +5533,13 @@ class OnboardingService:
     ) -> None:
         """Switch to AI conversation after an Instagram scrape failure."""
         db.upsert_onboarding_session(phone, {"currentStep": "conversing"})
+        # Couldn't pull details from the Instagram link — record a stuck signal.
+        # Escalates to human support only if such failures pile up (see
+        # onboarding_alert.note_stuck). No-op unless ALERT_NUMBER is configured.
+        await onboarding_alert.note_stuck(
+            phone, session,
+            "Instagram profile lookup failed — could not fetch business details.",
+        )
         history = session.get("conversationHistory", [])
         _no_ig_ctx = (
             "NOTE: The owner shared an Instagram link but it couldn't be processed. "
@@ -5349,6 +5551,67 @@ class OnboardingService:
         history.append({"role": "assistant", "content": clean_reply})
         db.upsert_onboarding_session(phone, {"conversationHistory": history})
         await self._send(phone, clean_reply)
+
+    async def _ask_instagram_confirm(
+        self, session: dict, phone: str, handle: str
+    ) -> None:
+        """Ask the owner to confirm an ambiguous "@…"-style Instagram handle.
+
+        Parks the session in the ``instagram_confirm`` gate (released by the
+        stale-gate TTL if abandoned) with the guessed handle stored on it.
+        """
+        lang = str(session.get("language") or "en")[:2].lower()
+        msg = (_IG_CONFIRM_MSG.get(lang) or _IG_CONFIRM_MSG["en"]).format(handle=handle)
+        _h = session.get("conversationHistory", [])
+        _h.append({"role": "assistant", "content": msg})
+        db.upsert_onboarding_session(phone, {
+            "currentStep": "instagram_confirm",
+            "pendingInstagramHandle": handle,
+            "conversationHistory": _h,
+        })
+        session["currentStep"] = "instagram_confirm"
+        session["pendingInstagramHandle"] = handle
+        session["conversationHistory"] = _h
+        await self._send(phone, msg)
+        logger.info("[ONBOARDING] Asked Instagram-handle confirm for %s: @%s", phone, handle)
+
+    async def _handle_instagram_confirm(
+        self, session: dict, phone: str, body: str, push_name: str, message_id: str
+    ) -> None:
+        """Resolve the owner's yes/no to an ambiguous Instagram-handle guess.
+
+        - *yes* → build the profile URL and run the normal Instagram scrape.
+        - anything else → release the gate and re-route the message through the
+          usual conversation handler, so a pasted link or a corrected handle in
+          the same reply is still processed (never a dead end).
+        """
+        handle = session.get("pendingInstagramHandle") or ""
+
+        if handle and _is_affirmative(body):
+            _h = session.get("conversationHistory", [])
+            _h.append({"role": "user", "content": body})
+            db.upsert_onboarding_session(phone, {
+                "currentStep": "conversing",
+                "pendingInstagramHandle": None,
+                "conversationHistory": _h,
+            })
+            session["currentStep"] = "conversing"
+            session["pendingInstagramHandle"] = None
+            session["conversationHistory"] = _h
+            await self._handle_instagram_url(
+                session, phone, f"https://www.instagram.com/{handle}/", push_name,
+            )
+            return
+
+        # Not a clear "yes" — drop the gate and let the normal handler process the
+        # actual message (it appends the user turn to history itself).
+        db.upsert_onboarding_session(phone, {
+            "currentStep": "conversing",
+            "pendingInstagramHandle": None,
+        })
+        session["currentStep"] = "conversing"
+        session["pendingInstagramHandle"] = None
+        await self._handle_conversation(session, phone, body, push_name, message_id)
 
     async def _handle_website_confirm(
         self,
@@ -5529,6 +5792,10 @@ class OnboardingService:
                 phone, _guard_step,
             )
             return
+
+        # Clear any accumulated "stuck" signal — reaching finalization is decisive
+        # forward progress. Cheap no-op when there's nothing to reset.
+        await onboarding_alert.note_progress(phone, session)
 
         if pre_extracted:
             business_json = pre_extracted

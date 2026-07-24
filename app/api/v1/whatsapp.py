@@ -25,7 +25,7 @@ from app.services import global_numbers
 from app.services.whatsmeow_client import WhatsmeowClient, is_our_outbound_echo
 from app.owner.commands.handlers import handle_owner_command, is_owner_message
 from app import firestore as db
-from app.integrations import cartesia_client
+from app.integrations import cartesia_client, deepgram_client
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -257,6 +257,47 @@ async def _handle_missed_call(payload: dict) -> None:
                 detail=f"call_missed follow-up FAILED call_id={call_id!r}",
                 error=str(fallback_exc),
             )
+
+
+async def _transcribe_audio(media_url: str, mime_type: str, phone: str) -> str | None:
+    """Download a WhatsApp voice note and transcribe it to text via Deepgram STT.
+
+    Returns the transcript, or None if the audio can't be downloaded, STT fails,
+    or it contained no speech. Mirrors the customer-AI voice pipeline
+    (download_media → Deepgram) but text-only, for callers (e.g. the demo line)
+    that just need the words rather than a spoken reply.
+    """
+    if not media_url:
+        return None
+    try:
+        audio_bytes, detected_mime = await _wa.download_media(media_url)
+        effective_mime = (
+            detected_mime
+            if detected_mime not in ("", "application/octet-stream")
+            else mime_type
+        )
+        if len(audio_bytes) < 100:
+            logger.warning(
+                "[AUDIO] Downloaded audio too small for %s (%d bytes)",
+                phone, len(audio_bytes),
+            )
+            return None
+    except Exception as exc:
+        logger.error("[AUDIO] Download failed for %s (url=%s): %s", phone, media_url, exc)
+        return None
+
+    try:
+        transcript = await deepgram_client.transcribe_audio(audio_bytes, effective_mime)
+    except Exception as exc:
+        logger.error("[AUDIO] Deepgram transcription failed for %s: %s", phone, exc)
+        return None
+
+    transcript = (transcript or "").strip()
+    if not transcript:
+        logger.warning("[AUDIO] Empty transcript for %s — audio had no speech", phone)
+        return None
+    logger.info("[AUDIO] Transcript for %s: %r", phone, transcript[:120])
+    return transcript
 
 
 async def _process_webhook(payload: dict) -> None:
@@ -725,9 +766,21 @@ async def _process_webhook(payload: dict) -> None:
         # the customer-AI (no-business → silent) path.
         _demo_device = settings.DEMO_WA_DEVICE_ID
         if _demo_device and device_id == _demo_device:
+            # Voice notes on the demo line: transcribe to text first (same
+            # Deepgram STT the customer AI uses) so the demo understands audio.
+            # On any failure we pass an empty body through — handle_demo_message
+            # then sends its existing localized "please send text" nudge, so we
+            # never duplicate that copy or feed noise into the demo.
+            demo_body = body
+            if is_audio:
+                demo_body = await _transcribe_audio(media_url, mime_type, phone) or ""
+                logger.info(
+                    "[WEBHOOK] demo audio from %s (device=%r) transcribed=%s",
+                    phone, device_id, bool(demo_body),
+                )
             logger.info("[WEBHOOK] routing phone=%s device=%r -> demo", phone, device_id)
             await _onboarding.handle_demo_message(
-                phone, body, push_name, message_id, message_type=message_type
+                phone, demo_body, push_name, message_id, message_type=message_type
             )
             _log_event("processed", phone=phone, message_id=message_id, detail="demo number")
             return

@@ -868,6 +868,35 @@ def delete_onboarding_session(phone: str) -> None:
     _db().collection("onboarding_sessions").document(phone_clean).delete()
 
 
+def list_onboarding_sessions_active_between(
+    start_iso: str, end_iso: str, limit: int = 1000
+) -> list[dict]:
+    """Return onboarding sessions whose last inbound owner message falls within
+    ``[start_iso, end_iso]`` (ISO-8601 UTC strings).
+
+    Used by the drop-off follow-up sweep to find owners who went quiet mid-flow
+    without streaming the entire (ever-growing) collection. ``lastInboundAt`` is
+    a top-level field stamped on every inbound owner message, so this bounded
+    range scan only touches recently-active sessions. Sessions created before
+    that field existed simply won't match — they get picked up on their next
+    message. A range on a single field uses Firestore's automatic single-field
+    index, so no composite index needs provisioning.
+    """
+    docs = (
+        _db().collection("onboarding_sessions")
+        .where(filter=FieldFilter("lastInboundAt", ">=", start_iso))
+        .where(filter=FieldFilter("lastInboundAt", "<=", end_iso))
+        .limit(limit)
+        .stream()
+    )
+    out: list[dict] = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        data["id"] = doc.id
+        out.append(data)
+    return out
+
+
 # Collection: demo_sessions  —  doc ID = phone (digits, no +)
 # Isolated from onboarding_sessions so a Salão Bella demo on the dedicated demo
 # number can never collide with a real onboarding session for the same phone.

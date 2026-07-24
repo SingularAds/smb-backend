@@ -28,6 +28,7 @@ from app.services.automation.customer_intelligence import run_customer_intellige
 from app.services.automation.referral_automation import run_referral_invite_sweep, run_referral_discount_expiry_sweep
 from app.services.automation.trial_expiry_automation import run_trial_expiry_sweep
 from app.services.automation.day2_checkin import run_day2_checkin_sweep
+from app.services.automation.onboarding_followup import run_onboarding_followup_sweep
 from app.services.automation.kb_expiry import run_kb_expiry_sweep
 from app.services.csat_service import sweep_all as run_csat_sweep
 from app.config import settings as _settings
@@ -99,6 +100,13 @@ async def _job_day2_checkin() -> None:
         await run_day2_checkin_sweep()
     except Exception as exc:
         logger.exception("[Scheduler] day-2 check-in sweep crashed: %s", exc)
+
+
+async def _job_onboarding_followup() -> None:
+    try:
+        await run_onboarding_followup_sweep()
+    except Exception as exc:
+        logger.exception("[Scheduler] onboarding follow-up sweep crashed: %s", exc)
 
 
 async def _job_kb_expiry() -> None:
@@ -220,6 +228,20 @@ def start_scheduler() -> None:
         name="Day-2 trust check-in (one-shot, 2 days after trial start)",
         replace_existing=True,
         misfire_grace_time=600,
+    )
+
+    # Onboarding drop-off follow-up sweep — every 15 minutes. The 1 h / 18 h
+    # silence thresholds are enforced inside the sweep; running every 15 min just
+    # bounds how soon after a threshold the nudge actually goes out. Capped at two
+    # nudges per session (see app/services/automation/onboarding_followup.py).
+    _scheduler.add_job(
+        _job_onboarding_followup,
+        trigger=IntervalTrigger(minutes=15),
+        id="onboarding_followup_sweep",
+        name="Onboarding drop-off follow-up sweep (1 h + 18 h nudges)",
+        replace_existing=True,
+        misfire_grace_time=120,
+        max_instances=1,
     )
 
     # KB expiry sweep — every day at 04:00 UTC. Flips pending KB entries past
