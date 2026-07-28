@@ -161,3 +161,57 @@ def update_global_kb(
     global_kb_module.get_global_kb(force_refresh=True)
     logger.info("[ANALYTICS] Global KB updated (%d chars)", len(content))
     return _global_kb_payload()
+
+
+# ── Manual WhatsApp pairing (human-support tool) ──────────────────────────────
+# Lets a support agent link a business owner's WhatsApp for them when the owner
+# can't complete pairing in-chat. Proxies the same bridge calls Sofia uses and,
+# when a registered business exists, arms the auto-finalize poll so onboarding
+# completes end-to-end the moment the owner links.
+
+# Lazy singleton — OnboardingService's constructor is cheap (client wrappers
+# only, no network), but importing it lazily keeps this module light and avoids
+# any import-order coupling with the onboarding stack.
+_onboarding_singleton = None
+
+
+def _get_onboarding():
+    global _onboarding_singleton
+    if _onboarding_singleton is None:
+        from app.services.onboarding_service import OnboardingService
+        _onboarding_singleton = OnboardingService()
+    return _onboarding_singleton
+
+
+class PairingGenerateRequest(BaseModel):
+    phone: str
+    mode: str = "code"  # "code" (default) | "qr"
+
+
+@router.post("/pairing/generate")
+async def analytics_pairing_generate(
+    payload: PairingGenerateRequest,
+    _: None = Depends(require_admin_key),
+) -> dict:
+    """Generate a pairing CODE (or QR) so a human agent can link a stuck owner's
+    WhatsApp. Returns { ok, code | qrDataUrl, sessionId, phone, autoFinalize, … }.
+    Errors are returned as { ok: false, error } with HTTP 200 so the dashboard
+    can show a friendly message rather than a stack trace."""
+    onb = _get_onboarding()
+    result = await onb.admin_generate_pairing(payload.phone, mode=payload.mode)
+    logger.info(
+        "[ANALYTICS] Manual pairing requested phone=%s mode=%s ok=%s",
+        payload.phone, payload.mode, result.get("ok"),
+    )
+    return result
+
+
+@router.get("/pairing/status")
+async def analytics_pairing_status(
+    phone: str = Query(..., description="Owner phone (country code + number, digits only)"),
+    _: None = Depends(require_admin_key),
+) -> dict:
+    """Live bridge status for biz-<phone> — used to confirm whether a number is
+    stuck (needs_pairing) or already connected before/after generating a code."""
+    onb = _get_onboarding()
+    return await onb.admin_pairing_status(phone)

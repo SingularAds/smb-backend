@@ -37,7 +37,7 @@ function rangeParams(filter: RangeFilter): URLSearchParams {
 }
 
 async function request<T>(
-  method: "GET" | "PUT",
+  method: "GET" | "PUT" | "POST",
   path: string,
   params?: URLSearchParams,
   body?: unknown,
@@ -106,4 +106,48 @@ export function fetchGlobalKb(): Promise<GlobalKb> {
 
 export function saveGlobalKb(content: string): Promise<GlobalKb> {
   return request<GlobalKb>("PUT", "/global-kb", undefined, { content });
+}
+
+// ── Manual WhatsApp pairing (human-support tool) ────────────────────────────
+
+export interface PairingResult {
+  ok: boolean;
+  error?: string;
+  message?: string;
+  mode?: "code" | "qr";
+  code?: string;
+  qrDataUrl?: string;
+  sessionId?: string;
+  phone?: string;
+  autoFinalize?: boolean;
+  alreadyConnected?: boolean;
+  status?: string;
+}
+
+export interface PairingStatus {
+  ok: boolean;
+  error?: string;
+  sessionId?: string;
+  phone?: string;
+  status?: string | null;
+  paired?: boolean;
+  pairedPhone?: string;
+  businessName?: string;
+  hasBusiness?: boolean;
+  onboardingStep?: string;
+}
+
+export function generatePairing(
+  phone: string,
+  mode: "code" | "qr",
+): Promise<PairingResult> {
+  return request<PairingResult>("POST", "/pairing/generate", undefined, {
+    phone,
+    mode,
+  });
+}
+
+export function fetchPairingStatus(phone: string): Promise<PairingStatus> {
+  const params = new URLSearchParams({ phone });
+  return request<PairingStatus>("GET", "/pairing/status", params);
 }

@@ -27,6 +27,7 @@ import { DetailSkeleton, OverviewSkeleton } from "./components/Skeleton";
 import { OverviewPage } from "./pages/Overview";
 import { BusinessDetailPage } from "./pages/BusinessDetail";
 import { GlobalKbPage } from "./pages/GlobalKb";
+import { PairingPage } from "./pages/Pairing";
 
 // App shell. The filter row lives here (one row above everything it scopes —
 // both screens re-render against the same slice). Refetch holds the previous
@@ -203,6 +204,7 @@ function Shell({ onAuthFail }: { onAuthFail: () => void }) {
   const location = useLocation();
   const isOverview = location.pathname === "/";
   const isKb = location.pathname.startsWith("/global-kb");
+  const isPairing = location.pathname.startsWith("/pairing");
   const [filter, setFilter] = useState<RangeFilter>({
     preset: 30,
     from: null,
@@ -240,6 +242,9 @@ function Shell({ onAuthFail }: { onAuthFail: () => void }) {
             <NavLink to="/global-kb" className={navLink}>
               Global KB
             </NavLink>
+            <NavLink to="/pairing" className={navLink}>
+              Pairing
+            </NavLink>
             <button
               onClick={onAuthFail}
               className="rounded-md px-2.5 py-1 text-xs font-medium text-[var(--status-critical)] hover:bg-[rgba(208,59,59,0.08)] transition-colors"
@@ -249,7 +254,7 @@ function Shell({ onAuthFail }: { onAuthFail: () => void }) {
             </button>
           </nav>
         </div>
-        {!isKb ? (
+        {!isKb && !isPairing ? (
           <FilterBar
             filter={filter}
             onFilterChange={setFilter}
@@ -282,6 +287,7 @@ function Shell({ onAuthFail }: { onAuthFail: () => void }) {
             element={<DetailRoute filter={filter} onAuthFail={onAuthFail} />}
           />
           <Route path="/global-kb" element={<GlobalKbPage onAuthFail={onAuthFail} />} />
+          <Route path="/pairing" element={<PairingPage onAuthFail={onAuthFail} />} />
         </Routes>
       </main>
     </div>

@@ -188,17 +188,21 @@ You are Sofia, Recepte's AI receptionist and sales assistant. You help business 
 owners discover, try, and activate their own AI receptionist through a WhatsApp \
 conversation. You are warm, direct, and efficient.
 
-MOST IMPORTANT RULE — LANGUAGE:
-Detect the language of the user's message and ALWAYS respond in that exact language.
-Do NOT switch languages. If they write in German, reply in German. If they write in
-Portuguese, reply in Portuguese. If they write in Hindi, reply in Hindi. Always match
-their language perfectly. Examples:
-  - User writes in German → reply in German only
-  - User writes in Portuguese → reply in Portuguese only
-  - User writes in Spanish → reply in Spanish only
-  - User writes in Hindi → reply in Hindi only
-  - User writes in French → reply in French only
-This is your HIGHEST priority rule. Detect language first, then respond.
+MOST IMPORTANT RULE — LANGUAGE (HARD RULE, NEVER VIOLATE):
+This conversation has ONE fixed language, given to you in the "LANGUAGE DIRECTIVE"
+that appears later in this prompt. You MUST write EVERY message — greetings,
+questions, confirmations, summaries, apology/error lines, everything — entirely in
+that one language.
+- NEVER switch languages mid-conversation.
+- NEVER mix languages: not a single word, phrase, caption, or sign-off in any other
+  language. The entire message is in the conversation language.
+- Do NOT re-detect the language from each incoming message. Short, ambiguous, or
+  English-looking replies (a business name, a link, "ok", a number) do NOT change
+  the language — keep replying in the conversation language.
+- The ONLY time you change language is when the owner EXPLICITLY asks you to (e.g.
+  "reply in English", "fala em português", "responde en español"). When they do,
+  switch fully and stay in the new language for the rest of the chat.
+This is your HIGHEST priority rule.
 
 PERSONA:
 - Your name is Sofia. Always speak in first person ("eu" / "I"), never "we at Recepte" \
@@ -240,6 +244,14 @@ GOOGLE PLACES SEARCH:
 - If no match is found, the system tells you — then ask for their city/address only, \
 then move to the referral question
 - Never suggest the owner search Google themselves
+- NEVER tell the owner you are "searching", "looking it up", "processing", "one \
+moment", "give me a second", or that you will "get back to them". The search is \
+silent and instant: either a confirmation card appears automatically, or you are \
+told it was not found. Promising an action and then stopping leaves the owner \
+staring at "Processing…" with no reply — NEVER do this.
+- If you are ever unsure whether a search happened, do NOT claim you are searching. \
+Instead ask ONE concrete question that keeps things moving: their city, or a \
+website / Instagram / Google Maps link.
 - After a business is confirmed from Google Places (owner replies yes), do NOT ask for \
 business name/type/address again unless the owner explicitly says they are wrong
 
@@ -1451,16 +1463,23 @@ def _infer_timezone_from_phone(phone: str) -> str:
     return "UTC"
 
 
-def _looks_like_business_name(text: str) -> bool:
+def _looks_like_business_name(text: str, max_words: int = 7) -> bool:
     """Heuristic: return True if text is likely a standalone business name.
 
     Used to trigger an automatic Google Places lookup instead of sending the
     text to the AI as a normal conversation turn.
+
+    ``max_words`` defaults to 7 for the cold fast-path (avoid misreading long
+    sentences as names). Callers that already KNOW the owner is giving business
+    info — because we just asked for a link/name — pass a higher cap so a
+    descriptive name like "L.C.G. Limpezas e Conservação em Geral" still triggers
+    a real search instead of dead-ending in the AI (client feedback 2026-07-27,
+    Issue 4).
     """
     stripped = text.strip()
     words = stripped.split()
-    # Must be 2–7 words
-    if len(words) < 2 or len(words) > 7:
+    # Must be 2..max_words words
+    if len(words) < 2 or len(words) > max_words:
         return False
     lower = stripped.lower()
     # Skip common one-liner replies
@@ -2349,35 +2368,32 @@ class OnboardingService:
         if override:
             return override, True
 
-        # 2. If the session already has a saved language, verify it still matches
-        #    when the message carries enough linguistic signal. Owners DO switch
-        #    language mid-conversation (e.g. greet in English, continue in
-        #    Portuguese) and a stale saved language must not pin every reply to
-        #    the wrong one. Short replies ("Yes", "3pm", "ok") never re-detect —
-        #    they carry no signal and must not flip the conversation language.
+        # 2. Once a conversation language is set, it is LOCKED for the rest of the
+        #    chat. Only an EXPLICIT request (handled in step 1 above, e.g. "reply
+        #    in English") may change it. We deliberately no longer re-detect the
+        #    language per message: short or ambiguous replies ("ok", "sim", a bare
+        #    business name, a URL, a phone number) were being misdetected as a
+        #    different language and flipping the whole conversation — usually to
+        #    English — which is exactly what the owner does NOT want (client
+        #    feedback 2026-07-27, Issue 2). The language chosen on the first
+        #    message now carries through unchanged unless the owner asks to switch.
         if session and session.get("language"):
-            saved = session["language"]
-            if _has_language_signal(body):
-                detected, confidence = await self._detect_language_llm(body)
-                if detected and detected != saved and confidence >= 0.8:
-                    logger.info(
-                        "[LANG] Conversation language switch detected for %s: %s -> %s "
-                        "(confidence=%.2f)",
-                        phone, saved, detected, confidence,
-                    )
-                    return detected, True  # True -> caller persists the new language
-            return saved, False
+            return session["language"], False
 
-        # 3. First message (no session or no language saved yet) — run LLM detection
-        detected, confidence = await self._detect_language_llm(body)
-        if detected and confidence >= 0.6:
-            return detected, True   # True -> caller will save to session
-        if detected and not session:
-            return detected, False  # new user, low confidence — use but don't persist yet
-
-        # 4. Fallback: infer from phone country code
-        fallback = self.ai.detect_language(phone) or "en"
-        return fallback, False
+        # 3. Initial language for a brand-new conversation (client's model,
+        #    2026-07-27, Issue 2). Use a CONFIDENT signal from the first message
+        #    when there is one; otherwise START from the phone number's country
+        #    code. A short or ambiguous opener ("Hi", "Ok", an emoji, a bare
+        #    business name) carries no real language signal, so it must NOT lock
+        #    the chat to the wrong language — the country code decides instead
+        #    (for this market +55/+351 → Portuguese, +34 → Spanish; NOT English).
+        #    Either branch becomes the LOCKED conversation language (step 2).
+        if _has_language_signal(body):
+            detected, confidence = await self._detect_language_llm(body)
+            if detected and confidence >= 0.8:
+                return detected, True
+        # detect_language always returns a code (defaults to "en" for unmapped).
+        return self.ai.detect_language(phone), True
 
     async def _localize_static(
         self,
@@ -2388,7 +2404,13 @@ class OnboardingService:
         if not text:
             return text
 
-        lang_key = _language_key_from_text(user_message, language_hint)
+        # Target the LOCKED conversation language (language_hint), NOT a language
+        # re-derived from the current user message. Deriving it from the message
+        # meant an English-looking reply (a bare business name, "ok", a URL) made
+        # us skip translation and leak an English static string into a non-English
+        # chat (client feedback 2026-07-27, Issue 2). The conversation language is
+        # the single source of truth here.
+        lang_key = (language_hint or "en")[:2].lower()
         if lang_key == "en":
             return text
 
@@ -2398,12 +2420,11 @@ class OnboardingService:
             return cached
 
         prompt = (
-            "Translate the assistant message into the SAME language as the user's message.\n"
+            f"Translate the assistant message below into this language "
+            f"(ISO 639-1 code): {lang_key}.\n"
             "Preserve line breaks, emojis, markdown, numbers, URLs, and any bracketed tokens "
-            "like [CONFIRMED], plus any placeholders inside {} exactly. Do NOT add or remove content. If it is already in that "
-            "language, return it unchanged.\n\n"
-            f"Language hint (if ambiguous): {lang_key}\n\n"
-            f"User message:\n{user_message}\n\n"
+            "like [CONFIRMED], plus any placeholders inside {} exactly. Do NOT add or remove "
+            "content. If it is already in that language, return it unchanged.\n\n"
             f"Assistant message:\n{text}"
         )
 
@@ -2510,6 +2531,22 @@ class OnboardingService:
             db.upsert_onboarding_session(phone, {"language": lang_for_message})
             logger.info("[LATENCY] Onboarding language upsert took %.3fs", time.time() - db_upsert_start)
             session["language"] = lang_for_message
+
+        # ── Parallel human-support alert (client feedback 2026-07-27) ─────────
+        # If this inbound message is an explicit request for a human, or is badly
+        # off-context / inappropriate, ping the human-support number IN PARALLEL.
+        # This NEVER stops, pauses, or changes onboarding — Sofia keeps replying
+        # normally below; the alert just lets a human jump in when they want to.
+        # No-op unless ALERT_NUMBER is set. Only for existing sessions (a brand
+        # new user's first message is handled by _start_new, which creates the
+        # session; any follow-up is covered here).
+        if session:
+            try:
+                await onboarding_alert.alert_if_support_needed(
+                    phone, session, body, session_kind="onboarding",
+                )
+            except Exception:
+                logger.exception("[ALERT] support-need check failed for %s", phone)
 
         # ── recepte.co activation message: intercept EARLY ───────────────────
         # "I want to activate recepte for <BusinessName>" arrives when the owner
@@ -2768,19 +2805,35 @@ class OnboardingService:
                         session, phone, body, push_name, message_id
                     )
                     return
-                # ── Anti-loop guard (prod bug 2026-07-13) ─────────────────────
-                # The user replied with something that is neither a location
-                # share nor an escape word (e.g. "ola", a question, small talk).
-                # Old behaviour re-sent the same static location prompt forever.
-                # New behaviour: re-prompt AT MOST ONCE, then release the gate
-                # and let the AI answer the actual message (dynamic onboarding).
-                # askedForLocation stays True, so a later Places search falls
-                # back to global text search instead of re-asking — the gate
-                # can never re-trap this session.
+                # ── Owner replied with a business NAME instead of a location ──
+                # Use it directly: run a (global text) Places search rather than
+                # re-asking. askedForLocation is already True, so _run_places_search
+                # does a global search, and it ALWAYS replies (found / pick / a
+                # graceful "couldn't find" message) — never a dead end. A trailing
+                # "?" means it is a question, not a name, so let the assist path
+                # below handle it instead.
+                if _looks_like_business_name(body, max_words=12) and not body.strip().endswith("?"):
+                    db.upsert_onboarding_session(phone, {
+                        "currentStep": "conversing",
+                        "locationPromptCount": 0,
+                    })
+                    session["currentStep"] = "conversing"
+                    await self._run_places_search(session, phone, body, push_name, original_body=body)
+                    return
+
+                # ── Assist-then-resume (client feedback 2026-07-27, Issue 3) ──
+                # The reply is not a location, an escape word, a demo request, or a
+                # business name — the owner is confused or asking a question
+                # ("why do you need my location?", "não entendi"). Old behaviour
+                # just re-sent the same location prompt, ignoring the question.
+                # New behaviour: ANSWER their onboarding question briefly, THEN
+                # guide them to continue the SAME step. Safety valve: after 2 such
+                # assists with no progress, release the gate to the AI so it can
+                # never trap the session.
                 _loc_prompts = int(session.get("locationPromptCount") or 0)
-                if _loc_prompts >= 1:
+                if _loc_prompts >= 2:
                     logger.info(
-                        "[ONBOARDING] location_request released after %d re-prompts "
+                        "[ONBOARDING] location_request released after %d assists "
                         "for %s — routing message to AI (anti-loop)",
                         _loc_prompts, phone,
                     )
@@ -2790,13 +2843,10 @@ class OnboardingService:
                         "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
                     })
                     session["currentStep"] = "conversing"
-                    # Human-support alert: the owner couldn't share their location
-                    # even after a re-prompt — exactly the "no result" dead-end the
-                    # alert system is for. No-op unless ALERT_NUMBER is configured.
                     await onboarding_alert.maybe_alert_human(
                         phone, session,
-                        "Owner could not share their location after repeated "
-                        "prompts — location step released with no result.",
+                        "Owner is stuck at the location step and could not proceed "
+                        "even after being helped — released to open conversation.",
                     )
                     await self._handle_conversation(session, phone, body, push_name, message_id)
                     return
@@ -2806,13 +2856,30 @@ class OnboardingService:
                     "timestamps.lastActivityAt": datetime.utcnow().isoformat(),
                 })
                 session["locationPromptCount"] = _loc_prompts + 1
-                loc_msg = (
-                    "Perfect! 📍 Let’s find you on the map. "
-                    "Tap 📎 → Location → Send Your Current Location. Takes 2 seconds 🙌\n\n"
-                    "_(Or just reply *skip* and we'll continue without it.)_"
+                _assist_ctx = (
+                    "CONTEXT: You are in the middle of onboarding and just asked the owner "
+                    "to share their WhatsApp location so the system can find their business "
+                    "on the map automatically. Their latest message is NOT a location — they "
+                    "seem confused or are asking a question. Do BOTH of the following, "
+                    "briefly, staying STRICTLY on the onboarding topic (never anything "
+                    "unrelated):\n"
+                    "1) Answer their question helpfully and reassuringly. If they ask why you "
+                    "need the location, explain simply: it lets you find their business on "
+                    "Google Maps and fill in the details automatically so they don't have to "
+                    "type everything; it is optional and their data stays private.\n"
+                    "2) Then guide them to continue the SAME step: either tap the attachment "
+                    "(📎) → Location to share it, OR just reply with their business name and "
+                    "city and you'll continue from there. Keep it short (2-4 lines)."
                 )
-                loc_msg = await self._localize_static(loc_msg, body, session.get("language", "en"))
-                await self._send(phone, loc_msg)
+                history = session.get("conversationHistory", [])
+                history.append({"role": "user", "content": body})
+                push = push_name or session.get("pushName", "")
+                lang = session.get("language", "en")
+                ai_reply = await self._get_ai_response(history, push, lang, extra_context=_assist_ctx)
+                _, clean_reply = self._check_confirmed(ai_reply)
+                history.append({"role": "assistant", "content": clean_reply})
+                db.upsert_onboarding_session(phone, {"conversationHistory": history})
+                await self._send(phone, clean_reply)
                 return
 
             # Website confirmation step
@@ -3891,6 +3958,30 @@ class OnboardingService:
                 await self._run_places_search(session, phone, _stated_name, push_name, original_body=body)
                 return
 
+        # Descriptive business-name fallback (client feedback 2026-07-27, Issue 4):
+        # the owner replied with something name-like but longer than the strict
+        # fast-path cap (e.g. "L.C.G. Que significa limpezas e conservação em
+        # geral" — 8 words). Without this it fell through to the AI, which promised
+        # "Vou procurar… Processando…" and then dead-ended with no search behind
+        # it. Run a REAL Places search (which ALWAYS replies) so that can't happen.
+        # Scoped to discovery, before any business has been identified, with the
+        # same greeting/sentence/noise guards; a question ("…?") is never a name.
+        if (
+            settings.GOOGLE_PLACES_API_KEY
+            and _sales_phase_check == "discovery"
+            and not session.get("websiteExtractedData")
+            and not session.get("mandatoryFieldsRequired")
+            and not _is_demo_request(body)
+            and not body.strip().endswith("?")
+            and _looks_like_business_name(body, max_words=12)
+        ):
+            _h = session.get("conversationHistory", [])
+            _h.append({"role": "user", "content": body})
+            db.upsert_onboarding_session(phone, {"conversationHistory": _h})
+            session["conversationHistory"] = _h
+            await self._run_places_search(session, phone, body, push_name, original_body=body)
+            return
+
         # Get conversation history and add new user message
         history = session.get("conversationHistory", [])
         history.append({"role": "user", "content": body})
@@ -3912,14 +4003,11 @@ class OnboardingService:
             # Persist user message to history before returning early
             db.upsert_onboarding_session(phone, {"conversationHistory": history})
             await self._daniel_handoff(phone, session, context=body)
-            # Also ping the human-support WhatsApp number (if configured). The
-            # owner explicitly asked for a human, so bypass the cooldown (still
-            # capped per session). No-op unless ALERT_NUMBER is set.
-            await onboarding_alert.maybe_alert_human(
-                phone, session,
-                f"Owner explicitly asked for a human (said: {body!r}).",
-                force=True,
-            )
+            # NOTE: the WhatsApp human-support alert for explicit human requests
+            # is now raised centrally in handle_message() via
+            # onboarding_alert.alert_if_support_needed (covers this path AND every
+            # gate step, with a single de-duplicated alert), so we do NOT alert
+            # again here — that would double-page the agent.
             await self._send(
                 phone,
                 "We have raised the issue — one of our team members will be connecting with you soon. 👋",
@@ -4482,11 +4570,35 @@ class OnboardingService:
                 lang = switched
                 session["language"] = lang
 
-        # Human handoff
-        if body.strip().lower() in _DANIEL_TRIGGER_WORDS:
+        # Human handoff — explicit human request (a bare Daniel keyword OR a
+        # natural phrase like "I want to contact human support" that the strict
+        # keyword set used to miss, client feedback 2026-07-27). Acknowledge to
+        # the user AND ping the human-support number with the demo context.
+        _support_cat, _ = onboarding_alert.classify_support_need(body)
+        if _support_cat == "human_request" or body.strip().lower() in _DANIEL_TRIGGER_WORDS:
             await self._daniel_handoff(phone, session, context=f"[demo-number] {body}")
+            try:
+                await onboarding_alert.maybe_alert_human(
+                    phone, session,
+                    f"Demo user asked to talk to a human: {body.strip()[:160]!r}",
+                    force=True, session_kind="demo",
+                )
+            except Exception:
+                logger.exception("[ALERT] demo human-request alert failed for %s", phone)
             await self._send_demo(phone, _demo_text(_DEMO_HANDOFF_ACK, lang))
             return
+
+        # Off-context / inappropriate in the demo → alert a human IN PARALLEL,
+        # but do NOT stop: fall through so the LLM still gives its (good) reply.
+        if _support_cat == "inappropriate":
+            try:
+                await onboarding_alert.maybe_alert_human(
+                    phone, session,
+                    f"Demo user went off-context / inappropriate: {body.strip()[:160]!r}",
+                    session_kind="demo",
+                )
+            except Exception:
+                logger.exception("[ALERT] demo inappropriate alert failed for %s", phone)
 
         # "I want to connect" → point them to the real onboarding number.
         wants_connect = _is_demo_connect_intent(body) or (
@@ -4812,6 +4924,47 @@ class OnboardingService:
         return "\n".join(lines)
 
     async def _run_places_search(
+        self,
+        session: dict,
+        phone: str,
+        query: str,
+        push_name: str,
+        original_body: str | None = None,
+    ) -> None:
+        """Guaranteed-reply wrapper around the Places search (client feedback
+        2026-07-27, Issue 4).
+
+        The underlying search already returns gracefully on API failure/timeout,
+        but a defect anywhere in the result handling (LLM fallback, localization,
+        etc.) must never leave the owner staring at nothing. Any unexpected
+        exception is caught here and turned into a helpful, localized message that
+        keeps onboarding moving, and the gate is released so they are not stuck.
+        """
+        try:
+            await self._run_places_search_impl(
+                session, phone, query, push_name, original_body=original_body,
+            )
+        except Exception as exc:
+            logger.exception("[ONBOARDING] Places search crashed for %r: %s", query, exc)
+            try:
+                db.upsert_onboarding_session(phone, {"currentStep": "conversing"})
+                session["currentStep"] = "conversing"
+            except Exception:
+                pass
+            fallback = (
+                "Hmm, I couldn't look that up just now 😅 No problem — could you share "
+                "your business name and city, or a website / Instagram / Google Maps "
+                "link? I'll take it from there."
+            )
+            try:
+                fallback = await self._localize_static(
+                    fallback, original_body or query, session.get("language", "en"),
+                )
+            except Exception:
+                pass
+            await self._send(phone, fallback)
+
+    async def _run_places_search_impl(
         self,
         session: dict,
         phone: str,
@@ -7072,6 +7225,161 @@ class OnboardingService:
                 "⏱ *QR code expired.*\n\n"
                 "Reply *refresh* for a new QR code or *code* to switch to a pairing code.",
             )
+
+    # ── admin manual pairing (human-support dashboard tool) ──────────────
+    # Used by the internal analytics dashboard so a human agent can pair a
+    # business owner's WhatsApp for them when the owner can't do it in-chat.
+    # Reuses the exact same bridge calls + auto-finalize polls as Sofia, so a
+    # manually generated code/QR completes onboarding end-to-end on link.
+
+    async def admin_pairing_status(self, phone: str) -> dict:
+        """Return the bridge session status for biz-<phone> (dashboard helper)."""
+        phone = db._clean_phone(phone)
+        if not phone or not phone.isdigit() or len(phone) < 8:
+            return {"ok": False, "error": "Enter a valid phone number (country code + number, digits only)."}
+        pairing_sid = f"biz-{phone}"
+        try:
+            status = await self.wa.get_session_status(pairing_sid)
+        except Exception as exc:
+            return {
+                "ok": False, "sessionId": pairing_sid, "phone": phone,
+                "status": "unreachable", "error": f"Bridge unreachable: {exc}"[:200],
+            }
+        biz = None
+        try:
+            biz = db.get_business_by_owner_phone(phone)
+        except Exception:
+            pass
+        sess = None
+        try:
+            sess = db.get_onboarding_session(phone)
+        except Exception:
+            pass
+        return {
+            "ok": True,
+            "sessionId": pairing_sid,
+            "phone": phone,
+            "status": status.get("status"),
+            "paired": bool(status.get("paired")),
+            "pairedPhone": status.get("phone") or "",
+            "businessName": (biz or {}).get("name") or (biz or {}).get("businessName") or "",
+            "hasBusiness": bool(biz),
+            "onboardingStep": (sess or {}).get("currentStep") or "",
+        }
+
+    def _arm_manual_pairing_poll(self, phone: str, pairing_sid: str, mode: str) -> None:
+        """Put the onboarding session into the right pairing state and start the
+        auto-finalize poll, so a manually generated code/QR completes onboarding
+        (waSessionId + trial + owner confirmation) the moment the device links —
+        exactly as if Sofia had sent it. Only called when a registered business
+        exists for the phone, so we never yank an unrelated chat into pairing.
+        """
+        attempt_id = datetime.utcnow().isoformat()
+        if mode == "qr":
+            db.upsert_onboarding_session(phone, {
+                "currentStep": "pairing_qr_active",
+                "pairingSessionId": pairing_sid,
+                "qrAttemptId": attempt_id,
+            })
+            asyncio.ensure_future(
+                self._poll_qr_pairing_status(phone, pairing_sid, attempt_id)
+            )
+        else:
+            db.upsert_onboarding_session(phone, {
+                "currentStep": "pairing",
+                "pairingSessionId": pairing_sid,
+                "pairingAttemptId": attempt_id,
+            })
+            sess = db.get_onboarding_session(phone) or {}
+            asyncio.ensure_future(
+                self._poll_pairing_status(phone, pairing_sid, sess, attempt_id)
+            )
+        logger.info("[ADMIN-PAIR] Armed %s auto-finalize poll for %s (session=%s)", mode, phone, pairing_sid)
+
+    async def admin_generate_pairing(self, phone: str, mode: str = "code") -> dict:
+        """Generate a fresh pairing CODE (default) or QR for biz-<phone> so a
+        human-support agent can link a stuck owner's WhatsApp manually.
+
+        When a registered business + onboarding session exist for the phone, the
+        auto-finalize poll is armed so onboarding completes the instant the owner
+        links — no further owner action needed. Returns a dict for the dashboard.
+        """
+        phone = db._clean_phone(phone)
+        if not phone or not phone.isdigit() or len(phone) < 8:
+            return {"ok": False, "error": "Enter a valid phone number (country code + number, digits only)."}
+        mode = "qr" if str(mode).lower() == "qr" else "code"
+        pairing_sid = f"biz-{phone}"
+
+        # Already linked & connected → nothing to do.
+        try:
+            status = await self.wa.get_session_status(pairing_sid)
+        except Exception:
+            status = {}
+        if status.get("paired") and status.get("status") == "connected":
+            return {
+                "ok": True, "alreadyConnected": True, "sessionId": pairing_sid,
+                "phone": phone, "status": "connected",
+                "message": "This number is already linked and connected — no pairing needed.",
+            }
+
+        session = None
+        try:
+            session = db.get_onboarding_session(phone)
+        except Exception:
+            pass
+        can_autofinalize = bool(session and session.get("businessId"))
+
+        if mode == "qr":
+            try:
+                qr = await self.wa.get_qr_payload(pairing_sid, timeout_seconds=20)
+            except PairingStateConflict:
+                try:
+                    await self.wa.reconnect_session(pairing_sid)
+                except Exception:
+                    pass
+                return {
+                    "ok": True, "alreadyConnected": True, "sessionId": pairing_sid,
+                    "phone": phone, "status": "connected",
+                    "message": "This number is already linked — reconnecting the existing device.",
+                }
+            except Exception as exc:
+                return {"ok": False, "error": f"Could not generate a QR code: {exc}"[:200]}
+            payload = qr.get("qr_payload", "")
+            try:
+                import base64
+                png = self._qr_payload_to_png_bytes(payload)
+                data_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+            except Exception as exc:
+                return {"ok": False, "error": f"Could not render the QR image: {exc}"[:200]}
+            if can_autofinalize:
+                self._arm_manual_pairing_poll(phone, pairing_sid, mode="qr")
+            return {
+                "ok": True, "mode": "qr", "qrDataUrl": data_url, "sessionId": pairing_sid,
+                "phone": phone, "autoFinalize": can_autofinalize,
+            }
+
+        # default: pairing code
+        try:
+            result = await self.wa.generate_pair_code(pairing_sid, f"+{phone}")
+        except PairingStateConflict:
+            try:
+                await self.wa.reconnect_session(pairing_sid)
+            except Exception:
+                pass
+            return {
+                "ok": True, "alreadyConnected": True, "sessionId": pairing_sid,
+                "phone": phone, "status": "connected",
+                "message": "This number is already linked — reconnecting the existing device.",
+            }
+        except Exception as exc:
+            return {"ok": False, "error": f"Could not generate a pairing code: {exc}"[:200]}
+        code = result.get("code", "")
+        if can_autofinalize:
+            self._arm_manual_pairing_poll(phone, pairing_sid, mode="code")
+        return {
+            "ok": True, "mode": "code", "code": code, "sessionId": pairing_sid,
+            "phone": phone, "autoFinalize": can_autofinalize,
+        }
 
     # ── step transition helpers ──────────────────────────────────────────
 

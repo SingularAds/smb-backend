@@ -718,6 +718,22 @@ async def _process_webhook(payload: dict) -> None:
             _log_event("skipped", phone=phone, message_id=message_id, detail="duplicate (bridge retry)")
             return
 
+        # ── Cross-instance dedup (fixes duplicate replies) ───────────────────
+        # The in-memory cache above only guards THIS process. Both the backend
+        # and the bridge run multiple Cloud Run instances, so the same message
+        # can reach different backend instances (several bridge instances, or a
+        # bridge retry landing elsewhere) and slip past it — the user then gets
+        # two identical replies. An atomic Firestore claim makes exactly one
+        # instance win; the rest drop it. Fail-open, so a Firestore hiccup never
+        # loses a real message.
+        if message_id and not db.claim_webhook_once(f"message:{device_id}:{message_id}"):
+            logger.info(
+                "[WEBHOOK] skipped — already claimed by another instance message_id=%r from %s",
+                message_id, phone,
+            )
+            _log_event("skipped", phone=phone, message_id=message_id, detail="duplicate (cross-instance)")
+            return
+
         # ── Outbound-echo suppression: drop echoes of messages we sent ────────
         # The bridge fires a webhook for every message it delivers (including ones
         # we asked it to send). Those echoes have a fresh message_id returned by

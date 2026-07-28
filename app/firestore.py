@@ -868,6 +868,50 @@ def delete_onboarding_session(phone: str) -> None:
     _db().collection("onboarding_sessions").document(phone_clean).delete()
 
 
+def claim_webhook_once(dedup_key: str, ttl_seconds: int = 300) -> bool:
+    """Atomically claim a webhook for one-time processing (cross-instance safe).
+
+    Returns True if this call is the FIRST to claim ``dedup_key`` (the caller
+    should process the message), or False if it was already claimed (a duplicate
+    delivery — the caller must skip it).
+
+    Why this exists: the webhook handler's in-process ``_seen_message_ids`` cache
+    only guards ONE backend instance. Both the bridge and the backend run several
+    Cloud Run instances, so the same WhatsApp message can be delivered to
+    different backend instances (multiple bridge instances, or a bridge retry) and
+    slip past the in-memory cache — producing duplicate AI replies. Firestore's
+    ``create()`` is atomic across all instances, so exactly one claimant wins.
+
+    Fail-OPEN: on any Firestore error this returns True (process), so a Firestore
+    hiccup never drops a real message — the in-memory cache still guards
+    same-instance retries.
+
+    ``expireAt`` is written as a Timestamp so an (optional) Firestore TTL policy
+    on the ``webhook_dedup`` collection can auto-purge old rows and keep it
+    bounded. Rows are tiny, so it is safe to run without a policy too.
+    """
+    import hashlib
+    from google.api_core import exceptions as _gexc
+
+    if not dedup_key:
+        return True
+    doc_id = hashlib.sha256(dedup_key.encode("utf-8")).hexdigest()
+    now = datetime.utcnow()
+    ref = _db().collection("webhook_dedup").document(doc_id)
+    try:
+        ref.create({
+            "key": dedup_key,
+            "createdAt": now.isoformat(),
+            "expireAt": now + timedelta(seconds=ttl_seconds),
+        })
+        return True
+    except _gexc.AlreadyExists:
+        return False
+    except Exception as exc:
+        logger.warning("[DEDUP] claim_webhook_once failed for %r (fail-open): %s", dedup_key, exc)
+        return True
+
+
 def list_onboarding_sessions_active_between(
     start_iso: str, end_iso: str, limit: int = 1000
 ) -> list[dict]:
