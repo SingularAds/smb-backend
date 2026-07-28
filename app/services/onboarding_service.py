@@ -476,9 +476,11 @@ DEMO SEQUENCE (follow in order — do NOT skip step 5):
   Then reassure them on trust: it runs on THEIR own number via WhatsApp's official
   Linked Devices, their number stays theirs, they disconnect in 2 taps anytime,
   and their customers' data is always private and protected (LGPD) — that same
-  care is how we help THEM earn their customers' trust. Connecting takes ~2 minutes.
-  Invite them to start the free trial or ask anything. On this closing message,
-  and ONLY this one, append the token [DEMO_DONE] on its own line at the very end.
+  care is how we help THEM earn their customers' trust. Keep it warm and SHORT.
+  On this closing message, and ONLY this one, append the token [DEMO_DONE] on its
+  own line at the very end. Do NOT paste a link or spell out the sign-up steps
+  here — right after your close the system automatically sends them their link to
+  go finish setup, so leave that part to it.
 
 AFTER THE CLOSE (free chat): answer product questions briefly, then nudge back to
 the free trial. Never argue.
@@ -504,6 +506,18 @@ if nothing interrupted it. Never sound defensive. Facts you can use:
   and can be deleted anytime. We never share it.
 - You can verify the company at www.recepte.co.
 
+QUESTIONS ANY TIME (mid-demo interruptions): If they break the role-play with a
+real question (pricing, how setup works, what happens after, "does it do X?"…),
+answer it briefly — 1-2 short lines — then smoothly pick the demo back up EXACTLY
+where it paused. Never ignore a question just to push the script.
+
+WHEN YOU'RE NOT SURE (important): If they ask something about Recepte you don't
+actually know — a price/plan not listed here, a custom setup or integration,
+billing specifics, anything beyond your facts — do NOT invent an answer. Say
+briefly and honestly that a teammate will confirm the exact details, and append
+the token [NEEDS_HUMAN] on its own line at the very end of THAT message. (The
+system quietly notifies our team; you keep chatting normally.)
+
 NEVER ask for CPF, credit card, passwords, or SMS codes. If they offer any, refuse
 warmly ("não preciso disso") and do not store it.
 
@@ -514,8 +528,9 @@ SPECIAL CASES:
 - A real customer messaging by mistake: gently explain this is a Recepte demo.
 - Competitor asking technical/architecture questions: stay vague, redirect.
 
-Output ONLY the message text to send. No JSON, no metadata (except the single
-[DEMO_DONE] token on the final close message).
+Output ONLY the message text to send. No JSON, no metadata — except the control
+tokens [DEMO_DONE] (only on the final close message) and [NEEDS_HUMAN] (only when
+you couldn't confidently answer), each on its own line at the very end.
 """
 
 # Beat-0 greeting — sent deterministically so the FIRST demo reply is instant and
@@ -557,6 +572,89 @@ _DEMO_PREFILL_TEXTS: dict[str, str] = {
 def _demo_prefill_text(lang: str) -> str:
     lang2 = (lang or "en")[:2].lower()
     return _DEMO_PREFILL_TEXTS.get(lang2, _DEMO_PREFILL_TEXTS["en"])
+
+
+# Pre-filled text for the "go BACK to finish onboarding" wa.me link sent at the
+# end of the demo. Points at the SAME global number the prospect came from, so
+# any message resumes their onboarding exactly where they left off.
+_DEMO_RETURN_PREFILL_TEXTS: dict[str, str] = {
+    "pt": "Voltei pra terminar meu cadastro",
+    "en": "I'm back to finish my setup",
+    "es": "Volví para terminar mi registro",
+}
+
+
+def _demo_return_prefill(lang: str) -> str:
+    lang2 = (lang or "pt")[:2].lower()
+    return _DEMO_RETURN_PREFILL_TEXTS.get(lang2, _DEMO_RETURN_PREFILL_TEXTS["pt"])
+
+
+# End-of-demo guidance (client 2026-07-28). Two SHORT messages: (1) end the demo
+# and send them back to finish onboarding + pair their WhatsApp on the SAME
+# global number they came from; (2) point to recepte.co and invite questions or
+# a human handoff. Kept tight on purpose — people don't read long messages.
+_DEMO_GUIDANCE_REDIRECT: dict[str, str] = {
+    "pt": (
+        "É o fim do demo 🎬 Pra ativar isso no SEU negócio, volte de onde parou e "
+        "conecte seu WhatsApp (pelo WhatsApp oficial). Seu link pra continuar 👉 {link}"
+    ),
+    "en": (
+        "That's the demo 🎬 To turn this on for YOUR business, pick up where you "
+        "left off and connect your WhatsApp (via official WhatsApp). Your link to continue 👉 {link}"
+    ),
+    "es": (
+        "Fin del demo 🎬 Para activarlo en TU negocio, retoma donde lo dejaste y "
+        "conecta tu WhatsApp (por WhatsApp oficial). Tu enlace para continuar 👉 {link}"
+    ),
+}
+
+_DEMO_GUIDANCE_REDIRECT_NOLINK: dict[str, str] = {
+    "pt": (
+        "É o fim do demo 🎬 Pra ativar no SEU negócio, volte ao seu onboarding e "
+        "conecte seu WhatsApp pelo app oficial. Precisa de ajuda? É só falar 😊"
+    ),
+    "en": (
+        "That's the demo 🎬 To turn this on for YOUR business, head back to your "
+        "onboarding and connect your WhatsApp via the official app. Need a hand? Just say so 😊"
+    ),
+    "es": (
+        "Fin del demo 🎬 Para activarlo en TU negocio, vuelve a tu onboarding y "
+        "conecta tu WhatsApp por la app oficial. ¿Necesitas ayuda? Solo dilo 😊"
+    ),
+}
+
+_DEMO_GUIDANCE_QUERIES: dict[str, str] = {
+    "pt": (
+        "Sobre a gente: recepte.co 💚 Ficou alguma dúvida sobre a Recepte ou os "
+        "próximos passos? Posso responder aqui. Se preferir, eu passo seus dados "
+        "pro nosso time humano te ajudar a finalizar — é só dizer *sim*."
+    ),
+    "en": (
+        "About us: recepte.co 💚 Any questions about Recepte or the next steps? I "
+        "can answer here. Or I can share your details with our human team to help "
+        "you finish setup — just say *yes*."
+    ),
+    "es": (
+        "Sobre nosotros: recepte.co 💚 ¿Alguna duda sobre Recepte o los próximos "
+        "pasos? Puedo responder aquí. O comparto tus datos con nuestro equipo "
+        "humano para ayudarte a terminar — solo di *sí*."
+    ),
+}
+
+# Shorter re-send of just the return link (if they ask to connect again after the
+# full guidance has already gone out).
+_DEMO_RETURN_ONLY: dict[str, str] = {
+    "pt": "Seu link pra continuar o onboarding 👉 {link}",
+    "en": "Your link to continue onboarding 👉 {link}",
+    "es": "Tu enlace para continuar el onboarding 👉 {link}",
+}
+
+# Acknowledgement after the prospect accepts the human-support handoff at the end.
+_DEMO_HUMAN_SHARED_ACK: dict[str, str] = {
+    "pt": "Combinado! 🙌 Já compartilhei seu contato com nosso time — eles vão te chamar pra te ajudar a finalizar.",
+    "en": "Done! 🙌 I've shared your details with our team — they'll reach out to help you finish.",
+    "es": "¡Listo! 🙌 Compartí tus datos con nuestro equipo — te contactarán para ayudarte a terminar.",
+}
 
 
 # Small fixed strings used by the dedicated demo number, per language (the demo
@@ -4290,6 +4388,15 @@ class OnboardingService:
             return True, reply.replace("[DEMO_DONE]", "").strip()
         return False, reply
 
+    @staticmethod
+    def _strip_needs_human(reply: str) -> tuple[bool, str]:
+        """Detect + strip the [NEEDS_HUMAN] marker. Sofia appends it when she is
+        NOT sure about a Recepte / pricing / plan / configuration question, so we
+        can quietly page a human while she still gives her best reply."""
+        if "[NEEDS_HUMAN]" in reply:
+            return True, reply.replace("[NEEDS_HUMAN]", "").strip()
+        return False, reply
+
     async def _start_salao_bella_demo(
         self,
         session: dict,
@@ -4531,10 +4638,29 @@ class OnboardingService:
         name = push_name or ""
         greeting = _demo_greeting(lang, name)
         now = datetime.utcnow().isoformat()
+
+        # Remember which GLOBAL onboarding number this prospect came from (there
+        # are several global numbers but only ONE demo number). The demo session
+        # is keyed by the same phone as their onboarding session, so we can read
+        # its onboardingDeviceId now and, at the end of the demo, send them BACK
+        # to that exact number to resume onboarding where they left off. Empty
+        # when they reached the demo some other way (e.g. the standalone page).
+        origin_device = ""
+        origin_number = ""
+        try:
+            onb = db.get_onboarding_session(phone) or {}
+            origin_device = (onb.get("onboardingDeviceId") or "").strip()
+            if origin_device:
+                origin_number = global_numbers.number_for_device(origin_device)
+        except Exception:
+            logger.debug("[DEMO-NUMBER] origin lookup failed for %s", phone, exc_info=True)
+
         db.upsert_demo_session(phone, {
             "phone": phone,
             "pushName": name,
             "language": lang,
+            "originDevice": origin_device,
+            "originNumber": origin_number,
             "demoHistory": [
                 {"role": "user", "content": body},
                 {"role": "assistant", "content": greeting},
@@ -4569,6 +4695,26 @@ class OnboardingService:
             if switched in _DEMO_LANG_NAMES and switched != lang:
                 lang = switched
                 session["language"] = lang
+
+        # Post-demo human-support opt-in: the closing guidance offered to loop in
+        # a human ("just say yes"). This one reply is the answer — if it's a bare
+        # "yes", share their context with the alert number and confirm; otherwise
+        # clear the flag and let the demo answer their question normally. (Explicit
+        # later "human" requests are still caught by the classifier below.)
+        if session.get("awaitingHumanSupportAnswer"):
+            db.upsert_demo_session(phone, {"awaitingHumanSupportAnswer": False})
+            session["awaitingHumanSupportAnswer"] = False
+            if _is_affirmative(body):
+                try:
+                    await onboarding_alert.maybe_alert_human(
+                        phone, session,
+                        "Demo user accepted the offer to have a human help finish onboarding.",
+                        force=True, session_kind="demo",
+                    )
+                except Exception:
+                    logger.exception("[ALERT] demo human-support opt-in failed for %s", phone)
+                await self._send_demo(phone, _demo_text(_DEMO_HUMAN_SHARED_ACK, lang))
+                return
 
         # Human handoff — explicit human request (a bare Daniel keyword OR a
         # natural phrase like "I want to contact human support" that the strict
@@ -4605,18 +4751,19 @@ class OnboardingService:
             session.get("demoSoftCloseReached") and _is_affirmative(body)
         )
         if wants_connect:
-            await self._demo_number_close(phone, lang)
+            await self._demo_number_close(phone, lang, session)
             return
 
         count = int(session.get("demoMsgCount", 0)) + 1
         if count > 40:  # anti abuse / cost-burn
-            await self._demo_number_close(phone, lang)
+            await self._demo_number_close(phone, lang, session)
             return
 
         demo_history = session.get("demoHistory", [])
         demo_history.append({"role": "user", "content": body})
         reply = await self._get_demo_response(demo_history, name, lang)
         soft_close, clean = self._strip_demo_done(reply)
+        needs_human, clean = self._strip_needs_human(clean)
         demo_history.append({"role": "assistant", "content": clean})
         db.upsert_demo_session(phone, {
             "demoHistory": demo_history[-24:],
@@ -4627,39 +4774,94 @@ class OnboardingService:
         })
         await self._send_demo(phone, clean)
 
-    async def _demo_number_close(self, phone: str, lang: str) -> None:
-        """Close the demo and point the prospect to the real onboarding number."""
-        # Picks the PRIMARY global number (first entry in the multi-number
-        # registry, or the single legacy number when only one is configured) —
-        # see app/services/global_numbers.py.
-        onboarding_number = global_numbers.primary_number()
-        closes = {
-            "pt": "Perfeito! 🎉 Pra ativar isso no SEU número é só falar com a gente aqui 👉 {link}",
-            "en": "Perfect! 🎉 To set this up on YOUR number, just message us here 👉 {link}",
-            "es": "¡Perfecto! 🎉 Para activarlo en TU número, escríbenos aquí 👉 {link}",
-        }
-        no_link = {
-            "pt": "Perfeito! 🎉 Pra ativar no SEU número, acesse recepte.co e comece o teste grátis.",
-            "en": "Perfect! 🎉 To set this up on YOUR number, go to recepte.co and start the free trial.",
-            "es": "¡Perfecto! 🎉 Para activarlo en TU número, entra en recepte.co y empieza la prueba gratis.",
-        }
-        start_texts = {
-            "pt": "Quero começar com a Recepte",
-            "en": "I want to get started with Recepte",
-            "es": "Quiero empezar con Recepte",
-        }
+        # Sofia flagged she couldn't confidently answer a business / pricing / plan
+        # / config question → notify a human IN PARALLEL. She already replied; the
+        # demo never pauses or stops (client 2026-07-28).
+        if needs_human:
+            try:
+                await onboarding_alert.maybe_alert_human(
+                    phone, session,
+                    f"Demo: unsure about a business/pricing/config question. Client asked: {body.strip()[:160]!r}",
+                    session_kind="demo",
+                )
+            except Exception:
+                logger.exception("[ALERT] demo needs-human alert failed for %s", phone)
+
+        # The demo reached its natural end (beat-6 close, [DEMO_DONE]) → follow up
+        # with the concrete next steps: the link BACK to their OWN onboarding
+        # number to finish + pair WhatsApp, then the recepte.co / questions /
+        # human-support offer. Sent once per session.
+        if soft_close and not session.get("demoGuidanceSent"):
+            await asyncio.sleep(1)
+            await self._demo_number_close(phone, lang, session)
+
+    async def _demo_return_link(self, phone: str, session: dict, lang: str) -> str:
+        """A wa.me link BACK to the SAME global onboarding number the prospect came
+        from, so any message there resumes onboarding where they left off. Prefers
+        the origin captured when the demo started; falls back to a live lookup of
+        their onboarding session, then to the primary global number. Returns ""
+        when no global number is configured at all."""
+        number = (session.get("originNumber") or "").strip()
+        if not number:
+            device = (session.get("originDevice") or "").strip()
+            if device:
+                number = global_numbers.number_for_device(device)
+        if not number:
+            try:
+                onb = db.get_onboarding_session(phone) or {}
+                dev = (onb.get("onboardingDeviceId") or "").strip()
+                if dev:
+                    number = global_numbers.number_for_device(dev)
+            except Exception:
+                pass
+        if not number:
+            number = global_numbers.primary_number()
+        if not number:
+            return ""
+        return f"https://wa.me/{number}?text={quote(_demo_return_prefill(lang))}"
+
+    async def _demo_number_close(self, phone: str, lang: str, session: dict | None = None) -> None:
+        """End the demo with the concrete next steps (client 2026-07-28).
+
+        Two SHORT messages: (1) end the demo and send the prospect BACK to the
+        SAME global onboarding number they came from, to finish setup + pair their
+        WhatsApp; (2) point to recepte.co and invite questions or a human handoff
+        ("say yes"). Idempotent — the full guidance goes out once per session; a
+        later connect intent just re-sends the return link.
+        """
+        if session is None:
+            session = db.get_demo_session(phone) or {}
         lang2 = (lang or "pt")[:2].lower()
-        if onboarding_number:
-            prefill = start_texts.get(lang2) or start_texts["pt"]
-            link = f"https://wa.me/{onboarding_number}?text={quote(prefill)}"
-            msg = (closes.get(lang2) or closes["pt"]).replace("{link}", link)
+        link = await self._demo_return_link(phone, session, lang)
+
+        # Already guided once → just re-send the return link (if they ask again),
+        # without repeating the whole close.
+        if session.get("demoGuidanceSent"):
+            if link:
+                msg = (_DEMO_RETURN_ONLY.get(lang2) or _DEMO_RETURN_ONLY["pt"]).replace("{link}", link)
+                await self._send_demo(phone, msg)
+            return
+
+        # Message 1 — end the demo + link BACK to THEIR own onboarding number.
+        if link:
+            msg1 = (_DEMO_GUIDANCE_REDIRECT.get(lang2) or _DEMO_GUIDANCE_REDIRECT["pt"]).replace("{link}", link)
         else:
-            msg = no_link.get(lang2) or no_link["pt"]
-        db.upsert_demo_session(phone, {
+            msg1 = _DEMO_GUIDANCE_REDIRECT_NOLINK.get(lang2) or _DEMO_GUIDANCE_REDIRECT_NOLINK["pt"]
+        await self._send_demo(phone, msg1)
+        await asyncio.sleep(1)
+
+        # Message 2 — recepte.co + questions + human-support offer ("just say yes").
+        msg2 = _DEMO_GUIDANCE_QUERIES.get(lang2) or _DEMO_GUIDANCE_QUERIES["pt"]
+        await self._send_demo(phone, msg2)
+
+        updates = {
             "demoSoftCloseReached": True,
+            "demoGuidanceSent": True,
+            "awaitingHumanSupportAnswer": True,
             "lastActivityAt": datetime.utcnow().isoformat(),
-        })
-        await self._send_demo(phone, msg)
+        }
+        db.upsert_demo_session(phone, updates)
+        session.update(updates)
         try:
             posthog_client.capture(
                 business_id=phone, customer_phone=phone, event="demo_cta_clicked",
@@ -4667,7 +4869,7 @@ class OnboardingService:
             )
         except Exception:
             pass
-        logger.info("[DEMO-NUMBER] closed to onboarding for %s", phone)
+        logger.info("[DEMO-NUMBER] end-of-demo guidance sent for %s (link=%s)", phone, bool(link))
 
     # ── Demo interrupt: pause onboarding, run demo, resume after ─────────
 
@@ -7296,6 +7498,58 @@ class OnboardingService:
             )
         logger.info("[ADMIN-PAIR] Armed %s auto-finalize poll for %s (session=%s)", mode, phone, pairing_sid)
 
+    @staticmethod
+    def _is_transient_bridge_error(exc: Exception) -> bool:
+        """True for the 'socket not ready yet' class of failure that clears on a
+        second try: a 5xx from the bridge, or a connection/timeout error. The
+        FIRST pair-code/QR request on a cold biz-<phone> session often trips this
+        while the bridge is still bringing up the WhatsApp websocket; the retry
+        (once the socket is warm) succeeds. Genuine 4xx / value errors are NOT
+        transient — they fall through to the normal (red) error message."""
+        resp = getattr(exc, "response", None)
+        if resp is not None and getattr(resp, "status_code", 0) >= 500:
+            return True
+        if type(exc).__name__ in {
+            "ConnectError", "ConnectTimeout", "ReadTimeout", "ReadError",
+            "WriteError", "WriteTimeout", "PoolTimeout", "RemoteProtocolError",
+            "ConnectionError", "TimeoutException", "NetworkError",
+        }:
+            return True
+        msg = str(exc).lower()
+        return any(
+            k in msg for k in (
+                "socket", "connection", "timed out", "timeout",
+                "econnrefused", "reset by peer", "handshake",
+            )
+        )
+
+    async def _warm_pairing_socket(self, pairing_sid: str) -> None:
+        """Best-effort nudge so the WhatsApp websocket for biz-<phone> is up by
+        the time the agent clicks Generate again. Failures are expected and
+        harmless (a never-linked session has nothing to 'reconnect'); the earlier
+        failed pair request already kicked off the handshake."""
+        try:
+            await self.wa.reconnect_session(pairing_sid)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _pairing_retryable(pairing_sid: str, phone: str, *, mode: str) -> dict:
+        """A friendly 'try once more' result for the transient first-attempt
+        socket error — the dashboard renders this in yellow, not as a red 500."""
+        what = "QR code" if mode == "qr" else "pairing code"
+        return {
+            "ok": False,
+            "retryable": True,
+            "sessionId": pairing_sid,
+            "phone": phone,
+            "mode": mode,
+            "warning": (
+                "Connected to WhatsApp — the link just needed to warm up on the "
+                f"first try. Click Generate once more to get the {what}."
+            ),
+        }
+
     async def admin_generate_pairing(self, phone: str, mode: str = "code") -> dict:
         """Generate a fresh pairing CODE (default) or QR for biz-<phone> so a
         human-support agent can link a stuck owner's WhatsApp manually.
@@ -7343,6 +7597,9 @@ class OnboardingService:
                     "message": "This number is already linked — reconnecting the existing device.",
                 }
             except Exception as exc:
+                if self._is_transient_bridge_error(exc):
+                    asyncio.ensure_future(self._warm_pairing_socket(pairing_sid))
+                    return self._pairing_retryable(pairing_sid, phone, mode="qr")
                 return {"ok": False, "error": f"Could not generate a QR code: {exc}"[:200]}
             payload = qr.get("qr_payload", "")
             try:
@@ -7372,6 +7629,9 @@ class OnboardingService:
                 "message": "This number is already linked — reconnecting the existing device.",
             }
         except Exception as exc:
+            if self._is_transient_bridge_error(exc):
+                asyncio.ensure_future(self._warm_pairing_socket(pairing_sid))
+                return self._pairing_retryable(pairing_sid, phone, mode="code")
             return {"ok": False, "error": f"Could not generate a pairing code: {exc}"[:200]}
         code = result.get("code", "")
         if can_autofinalize:

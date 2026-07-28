@@ -30,6 +30,7 @@ export function PairingPage({ onAuthFail }: { onAuthFail: () => void }) {
   const [result, setResult] = useState<PairingResult | null>(null);
   const [status, setStatus] = useState<PairingStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
   const cleanedPhone = phone.replace(/[^\d]/g, "");
@@ -48,12 +49,23 @@ export function PairingPage({ onAuthFail }: { onAuthFail: () => void }) {
     if (!canSubmit) return;
     setBusy("generate");
     setError(null);
+    setWarning(null);
     setResult(null);
     setCopied(false);
     try {
       const res = await generatePairing(cleanedPhone, mode);
-      setResult(res);
-      if (!res.ok && res.error) setError(res.error);
+      // A transient first-attempt socket warm-up isn't a failure — the bridge is
+      // just bringing up the WhatsApp connection. Show it in yellow with a
+      // "click once more" nudge instead of a red error.
+      if (!res.ok && res.retryable) {
+        setWarning(
+          res.warning ||
+            "Connecting to WhatsApp — click Generate once more to get the code.",
+        );
+      } else {
+        setResult(res);
+        if (!res.ok && res.error) setError(res.error);
+      }
     } catch (err) {
       handleError(err);
     } finally {
@@ -65,6 +77,7 @@ export function PairingPage({ onAuthFail }: { onAuthFail: () => void }) {
     if (cleanedPhone.length < 8 || busy !== null) return;
     setBusy("status");
     setError(null);
+    setWarning(null);
     try {
       const res = await fetchPairingStatus(cleanedPhone);
       setStatus(res);
@@ -158,6 +171,16 @@ export function PairingPage({ onAuthFail }: { onAuthFail: () => void }) {
             {busy === "status" ? "Checking…" : "Check status"}
           </button>
         </form>
+
+        {warning ? (
+          <div
+            role="status"
+            className="mt-3 flex items-start gap-2 rounded-md border border-[var(--status-warning)] bg-[rgba(250,178,25,0.12)] px-3 py-2 text-xs font-medium text-[var(--status-warning)] border-opacity-40"
+          >
+            <span aria-hidden>⏳</span>
+            <span>{warning}</span>
+          </div>
+        ) : null}
 
         {error ? (
           <p role="alert" className="mt-3 text-xs font-medium text-[var(--status-critical)]">

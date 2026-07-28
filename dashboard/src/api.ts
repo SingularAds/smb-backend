@@ -122,6 +122,9 @@ export interface PairingResult {
   autoFinalize?: boolean;
   alreadyConnected?: boolean;
   status?: string;
+  /** Transient first-attempt socket warm-up — show as a soft "try again", not an error. */
+  retryable?: boolean;
+  warning?: string;
 }
 
 export interface PairingStatus {
