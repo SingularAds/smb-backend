@@ -65,12 +65,15 @@ export function OverviewPage({
   filter,
   funnelRange,
   onFunnelRangeChange,
+  globalDevice,
 }: {
   data: Overview;
   filter: RangeFilter;
   /** the onboarding funnel's own window (all time by default) */
   funnelRange: RangeFilter;
   onFunnelRangeChange: (f: RangeFilter) => void;
+  /** current global-number scope (null = all) — forwarded to the funnel export */
+  globalDevice?: string | null;
 }) {
   const navigate = useNavigate();
   const [quick, setQuick] = useState<QuickFilter>("all");
@@ -261,6 +264,7 @@ export function OverviewPage({
             excludedDemoSessions={data.excludedDemoSessions}
             range={funnelRange}
             onRangeChange={onFunnelRangeChange}
+            globalDevice={globalDevice}
           />
         </div>
         <div className="rise h-full" style={rise(3)}>

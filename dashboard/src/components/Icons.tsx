@@ -155,6 +155,13 @@ export const CheckBoldIcon = ({ className }: IconProps) => (
   </svg>
 );
 
+export const DownloadIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M12 4v11m0 0 4-4m-4 4-4-4" />
+    <path d="M4 19h16" />
+  </Svg>
+);
+
 export const CopyIcon = (p: IconProps) => (
   <Svg {...p}>
     <rect x="9" y="9" width="11" height="11" rx="2" />

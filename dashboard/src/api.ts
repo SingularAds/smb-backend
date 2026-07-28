@@ -1,4 +1,10 @@
-import type { BusinessDetail, GlobalKb, Overview, RangeFilter } from "./types";
+import type {
+  BusinessDetail,
+  GlobalKb,
+  OnboardingChat,
+  Overview,
+  RangeFilter,
+} from "./types";
 
 // The admin key lives in sessionStorage only (cleared when the tab closes) —
 // this is an internal tool behind a shared key, not user auth.
@@ -98,6 +104,55 @@ export function fetchBusinessDetail(
     `/businesses/${encodeURIComponent(businessId)}`,
     rangeParams(filter),
   );
+}
+
+/** Download the onboarding prospects in [from, to] as an .xlsx file.
+ *  Both dates are required (the backend rejects a missing range with 422).
+ *  Mirrors the dashboard funnel (demo/test excluded, same number scope);
+ *  triggers a browser download named by the server's Content-Disposition. */
+export async function downloadOnboardingExport(
+  from: string,
+  to: string,
+  globalDevice?: string | null,
+): Promise<void> {
+  const key = getAdminKey();
+  const params = new URLSearchParams({ from, to });
+  if (globalDevice) params.set("global_device", globalDevice);
+  const res = await fetch(`/api/v1/analytics/onboarding-export?${params}`, {
+    headers: key ? { "x-admin-key": key } : {},
+  });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const errBody = await res.json();
+      if (typeof errBody?.detail === "string") detail = errBody.detail;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new ApiError(res.status, detail);
+  }
+  const blob = await res.blob();
+  const disposition = res.headers.get("Content-Disposition") ?? "";
+  const filename =
+    /filename="([^"]+)"/.exec(disposition)?.[1] ??
+    `onboarding_${from}_to_${to ?? "today"}.xlsx`;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/** The owner↔Sofia onboarding conversation for one prospect phone, read from
+ *  the onboarding_transcripts archive (templates included). Powers the funnel
+ *  drill-down's "view conversation" button. Rejects with a 404 ApiError when
+ *  no messages exist for that phone. */
+export function fetchOnboardingChat(phone: string): Promise<OnboardingChat> {
+  const params = new URLSearchParams({ phone });
+  return apiGet<OnboardingChat>("/onboarding-chat", params);
 }
 
 export function fetchGlobalKb(): Promise<GlobalKb> {

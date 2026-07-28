@@ -168,6 +168,7 @@ function OverviewRoute({
         filter={filter}
         funnelRange={funnelRange}
         onFunnelRangeChange={onFunnelRangeChange}
+        globalDevice={globalDevice}
       />
     </div>
   );

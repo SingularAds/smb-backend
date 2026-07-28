@@ -4,6 +4,8 @@ import { isAllTime } from "../types";
 import { ChartCard } from "./ChartCard";
 import { DateRangeDropdown } from "./DateRangeDropdown";
 import { FunnelDrillModal } from "./FunnelDrillModal";
+import { FunnelExportModal } from "./FunnelExportModal";
+import { DownloadIcon } from "./Icons";
 import { fmtDate, fmtNumber, fmtPercent } from "../lib/format";
 
 // Onboarding registration funnel: 4 ordered stages → horizontal bars on an
@@ -25,15 +27,19 @@ export function FunnelChart({
   excludedDemoSessions = 0,
   range,
   onRangeChange,
+  globalDevice,
 }: {
   stages: FunnelStage[];
   excludedDemoSessions?: number;
   /** the funnel's OWN window — all time by default, independent of the page filter */
   range?: RangeFilter;
   onRangeChange?: (f: RangeFilter) => void;
+  /** current global-number scope (null = all) — passed through to the export */
+  globalDevice?: string | null;
 }) {
   const max = Math.max(1, ...stages.map((s) => s.count));
   const [drillStage, setDrillStage] = useState<FunnelStage | null>(null);
+  const [exportOpen, setExportOpen] = useState(false);
 
   // Say plainly what the bars cover, since it is NOT the page's date filter.
   const windowLabel = !range
@@ -173,14 +179,26 @@ export function FunnelChart({
         chart={chart}
         table={table}
         headerExtra={
-          range && onRangeChange ? (
-            <DateRangeDropdown
-              filter={range}
-              onChange={onRangeChange}
-              allowAllTime
-              label="Onboarding funnel date range"
-            />
-          ) : null
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setExportOpen(true)}
+              title="Export onboarding data to Excel"
+              className="inline-flex items-center gap-2 rounded-lg border border-hairline bg-surface px-3 py-1.5 text-xs font-medium text-ink-2 hover:text-ink"
+              style={{ boxShadow: "var(--shadow-card)" }}
+            >
+              <DownloadIcon className="text-muted" />
+              Export
+            </button>
+            {range && onRangeChange ? (
+              <DateRangeDropdown
+                filter={range}
+                onChange={onRangeChange}
+                allowAllTime
+                label="Onboarding funnel date range"
+              />
+            ) : null}
+          </div>
         }
       />
 
@@ -189,6 +207,13 @@ export function FunnelChart({
           label={drillStage.label}
           sessions={drillStage.sessions}
           onClose={() => setDrillStage(null)}
+        />
+      ) : null}
+
+      {exportOpen ? (
+        <FunnelExportModal
+          globalDevice={globalDevice}
+          onClose={() => setExportOpen(false)}
         />
       ) : null}
     </>

@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Modal } from "./Modal";
+import { OnboardingChatViewer } from "./OnboardingChatViewer";
+import { ChatIcon } from "./Icons";
 import type { FunnelSessionEntry } from "../types";
 import { fmtPhone, fmtRelative, fmtToken } from "../lib/format";
 
@@ -24,6 +26,8 @@ export function FunnelDrillModal({
 }) {
   const navigate = useNavigate();
   const [copied, setCopied] = useState<string | null>(null);
+  // The prospect whose onboarding conversation is being viewed (null = none).
+  const [chatFor, setChatFor] = useState<FunnelSessionEntry | null>(null);
 
   function handleCopy(phone: string) {
     copyToClipboard(phone);
@@ -133,33 +137,57 @@ export function FunnelDrillModal({
                 </div>
               </div>
 
-              {/* Action button */}
-              {s.businessId ? (
-                <button
-                  type="button"
-                  onClick={() => handleView(s.businessId!)}
-                  className="shrink-0 rounded-md px-2.5 py-1 text-xs font-medium"
-                  style={{
-                    background: "var(--accent)",
-                    color: "#fff",
-                  }}
-                >
-                  View →
-                </button>
-              ) : (
-                <a
-                  href={`https://wa.me/${(s.phone ?? "").replace(/\D/g, "")}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="shrink-0 rounded-md border border-[var(--hairline)] px-2.5 py-1 text-xs font-medium text-ink-2 hover:bg-[var(--page)]"
-                >
-                  WhatsApp ↗
-                </a>
-              )}
+              {/* Action buttons */}
+              <div className="flex shrink-0 items-center gap-1.5">
+                {/* View the onboarding conversation (from the transcript
+                    archive) — works even for prospects with no business page. */}
+                {s.phone ? (
+                  <button
+                    type="button"
+                    onClick={() => setChatFor(s)}
+                    title="View onboarding conversation"
+                    className="inline-flex items-center gap-1 rounded-md border border-[var(--hairline)] px-2 py-1 text-xs font-medium text-ink-2 hover:bg-[var(--page)] hover:text-ink"
+                  >
+                    <ChatIcon />
+                    Chat
+                  </button>
+                ) : null}
+
+                {s.businessId ? (
+                  <button
+                    type="button"
+                    onClick={() => handleView(s.businessId!)}
+                    className="rounded-md px-2.5 py-1 text-xs font-medium"
+                    style={{
+                      background: "var(--accent)",
+                      color: "#fff",
+                    }}
+                  >
+                    View →
+                  </button>
+                ) : (
+                  <a
+                    href={`https://wa.me/${(s.phone ?? "").replace(/\D/g, "")}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="rounded-md border border-[var(--hairline)] px-2.5 py-1 text-xs font-medium text-ink-2 hover:bg-[var(--page)]"
+                  >
+                    WhatsApp ↗
+                  </a>
+                )}
+              </div>
             </li>
           ))}
         </ul>
       )}
+
+      {chatFor?.phone ? (
+        <OnboardingChatViewer
+          phone={chatFor.phone}
+          title={`${chatFor.name ?? chatFor.businessName ?? fmtPhone(chatFor.phone)} — onboarding chat`}
+          onClose={() => setChatFor(null)}
+        />
+      ) : null}
     </Modal>
   );
 }

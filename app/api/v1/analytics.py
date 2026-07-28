@@ -3,6 +3,7 @@
 Endpoints backing the internal dashboard (dashboard/ app):
 
   GET /api/v1/analytics/overview                     (read-only)
+  GET /api/v1/analytics/onboarding-export            (read-only, .xlsx download)
   GET /api/v1/analytics/businesses/{business_id}     (read-only)
   GET /api/v1/analytics/global-kb                    (read-only)
   PUT /api/v1/analytics/global-kb                    (the ONE write: edits the
@@ -19,11 +20,12 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from app import firestore as fs
 from app.api.deps import require_admin_key
-from app.services import analytics_service
+from app.services import analytics_service, onboarding_export
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +87,46 @@ def analytics_overview(
     )
 
 
+@router.get("/onboarding-export")
+def onboarding_export_xlsx(
+    # Both dates are REQUIRED — the caller must pick an explicit range. This
+    # endpoint deliberately has NO lookback default (unlike /overview): a
+    # missing range must fail loudly, never silently export "last N days" the
+    # user never asked for.
+    date_from: str = Query(..., alias="from", description="Range start (ISO date/datetime, UTC) — required"),
+    date_to: str = Query(..., alias="to", description="Range end (ISO date/datetime, UTC) — required"),
+    global_device: str | None = Query(
+        None,
+        description="Scope to ONE global onboarding number (same values as /overview). Omit for all numbers.",
+    ),
+    _: None = Depends(require_admin_key),
+) -> Response:
+    """Download the onboarding prospects in range as an .xlsx workbook.
+
+    One row per onboarding journey — live sessions AND businesses whose
+    session was deleted (reconstructed) — with owner contact details,
+    business info, deepest funnel stage, pairing state and acquisition
+    context. Mirrors the dashboard funnel exactly (demo/test excluded).
+
+    A start and end date are mandatory; omitting either returns 422.
+    """
+    if not (date_from or "").strip() or not (date_to or "").strip():
+        raise HTTPException(status_code=422, detail="Select a start and end date to export.")
+    start, end = _resolve_range(None, date_from, date_to)
+    content, filename = onboarding_export.build_onboarding_export(
+        start, end, global_device=global_device,
+    )
+    logger.info(
+        "[ANALYTICS] onboarding export: %s -> %s (%d bytes)",
+        start.date(), end.date(), len(content),
+    )
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/businesses/{business_id}")
 def analytics_business_detail(
     business_id: str,
@@ -100,6 +142,24 @@ def analytics_business_detail(
     if detail is None:
         raise HTTPException(status_code=404, detail="Business not found")
     return detail
+
+
+@router.get("/onboarding-chat")
+def analytics_onboarding_chat(
+    phone: str = Query(..., description="Owner phone / onboarding session id (digits, any format)"),
+    _: None = Depends(require_admin_key),
+) -> dict:
+    """The owner↔Sofia onboarding conversation for one prospect.
+
+    Powers the "view conversation" button on the funnel drill-down: reads the
+    ``onboarding_transcripts`` archive (every message, templates included) so a
+    prospect's chat is viewable even if they never created a business or their
+    session was later deleted. 404 when no messages exist for that phone.
+    """
+    chat = analytics_service.get_onboarding_chat(phone)
+    if chat is None:
+        raise HTTPException(status_code=404, detail="No onboarding conversation found for this phone")
+    return chat
 
 
 # ── Global Recepte KB (view + edit) ──────────────────────────────────────────

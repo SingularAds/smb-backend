@@ -317,10 +317,23 @@ def global_number_options(
 
 # Ordered funnel stages. A session counts in the deepest stage it has reached;
 # funnel counts are cumulative (stage N includes everyone at stage >= N).
-FUNNEL_STAGES = ("started", "details_collected", "whatsapp_paired", "completed")
+#
+# The order mirrors the REAL flow: the business doc is created at
+# details-confirmation, BEFORE WhatsApp pairing — so "completed" (business
+# created / onboarded) comes 3rd and "whatsapp_paired" is the deepest stage.
+# Pairing is judged by the business doc's own waSessionId (the same source as
+# the accounts table's paired column), never inferred from merely having a
+# business — an owner who created a business but abandoned at the QR step is
+# Onboarded, NOT Paired.
+FUNNEL_STAGES = ("started", "details_collected", "completed", "whatsapp_paired")
 
 # currentStep → stage, covering BOTH state machines seen in production
 # (current conversational machine + retired awaiting_* machine).
+# No step maps to "completed": that stage means "business doc created" and is
+# derived from the business itself (funnel_stage's businessId bump + the
+# overview's business cross-check), not from a conversation step.
+# calendar_setup/call_forwarding/complete only exist after a successful pair,
+# so they map to the deepest stage.
 _STEP_STAGE = {
     # current machine
     "conversing": "started",
@@ -335,8 +348,8 @@ _STEP_STAGE = {
     "pairing_scam_warning": "details_collected",
     "calendar_setup": "whatsapp_paired",
     "call_forwarding": "whatsapp_paired",
-    "complete": "completed",
-    "post_onboarding": "completed",
+    "complete": "whatsapp_paired",
+    "post_onboarding": "whatsapp_paired",
     # retired machine (docs still exist in production)
     "awaiting_website": "started",
     "awaiting_business_name": "started",
@@ -352,10 +365,12 @@ def funnel_stage(session: dict) -> str:
     """Deepest funnel stage an onboarding session has reached."""
     step = (session.get("currentStep") or "").strip()
     stage = _STEP_STAGE.get(step, "started")
-    # A session that already produced a business doc has at least collected
-    # the details, whatever step it is parked on.
-    if stage == "started" and session.get("businessId"):
-        stage = "details_collected"
+    # A session that already produced a business doc is at least Onboarded,
+    # whatever step it is parked on (pairing state stays whatever the step
+    # says — the overview additionally cross-checks it against the business
+    # doc's waSessionId, the authoritative pairing source).
+    if stage in ("started", "details_collected") and session.get("businessId"):
+        stage = "completed"
     return stage
 
 
@@ -394,8 +409,8 @@ def is_registration_session(session: dict) -> bool:
 _ACQ_STAGE_LABELS = {
     "started": "Started chatting",
     "details_collected": "Business details collected",
+    "completed": "Onboarded",
     "whatsapp_paired": "Connected to platform",
-    "completed": "Fully onboarded",
 }
 
 
@@ -432,9 +447,9 @@ def _build_acquisition(
         # Authoritative 'completed' from businesses of this channel created in
         # range (sessions may be deleted after onboarding finishes).
         counts["completed"] = max(counts["completed"], created_by_channel.get(channel, 0))
-        # Enforce funnel monotonicity (started ≥ details ≥ paired ≥ completed).
-        counts["whatsapp_paired"] = max(counts["whatsapp_paired"], counts["completed"])
-        counts["details_collected"] = max(counts["details_collected"], counts["whatsapp_paired"])
+        # Enforce funnel monotonicity (started ≥ details ≥ onboarded ≥ paired).
+        counts["completed"] = max(counts["completed"], counts["whatsapp_paired"])
+        counts["details_collected"] = max(counts["details_collected"], counts["completed"])
         counts["started"] = max(counts["started"], counts["details_collected"])
 
         # Cumulative per-stage session lists (a completed owner also appears under
@@ -635,6 +650,22 @@ def _build_onboarding_chat(session: dict | None, owner_phone: str | None) -> dic
     }
 
 
+def get_onboarding_chat(phone: str) -> dict | None:
+    """The owner↔Sofia onboarding conversation for one phone, or None.
+
+    Reads the append-only ``onboarding_transcripts`` archive (every inbound
+    owner message AND every outbound Sofia message, templates included),
+    falling back to the session's ``conversationHistory`` for pre-archive
+    sessions. Works for prospects who never created a business AND for those
+    whose onboarding_sessions doc was later deleted — the archive survives it.
+    Returns the same shape as the business-detail ``onboardingChat`` field.
+    """
+    if not phone or not phone.strip():
+        return None
+    session = fs.get_onboarding_session(phone)
+    return _build_onboarding_chat(session, phone.strip())
+
+
 def _conversation_channel(raw: dict) -> str:
     if raw.get("channel"):
         return raw["channel"]
@@ -794,6 +825,7 @@ def business_profile(biz_id: str, biz: dict, now: datetime) -> dict:
         "ownerName": biz.get("ownerName") or None,
         "ownerPhone": biz.get("ownerPhone") or None,
         "businessType": biz.get("businessType") or None,
+        "address": biz.get("address") or None,
         "plan": biz.get("plan") or None,
         "status": biz.get("status") or None,
         "primaryLanguage": biz.get("primaryLanguage") or None,
@@ -1088,12 +1120,25 @@ def get_platform_overview(
             active_sessions += 1
         stage = funnel_stage(sess)
 
-        # Cross-reference with business collection: if a business exists for this owner phone,
-        # the onboarding is authoritatively "completed" for this cohort member.
+        # Cross-reference with the business collection: when a business exists
+        # for this owner, the business DOC is authoritative for the last two
+        # stages — Onboarded always (the doc exists), Paired only when the doc
+        # actually holds a waSessionId. Same source as the accounts table's
+        # paired column, so the funnel and accounts can never disagree about
+        # pairing (business creation happens BEFORE pairing in the flow, so a
+        # created-but-unpaired business is Onboarded, not Paired — regardless
+        # of what step the session is parked on). The session's OWN businessId
+        # wins over the owner-phone map: an owner who re-onboards has several
+        # businesses under one phone, and this session must be judged against
+        # the business it actually created.
         owner_phone = sess.get("ownerPhone")
-        biz_data = biz_by_owner.get(owner_phone or "")
-        if owner_phone and biz_data:
-            stage = "completed"
+        _sess_biz_id = sess.get("businessId")
+        if _sess_biz_id and _sess_biz_id in profiles and not profiles[_sess_biz_id]["isTest"]:
+            biz_data = profiles[_sess_biz_id]
+        else:
+            biz_data = biz_by_owner.get(owner_phone or "")
+        if biz_data:
+            stage = "whatsapp_paired" if biz_data.get("whatsappPaired") else "completed"
 
         # cumulative: reaching a deep stage counts for all earlier stages
         # (funnel bars follow the FUNNEL window)
@@ -1157,29 +1202,35 @@ def get_platform_overview(
         and _profile_matches(p)
     ]
 
-    # Some of the above are "completed" ONLY via this cross-check: their
-    # owner's onboarding_sessions doc no longer exists (deleted after
-    # completion, or scrubbed manually), so the session loop above never saw
-    # them and never counted them into any stage. Reaching "completed"
-    # necessarily means having passed through every earlier stage too, so
-    # count each of them into started/details_collected/whatsapp_paired as
-    # well — otherwise those bars would undercount relative to "completed"
-    # and relative to the drill-down rows built below (which, once reachable
-    # only through "completed", cascade into every earlier stage's list).
-    session_backed_owner_phones = {
-        entry["phone"]
+    # Some of the above are "completed" ONLY via this cross-check: no session
+    # in the loop above represents them — the owner's onboarding_sessions doc
+    # was deleted, was filtered out by the number scope, or (an owner who
+    # re-onboarded) now points at a DIFFERENT business under the same phone.
+    # Keyed by BUSINESS id, not owner phone: the funnel counts onboarding
+    # journeys, and one owner can legitimately produce several businesses.
+    # Being Onboarded necessarily means having passed through
+    # started/details_collected too, so count each of them into those stages
+    # as well — otherwise those bars would undercount relative to "completed"
+    # and relative to the drill-down rows built below (which cascade into
+    # every earlier stage's list). Paired is NOT implied by Onboarded: it
+    # comes from the business doc's own pairing state, the same source as
+    # the accounts table.
+    session_backed_business_ids = {
+        entry["businessId"]
         for entries in stage_sessions.values()
         for entry in entries
-        if entry.get("phone")
+        if entry.get("businessId")
     }
     reconstructed_profiles = [
         p for p in funnel_completed_profiles
-        if p.get("ownerPhone") and p["ownerPhone"] not in session_backed_owner_phones
+        if p["id"] not in session_backed_business_ids
     ]
-    for _ in reconstructed_profiles:
+    for p in reconstructed_profiles:
         stage_counts["started"] += 1
         stage_counts["details_collected"] += 1
-        stage_counts["whatsapp_paired"] += 1
+        stage_counts["completed"] += 1
+        if p.get("whatsappPaired"):
+            stage_counts["whatsapp_paired"] += 1
     stage_counts["completed"] = max(stage_counts["completed"], len(funnel_completed_profiles))
 
     # Authoritative per-channel "completed": businesses carrying an
@@ -1195,10 +1246,11 @@ def get_platform_overview(
             created_by_channel[ch] += 1
     acquisition = {"byChannel": _build_acquisition(channel_records, created_by_channel)}
 
-    # Ensure standard funnel monotonicity (Started >= Details Collected >= WhatsApp Paired >= Completed)
-    # to prevent funnel inversion when completed sessions were deleted.
-    stage_counts["whatsapp_paired"] = max(stage_counts["whatsapp_paired"], stage_counts["completed"])
-    stage_counts["details_collected"] = max(stage_counts["details_collected"], stage_counts["whatsapp_paired"])
+    # Ensure standard funnel monotonicity (Started >= Details Collected >=
+    # Onboarded >= WhatsApp Paired) to prevent funnel inversion when
+    # completed sessions were deleted.
+    stage_counts["completed"] = max(stage_counts["completed"], stage_counts["whatsapp_paired"])
+    stage_counts["details_collected"] = max(stage_counts["details_collected"], stage_counts["completed"])
     stage_counts["started"] = max(stage_counts["started"], stage_counts["details_collected"])
 
     # Per-stage completion (% of everyone who started) and drop-off (how many
@@ -1209,18 +1261,21 @@ def get_platform_overview(
     labels = {
         "started": "Started chatting",
         "details_collected": "Business details collected",
+        "completed": "Onboarded (business created)",
         "whatsapp_paired": "WhatsApp paired",
-        "completed": "Fully onboarded (business created)",
     }
     # Drill-down rows for the reconstructed completions counted above — built
     # straight from the business record since no onboarding_sessions doc
-    # survives for these owners. Appended to "completed" only; the cumulative
-    # merge below cascades each row into every earlier stage's list too.
+    # survives for these owners. Appended to the deepest stage the business
+    # doc proves (paired when it holds a waSessionId, otherwise Onboarded);
+    # the cumulative merge below cascades each row into every earlier
+    # stage's list too.
     biz_raw_by_id = dict(all_businesses)
     for p in reconstructed_profiles:
         raw_attribution = biz_raw_by_id.get(p["id"], {}).get("attribution")
         attribution = raw_attribution if isinstance(raw_attribution, dict) else {}
-        stage_sessions["completed"].append({
+        _recon_stage = "whatsapp_paired" if p.get("whatsappPaired") else "completed"
+        stage_sessions[_recon_stage].append({
             "phone": p["ownerPhone"],
             "name": p.get("ownerName"),
             "businessName": p.get("name"),

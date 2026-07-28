@@ -47,6 +47,7 @@ qrcode[pil]>=7.4.2
 phonenumbers==8.13.51
 pytz==2024.2
 langdetect==1.0.9
+openpyxl==3.1.5  # analytics dashboard .xlsx export
 
 # ── Testing ──
 pytest==8.3.4
