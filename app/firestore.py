@@ -945,6 +945,33 @@ def list_onboarding_sessions_active_between(
 # Isolated from onboarding_sessions so a Salão Bella demo on the dedicated demo
 # number can never collide with a real onboarding session for the same phone.
 
+def list_demo_sessions_active_between(
+    start_iso: str, end_iso: str, limit: int = 1000
+) -> list[dict]:
+    """Return demo sessions whose ``lastActivityAt`` falls within
+    ``[start_iso, end_iso]`` (naive-UTC ISO strings, matching the demo writer's
+    ``datetime.utcnow().isoformat()``).
+
+    Used by the end-of-demo "About us" idle sweep to find prospects who were
+    offered in-chat pairing and then went quiet, without streaming the whole
+    collection. A range on a single field uses Firestore's automatic single-field
+    index, so no composite index is required.
+    """
+    docs = (
+        _db().collection("demo_sessions")
+        .where(filter=FieldFilter("lastActivityAt", ">=", start_iso))
+        .where(filter=FieldFilter("lastActivityAt", "<=", end_iso))
+        .limit(limit)
+        .stream()
+    )
+    out: list[dict] = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        data["id"] = doc.id
+        out.append(data)
+    return out
+
+
 def get_demo_session(phone: str) -> dict | None:
     phone_clean = _clean_phone(phone)
     doc = _db().collection("demo_sessions").document(phone_clean).get()

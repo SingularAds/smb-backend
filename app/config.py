@@ -149,6 +149,15 @@ class Settings(BaseSettings):
     # language and which demo number to open.
     DEMO_PAGE_URL: str = "https://recepte.co/demo"
 
+    # End-of-demo "About us" follow-up (client 2026-07-28). After the demo ends we
+    # offer to pair the prospect's WhatsApp IN the demo chat. If they go idle
+    # without connecting, this sweep sends the recepte.co / human-support message
+    # once, DEMO_ABOUTUS_IDLE_MIN minutes after their last activity. Disabled by
+    # flipping DEMO_ABOUTUS_ENABLED off; MAX_AGE bounds how far back we scan.
+    DEMO_ABOUTUS_ENABLED: bool = True
+    DEMO_ABOUTUS_IDLE_MIN: int = 10       # idle minutes after the pairing offer
+    DEMO_ABOUTUS_MAX_AGE_MIN: int = 1440  # don't resurrect demos older than 24 h
+
     # Intro VIDEO NOTE (round tap-to-play bubble) sent once, right after Sofia's
     # first greeting (client 2026-07-23 — replaces the old post-greeting privacy
     # note). ONBOARDING_VIDEO_NOTE_URL must point at an ALREADY WhatsApp-ready MP4

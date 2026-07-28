@@ -451,6 +451,17 @@ STYLE (follow strictly):
 - ALWAYS end your message with the clear next step (a question or an action).
 - Use the person's name and their stated preference often — the memory is the show.
 
+ROLE-PLAY IMPROVISATION (be a REAL salon receptionist): You ARE the receptionist
+of Salão Bella — a real, working salon. When the "customer" asks about services,
+prices, hours, availability, products, or anything a salon client would ask,
+answer naturally and confidently, INVENTING plausible, consistent details on the
+spot (e.g. "Corte feminino R$60, escova R$45, coloração a partir de R$150",
+"abrimos de terça a sábado, 9h às 19h"). Keep the prices/services consistent once
+you've mentioned them. NEVER say you don't have that information for the salon,
+and NEVER defer a salon question to a human — that breaks the demo. The whole
+point is to SHOW the owner how dynamically their own AI receptionist will handle
+their real customers.
+
 DEMO SEQUENCE (follow in order — do NOT skip step 5):
 - Step 1 (info): capture their name + the service they'd want. If they only give
   a name, acknowledge and ask the service. Then tell them they can send a VOICE
@@ -465,7 +476,7 @@ DEMO SEQUENCE (follow in order — do NOT skip step 5):
   visita: hoje". Explain that next month they just say "oi" and you already know
   who they are. Their customers are never strangers again.
 - Step 5 (OWNER SUMMARY — MOST IMPORTANT, NEVER SKIP): say "Agora o melhor: veja
-  o que o DONO do salão recebe" and then, as a SEPARATE short block, send a daily
+  o que o DONO do salão recebe"(Make sure to use the same language of the conversation) and then, as a SEPARATE short block, send a daily
   report for Salão Bella. All numbers are illustrative EXCEPT the booking you just
   made with THIS person — put their real name + time in it. Include lines like:
   conversas atendidas, agendamentos (with their booking), 1 cliente sumida que
@@ -511,12 +522,14 @@ real question (pricing, how setup works, what happens after, "does it do X?"…)
 answer it briefly — 1-2 short lines — then smoothly pick the demo back up EXACTLY
 where it paused. Never ignore a question just to push the script.
 
-WHEN YOU'RE NOT SURE (important): If they ask something about Recepte you don't
-actually know — a price/plan not listed here, a custom setup or integration,
-billing specifics, anything beyond your facts — do NOT invent an answer. Say
-briefly and honestly that a teammate will confirm the exact details, and append
-the token [NEEDS_HUMAN] on its own line at the very end of THAT message. (The
-system quietly notifies our team; you keep chatting normally.)
+WHEN YOU'RE NOT SURE (important): If they ask something about RECEPTE (the product
+/ company) you don't actually know — a price/plan not listed here, a custom setup
+or integration, billing specifics, anything beyond your facts — do NOT invent an
+answer. Say briefly and honestly that a teammate will confirm the exact details,
+and append the token [NEEDS_HUMAN] on its own line at the very end of THAT message.
+(The system quietly notifies our team; you keep chatting normally.) This is ONLY
+for real questions about Recepte — NEVER for the Salão Bella role-play, where you
+always improvise as the receptionist (see ROLE-PLAY IMPROVISATION above).
 
 NEVER ask for CPF, credit card, passwords, or SMS codes. If they offer any, refuse
 warmly ("não preciso disso") and do not store it.
@@ -574,86 +587,160 @@ def _demo_prefill_text(lang: str) -> str:
     return _DEMO_PREFILL_TEXTS.get(lang2, _DEMO_PREFILL_TEXTS["en"])
 
 
-# Pre-filled text for the "go BACK to finish onboarding" wa.me link sent at the
-# end of the demo. Points at the SAME global number the prospect came from, so
-# any message resumes their onboarding exactly where they left off.
-_DEMO_RETURN_PREFILL_TEXTS: dict[str, str] = {
-    "pt": "Voltei pra terminar meu cadastro",
-    "en": "I'm back to finish my setup",
-    "es": "Volví para terminar mi registro",
-}
-
-
-def _demo_return_prefill(lang: str) -> str:
-    lang2 = (lang or "pt")[:2].lower()
-    return _DEMO_RETURN_PREFILL_TEXTS.get(lang2, _DEMO_RETURN_PREFILL_TEXTS["pt"])
-
-
-# End-of-demo guidance (client 2026-07-28). Two SHORT messages: (1) end the demo
-# and send them back to finish onboarding + pair their WhatsApp on the SAME
-# global number they came from; (2) point to recepte.co and invite questions or
-# a human handoff. Kept tight on purpose — people don't read long messages.
-_DEMO_GUIDANCE_REDIRECT: dict[str, str] = {
+# ── End-of-demo → IN-CHAT WhatsApp pairing (client 2026-07-28, revised) ────────
+# The demo no longer redirects the prospect back to a global number. Instead it
+# finishes onboarding right here: Sofia (1) ends the demo and explains the next
+# step is connecting their WhatsApp (official) so she can run it for their real
+# business, offering to help in-chat; (2) offers the same QR-vs-code pairing the
+# global onboarding number uses. All messages go out on the DEMO device. Kept
+# short — people don't read long messages.
+_DEMO_END_CONNECT: dict[str, str] = {
     "pt": (
-        "É o fim do demo 🎬 Pra ativar isso no SEU negócio, volte de onde parou e "
-        "conecte seu WhatsApp (pelo WhatsApp oficial). Seu link pra continuar 👉 {link}"
+        "É o fim do demo 🎬 Pra colocar isso pra trabalhar no SEU negócio, falta um "
+        "passo: conectar o seu WhatsApp (pelo WhatsApp oficial) pra eu atender seus "
+        "clientes por você. Bora? Eu te ajudo aqui mesmo 👇"
     ),
     "en": (
-        "That's the demo 🎬 To turn this on for YOUR business, pick up where you "
-        "left off and connect your WhatsApp (via official WhatsApp). Your link to continue 👉 {link}"
+        "That's the demo 🎬 To put this to work for YOUR business, there's one step "
+        "left: connect your WhatsApp (via official WhatsApp) so I can answer your "
+        "customers for you. Let's do it — I'll help you right here 👇"
     ),
     "es": (
-        "Fin del demo 🎬 Para activarlo en TU negocio, retoma donde lo dejaste y "
-        "conecta tu WhatsApp (por WhatsApp oficial). Tu enlace para continuar 👉 {link}"
+        "Fin del demo 🎬 Para poner esto a trabajar en TU negocio, falta un paso: "
+        "conectar tu WhatsApp (por WhatsApp oficial) para que yo atienda a tus "
+        "clientes por ti. ¿Vamos? Te ayudo aquí mismo 👇"
     ),
 }
 
-_DEMO_GUIDANCE_REDIRECT_NOLINK: dict[str, str] = {
+_DEMO_PAIRING_OFFER: dict[str, str] = {
     "pt": (
-        "É o fim do demo 🎬 Pra ativar no SEU negócio, volte ao seu onboarding e "
-        "conecte seu WhatsApp pelo app oficial. Precisa de ajuda? É só falar 😊"
+        "Como você prefere conectar?\n"
+        "1️⃣ QR code (se tiver um tablet, computador ou outro celular por perto)\n"
+        "2️⃣ Código de pareamento (se for só este celular 😊)\n\n"
+        "Responda *1* ou *2*."
     ),
     "en": (
-        "That's the demo 🎬 To turn this on for YOUR business, head back to your "
-        "onboarding and connect your WhatsApp via the official app. Need a hand? Just say so 😊"
+        "How would you like to connect?\n"
+        "1️⃣ QR code (if you have a tablet, computer, or another phone nearby)\n"
+        "2️⃣ Pairing code (if it's just this phone 😊)\n\n"
+        "Reply *1* or *2*."
     ),
     "es": (
-        "Fin del demo 🎬 Para activarlo en TU negocio, vuelve a tu onboarding y "
-        "conecta tu WhatsApp por la app oficial. ¿Necesitas ayuda? Solo dilo 😊"
+        "¿Cómo prefieres conectar?\n"
+        "1️⃣ Código QR (si tienes una tablet, computadora u otro teléfono cerca)\n"
+        "2️⃣ Código de vinculación (si es solo este teléfono 😊)\n\n"
+        "Responde *1* o *2*."
     ),
 }
 
-_DEMO_GUIDANCE_QUERIES: dict[str, str] = {
+_DEMO_CODE_INSTRUCTIONS: dict[str, str] = {
     "pt": (
-        "Sobre a gente: recepte.co 💚 Ficou alguma dúvida sobre a Recepte ou os "
-        "próximos passos? Posso responder aqui. Se preferir, eu passo seus dados "
-        "pro nosso time humano te ajudar a finalizar — é só dizer *sim*."
+        "Quase lá! 👇\n"
+        "📱 WhatsApp → Config. → Aparelhos conectados → Conectar aparelho\n"
+        "→ toque em *Conectar com número de telefone*, digite seu número e depois o código abaixo.\n"
+        "⏱ Expira em ~60s."
     ),
     "en": (
-        "About us: recepte.co 💚 Any questions about Recepte or the next steps? I "
-        "can answer here. Or I can share your details with our human team to help "
-        "you finish setup — just say *yes*."
+        "Almost there! 👇\n"
+        "📱 WhatsApp → Settings → Linked Devices → Link a Device\n"
+        "→ tap *Link with phone number instead*, enter your number, then the code below.\n"
+        "⏱ It expires in ~60s."
     ),
     "es": (
-        "Sobre nosotros: recepte.co 💚 ¿Alguna duda sobre Recepte o los próximos "
-        "pasos? Puedo responder aquí. O comparto tus datos con nuestro equipo "
-        "humano para ayudarte a terminar — solo di *sí*."
+        "¡Casi! 👇\n"
+        "📱 WhatsApp → Ajustes → Dispositivos vinculados → Vincular dispositivo\n"
+        "→ toca *Vincular con número de teléfono*, escribe tu número y luego el código de abajo.\n"
+        "⏱ Caduca en ~60s."
     ),
 }
 
-# Shorter re-send of just the return link (if they ask to connect again after the
-# full guidance has already gone out).
-_DEMO_RETURN_ONLY: dict[str, str] = {
-    "pt": "Seu link pra continuar o onboarding 👉 {link}",
-    "en": "Your link to continue onboarding 👉 {link}",
-    "es": "Tu enlace para continuar el onboarding 👉 {link}",
+_DEMO_CODE_INTRO: dict[str, str] = {
+    "pt": "Aqui está seu código — copie ☝🏼 e cole naquela tela:",
+    "en": "Here's your pairing code — copy it ☝🏼 and paste it on that screen:",
+    "es": "Aquí está tu código — cópialo ☝🏼 y pégalo en esa pantalla:",
 }
 
-# Acknowledgement after the prospect accepts the human-support handoff at the end.
+_DEMO_CODE_FOLLOWUP: dict[str, str] = {
+    "pt": "⏱ ~60s — eu aviso na hora que conectar 🔄\nResponda *novo código* pra um novo, ou *depois* pra conectar mais tarde.",
+    "en": "⏱ ~60s — I'll know the moment it connects 🔄\nReply *new code* for a fresh one, or *skip* to connect later.",
+    "es": "⏱ ~60s — te aviso en cuanto conecte 🔄\nResponde *nuevo código* para uno nuevo, o *después* para conectar más tarde.",
+}
+
+_DEMO_QR_CAPTION: dict[str, str] = {
+    "pt": "Escaneie em WhatsApp → Aparelhos conectados → Conectar aparelho. É a conexão oficial do WhatsApp — seu número continua seu. 🔒",
+    "en": "Scan this in WhatsApp → Linked Devices → Link a Device. It's WhatsApp's official linking — your number stays yours. 🔒",
+    "es": "Escanéalo en WhatsApp → Dispositivos vinculados → Vincular dispositivo. Es la vinculación oficial de WhatsApp — tu número sigue siendo tuyo. 🔒",
+}
+
+_DEMO_QR_FOLLOWUP: dict[str, str] = {
+    "pt": "Responda *pronto* quando conectar, *atualizar* pra um novo QR, ou *código* pra usar um código de pareamento.",
+    "en": "Reply *done* once linked, *refresh* for a new QR, or *code* to use a pairing code instead.",
+    "es": "Responde *listo* cuando conectes, *actualizar* para un QR nuevo, o *código* para usar un código de vinculación.",
+}
+
+_DEMO_PAIR_SUCCESS: dict[str, str] = {
+    "pt": (
+        "✅ Conectado! Seu atendente de IA está ATIVO no seu WhatsApp 🎉\n"
+        "A partir de agora eu respondo seus clientes, faço agendamentos e te mando o "
+        "resumo do dia — do jeitinho que você sentiu no demo. Bem-vindo à Recepte! 💚"
+    ),
+    "en": (
+        "✅ Connected! Your AI receptionist is now LIVE on your WhatsApp 🎉\n"
+        "From now on I'll answer your customers, take bookings and send you the daily "
+        "summary — just like you felt in the demo. Welcome to Recepte! 💚"
+    ),
+    "es": (
+        "✅ ¡Conectado! Tu recepcionista con IA está ACTIVO en tu WhatsApp 🎉\n"
+        "Desde ahora respondo a tus clientes, agendo citas y te envío el resumen del "
+        "día — tal como lo sentiste en el demo. ¡Bienvenido a Recepte! 💚"
+    ),
+}
+
+_DEMO_CODE_EXPIRED: dict[str, str] = {
+    "pt": "⏱ O código expirou. Responda *novo código* pra gerar outro, ou *depois* pra conectar mais tarde.",
+    "en": "⏱ That code expired. Reply *new code* for a fresh one, or *skip* to connect later.",
+    "es": "⏱ El código caducó. Responde *nuevo código* para otro, o *después* para conectar más tarde.",
+}
+
+_DEMO_PAIR_NOT_LINKED: dict[str, str] = {
+    "pt": "🤔 Ainda não vejo conectado. Digite o código em WhatsApp → Aparelhos conectados e responda *pronto*. Quer um código novo? Responda *novo código*.",
+    "en": "🤔 I don't see it linked yet. Enter the code in WhatsApp → Linked Devices, then reply *done*. Need a fresh code? Reply *new code*.",
+    "es": "🤔 Aún no lo veo conectado. Escribe el código en WhatsApp → Dispositivos vinculados y responde *listo*. ¿Un código nuevo? Responde *nuevo código*.",
+}
+
+_DEMO_PAIR_ERROR: dict[str, str] = {
+    "pt": "⚠️ Não consegui gerar o código agora. Tente de novo em instantes respondendo *novo código*, ou *depois* pra conectar mais tarde.",
+    "en": "⚠️ I couldn't generate the code right now. Try again in a moment with *new code*, or *skip* to connect later.",
+    "es": "⚠️ No pude generar el código ahora. Intenta de nuevo en un momento con *nuevo código*, o *después* para conectar más tarde.",
+}
+
+# Reworded human-support line (client 2026-07-28): "if you want to interact with
+# our human support, I can help you connect, just say yes." Sent as the About-us
+# follow-up ~10 min after the pairing offer when the prospect went idle without
+# connecting (see the demo_aboutus sweep), and immediately if they *skip*.
+_DEMO_ABOUTUS: dict[str, str] = {
+    "pt": (
+        "Sobre a gente: recepte.co 💚 Ficou alguma dúvida sobre a Recepte ou sobre "
+        "conectar seu WhatsApp? Posso responder aqui. E se quiser falar com nosso "
+        "suporte humano, eu te conecto — é só dizer *sim*."
+    ),
+    "en": (
+        "About us: recepte.co 💚 Any questions about Recepte or connecting your "
+        "WhatsApp? I can answer here. And if you'd like to talk to our human "
+        "support, I'll connect you — just say *yes*."
+    ),
+    "es": (
+        "Sobre nosotros: recepte.co 💚 ¿Alguna duda sobre Recepte o sobre conectar "
+        "tu WhatsApp? Puedo responder aquí. Y si quieres hablar con nuestro soporte "
+        "humano, te conecto — solo di *sí*."
+    ),
+}
+
+# Acknowledgement after the prospect accepts the human-support handoff.
 _DEMO_HUMAN_SHARED_ACK: dict[str, str] = {
-    "pt": "Combinado! 🙌 Já compartilhei seu contato com nosso time — eles vão te chamar pra te ajudar a finalizar.",
-    "en": "Done! 🙌 I've shared your details with our team — they'll reach out to help you finish.",
-    "es": "¡Listo! 🙌 Compartí tus datos con nuestro equipo — te contactarán para ayudarte a terminar.",
+    "pt": "Combinado! 🙌 Já compartilhei seu contato com nosso time — eles vão te chamar pra te ajudar.",
+    "en": "Done! 🙌 I've shared your details with our team — they'll reach out to help you.",
+    "es": "¡Listo! 🙌 Compartí tus datos con nuestro equipo — te contactarán para ayudarte.",
 }
 
 
@@ -4638,29 +4725,10 @@ class OnboardingService:
         name = push_name or ""
         greeting = _demo_greeting(lang, name)
         now = datetime.utcnow().isoformat()
-
-        # Remember which GLOBAL onboarding number this prospect came from (there
-        # are several global numbers but only ONE demo number). The demo session
-        # is keyed by the same phone as their onboarding session, so we can read
-        # its onboardingDeviceId now and, at the end of the demo, send them BACK
-        # to that exact number to resume onboarding where they left off. Empty
-        # when they reached the demo some other way (e.g. the standalone page).
-        origin_device = ""
-        origin_number = ""
-        try:
-            onb = db.get_onboarding_session(phone) or {}
-            origin_device = (onb.get("onboardingDeviceId") or "").strip()
-            if origin_device:
-                origin_number = global_numbers.number_for_device(origin_device)
-        except Exception:
-            logger.debug("[DEMO-NUMBER] origin lookup failed for %s", phone, exc_info=True)
-
         db.upsert_demo_session(phone, {
             "phone": phone,
             "pushName": name,
             "language": lang,
-            "originDevice": origin_device,
-            "originNumber": origin_number,
             "demoHistory": [
                 {"role": "user", "content": body},
                 {"role": "assistant", "content": greeting},
@@ -4746,7 +4814,15 @@ class OnboardingService:
             except Exception:
                 logger.exception("[ALERT] demo inappropriate alert failed for %s", phone)
 
-        # "I want to connect" → point them to the real onboarding number.
+        # In-chat WhatsApp pairing (post-demo): once the demo has ended and the
+        # pairing offer/flow is active, route every reply to the pairing handler
+        # (choose QR/code, enter the code, done/skip/new code…).
+        if session.get("demoPairingMode") in ("offer", "code", "qr"):
+            await self._handle_demo_pairing(session, phone, body, lang)
+            return
+
+        # "I want to connect" → end the demo and offer in-chat pairing (also
+        # re-arms the offer if they'd previously skipped it).
         wants_connect = _is_demo_connect_intent(body) or (
             session.get("demoSoftCloseReached") and _is_affirmative(body)
         )
@@ -4795,81 +4871,380 @@ class OnboardingService:
             await asyncio.sleep(1)
             await self._demo_number_close(phone, lang, session)
 
-    async def _demo_return_link(self, phone: str, session: dict, lang: str) -> str:
-        """A wa.me link BACK to the SAME global onboarding number the prospect came
-        from, so any message there resumes onboarding where they left off. Prefers
-        the origin captured when the demo started; falls back to a live lookup of
-        their onboarding session, then to the primary global number. Returns ""
-        when no global number is configured at all."""
-        number = (session.get("originNumber") or "").strip()
-        if not number:
-            device = (session.get("originDevice") or "").strip()
-            if device:
-                number = global_numbers.number_for_device(device)
-        if not number:
-            try:
-                onb = db.get_onboarding_session(phone) or {}
-                dev = (onb.get("onboardingDeviceId") or "").strip()
-                if dev:
-                    number = global_numbers.number_for_device(dev)
-            except Exception:
-                pass
-        if not number:
-            number = global_numbers.primary_number()
-        if not number:
-            return ""
-        return f"https://wa.me/{number}?text={quote(_demo_return_prefill(lang))}"
-
     async def _demo_number_close(self, phone: str, lang: str, session: dict | None = None) -> None:
-        """End the demo with the concrete next steps (client 2026-07-28).
+        """End the demo and offer IN-CHAT WhatsApp pairing (client 2026-07-28).
 
-        Two SHORT messages: (1) end the demo and send the prospect BACK to the
-        SAME global onboarding number they came from, to finish setup + pair their
-        WhatsApp; (2) point to recepte.co and invite questions or a human handoff
-        ("say yes"). Idempotent — the full guidance goes out once per session; a
-        later connect intent just re-sends the return link.
+        No redirect back to a global number — onboarding finishes right here. Two
+        SHORT messages: (1) end the demo + explain the next step is connecting
+        their WhatsApp (official) so Sofia can run it for their real business,
+        offering to help now; (2) the SAME QR-vs-code pairing choice the global
+        onboarding number uses. Idempotent — sent once per session. The About-us /
+        human-support message is deferred: it goes out ~10 min later if they go
+        idle without connecting (demo_aboutus sweep), or immediately on *skip*.
         """
         if session is None:
             session = db.get_demo_session(phone) or {}
-        lang2 = (lang or "pt")[:2].lower()
-        link = await self._demo_return_link(phone, session, lang)
-
-        # Already guided once → just re-send the return link (if they ask again),
-        # without repeating the whole close.
         if session.get("demoGuidanceSent"):
-            if link:
-                msg = (_DEMO_RETURN_ONLY.get(lang2) or _DEMO_RETURN_ONLY["pt"]).replace("{link}", link)
-                await self._send_demo(phone, msg)
+            # Already ended once. If they'd skipped pairing and now want to
+            # connect, re-arm the QR/code offer; otherwise nothing to do.
+            if session.get("demoPairingMode") == "skipped":
+                await self._send_demo(phone, _demo_text(_DEMO_PAIRING_OFFER, lang))
+                db.upsert_demo_session(phone, {
+                    "demoPairingMode": "offer",
+                    "lastActivityAt": datetime.utcnow().isoformat(),
+                })
+                session["demoPairingMode"] = "offer"
             return
 
-        # Message 1 — end the demo + link BACK to THEIR own onboarding number.
-        if link:
-            msg1 = (_DEMO_GUIDANCE_REDIRECT.get(lang2) or _DEMO_GUIDANCE_REDIRECT["pt"]).replace("{link}", link)
-        else:
-            msg1 = _DEMO_GUIDANCE_REDIRECT_NOLINK.get(lang2) or _DEMO_GUIDANCE_REDIRECT_NOLINK["pt"]
-        await self._send_demo(phone, msg1)
+        await self._send_demo(phone, _demo_text(_DEMO_END_CONNECT, lang))
         await asyncio.sleep(1)
+        await self._send_demo(phone, _demo_text(_DEMO_PAIRING_OFFER, lang))
 
-        # Message 2 — recepte.co + questions + human-support offer ("just say yes").
-        msg2 = _DEMO_GUIDANCE_QUERIES.get(lang2) or _DEMO_GUIDANCE_QUERIES["pt"]
-        await self._send_demo(phone, msg2)
-
+        now = datetime.utcnow().isoformat()
         updates = {
             "demoSoftCloseReached": True,
             "demoGuidanceSent": True,
-            "awaitingHumanSupportAnswer": True,
-            "lastActivityAt": datetime.utcnow().isoformat(),
+            "demoPairingMode": "offer",
+            "demoPairingOfferedAt": now,
+            "lastActivityAt": now,
         }
         db.upsert_demo_session(phone, updates)
         session.update(updates)
         try:
             posthog_client.capture(
-                business_id=phone, customer_phone=phone, event="demo_cta_clicked",
+                business_id=phone, customer_phone=phone, event="demo_pairing_offered",
                 properties={"channel": "demo_number"},
             )
         except Exception:
             pass
-        logger.info("[DEMO-NUMBER] end-of-demo guidance sent for %s (link=%s)", phone, bool(link))
+        logger.info("[DEMO-NUMBER] end + pairing offer sent for %s", phone)
+
+    # ── In-demo WhatsApp pairing (mirrors the global onboarding pairing, but all
+    #    messages go out on the DEMO device and state lives on the demo_session) ──
+
+    async def _handle_demo_pairing(self, session: dict, phone: str, body: str, lang: str) -> None:
+        """Drive one turn of the in-demo pairing flow, based on demoPairingMode
+        ("offer" → choose QR/code, "code"/"qr" → the active pairing)."""
+        normalized = body.strip().lower().rstrip(".!?")
+        mode = session.get("demoPairingMode")
+
+        _qr_choice = {"1", "qr", "qr code", "scan", "escanear", "escáner", "escaner", "scannear"}
+        _code_choice = {"2", "code", "codigo", "código", "pairing code", "pareamento", "vinculación", "vinculacion"}
+        _switch_qr = {"qr", "qr code", "scan", "escanear"}
+        _switch_code = {"code", "codigo", "código", "pairing code", "pareamento"}
+        _skip = {"skip", "depois", "later", "mais tarde", "después", "despues", "pular", "saltar", "not now"}
+        _done = {"done", "pronto", "feito", "hecho", "listo", "ready", "linked", "conectado", "connected", "scanned"}
+        _new_code = {"new code", "novo código", "novo codigo", "nuevo código", "nuevo codigo",
+                     "resend", "new", "código novo", "codigo novo", "otra vez", "de novo"}
+        _refresh = {"refresh", "atualizar", "actualizar", "new qr", "novo qr", "nuevo qr", "expired", "expirou"}
+
+        # Skip anywhere → send the About-us + human-support message now.
+        if normalized in _skip:
+            db.upsert_demo_session(phone, {
+                "demoPairingMode": "skipped",
+                "lastActivityAt": datetime.utcnow().isoformat(),
+            })
+            session["demoPairingMode"] = "skipped"
+            await self._demo_send_aboutus(phone, lang, session)
+            return
+
+        if mode == "offer":
+            if normalized in _qr_choice or normalized.startswith("1"):
+                await self._demo_send_qr(session, phone, lang)
+            elif normalized in _code_choice or normalized.startswith("2"):
+                await self._demo_send_code(session, phone, lang)
+            else:
+                await self._send_demo(phone, _demo_text(_DEMO_PAIRING_OFFER, lang))
+            return
+
+        if mode == "code":
+            if normalized in _new_code:
+                await self._demo_send_code(session, phone, lang)
+            elif normalized in _switch_qr:
+                await self._demo_send_qr(session, phone, lang)
+            elif normalized in _done:
+                await self._demo_check_and_finalize(session, phone, lang)
+            else:
+                await self._send_demo(phone, _demo_text(_DEMO_PAIR_NOT_LINKED, lang))
+            return
+
+        if mode == "qr":
+            if normalized in _refresh or normalized in _new_code:
+                await self._demo_send_qr(session, phone, lang)
+            elif normalized in _switch_code:
+                await self._demo_send_code(session, phone, lang)
+            elif normalized in _done:
+                await self._demo_check_and_finalize(session, phone, lang)
+            else:
+                await self._send_demo(phone, _demo_text(_DEMO_QR_FOLLOWUP, lang))
+            return
+
+    async def _demo_send_code(self, session: dict, phone: str, lang: str) -> None:
+        """Generate a pairing CODE for biz-<phone> and send it on the demo device."""
+        pairing_sid = f"biz-{phone}"
+        code = None
+        for attempt in range(3):
+            try:
+                result = await self.wa.generate_pair_code(pairing_sid, f"+{phone}")
+                code = result.get("code")
+                break
+            except PairingStateConflict:
+                try:
+                    await self.wa.reconnect_session(pairing_sid)
+                except Exception:
+                    pass
+                await self._demo_finalize_pairing(phone, session, lang)
+                return
+            except Exception as exc:
+                logger.warning("[DEMO-PAIR] code gen attempt %d failed for %s: %s", attempt + 1, phone, exc)
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+        if not code:
+            await self._send_demo(phone, _demo_text(_DEMO_PAIR_ERROR, lang))
+            return
+
+        attempt_id = datetime.utcnow().isoformat()
+        db.upsert_demo_session(phone, {
+            "demoPairingMode": "code",
+            "demoPairingAttemptId": attempt_id,
+            "lastActivityAt": attempt_id,
+        })
+        session["demoPairingMode"] = "code"
+        session["demoPairingAttemptId"] = attempt_id
+
+        await self._send_demo(phone, _demo_text(_DEMO_CODE_INSTRUCTIONS, lang))
+        await asyncio.sleep(1)
+        await self._send_demo(phone, _demo_text(_DEMO_CODE_INTRO, lang))
+        await asyncio.sleep(0.5)
+        await self._send_demo(phone, f"*{code}*")
+        await asyncio.sleep(0.5)
+        await self._send_demo(phone, _demo_text(_DEMO_CODE_FOLLOWUP, lang))
+        asyncio.ensure_future(self._demo_poll_pairing(phone, pairing_sid, attempt_id))
+        logger.info("[DEMO-PAIR] pairing code sent for %s", phone)
+
+    async def _demo_send_qr(self, session: dict, phone: str, lang: str) -> None:
+        """Fetch a QR payload for biz-<phone>, render a PNG and send it on the demo
+        device. Falls back to a pairing code if the QR can't be produced/sent."""
+        pairing_sid = f"biz-{phone}"
+        payload = None
+        try:
+            result = await self.wa.get_qr_current(pairing_sid)
+            if result is None:
+                result = await self.wa.get_qr_payload(pairing_sid, timeout_seconds=45)
+            payload = (result or {}).get("qr_payload")
+        except PairingStateConflict:
+            try:
+                await self.wa.reconnect_session(pairing_sid)
+            except Exception:
+                pass
+            await self._demo_finalize_pairing(phone, session, lang)
+            return
+        except Exception as exc:
+            logger.warning("[DEMO-PAIR] QR fetch failed for %s: %s", phone, exc)
+
+        if not payload:
+            # Never dead-end — drop back to the pairing code.
+            await self._demo_send_code(session, phone, lang)
+            return
+
+        try:
+            png = self._qr_payload_to_png_bytes(payload)
+            device = settings.DEMO_WA_DEVICE_ID or self.wa.default_device_id
+            await self.wa.send_image(
+                phone=phone, image_bytes=png, caption=_demo_text(_DEMO_QR_CAPTION, lang),
+                mime_type="image/png", device_id=device,
+            )
+        except Exception as exc:
+            logger.error("[DEMO-PAIR] QR send failed for %s: %s — falling back to code", phone, exc)
+            await self._demo_send_code(session, phone, lang)
+            return
+
+        attempt_id = datetime.utcnow().isoformat()
+        db.upsert_demo_session(phone, {
+            "demoPairingMode": "qr",
+            "demoQrAttemptId": attempt_id,
+            "lastActivityAt": attempt_id,
+        })
+        session["demoPairingMode"] = "qr"
+        session["demoQrAttemptId"] = attempt_id
+        await asyncio.sleep(1)
+        await self._send_demo(phone, _demo_text(_DEMO_QR_FOLLOWUP, lang))
+        asyncio.ensure_future(self._demo_poll_qr(phone, pairing_sid, attempt_id))
+        logger.info("[DEMO-PAIR] QR sent for %s", phone)
+
+    async def _demo_check_and_finalize(self, session: dict, phone: str, lang: str) -> None:
+        """Verify the bridge shows biz-<phone> linked; finalize or nudge to retry."""
+        pairing_sid = f"biz-{phone}"
+        try:
+            status = await self.wa.get_session_status(pairing_sid)
+            if status.get("paired") or status.get("status") == "connected":
+                await self._demo_finalize_pairing(phone, session, lang)
+                return
+        except Exception as exc:
+            logger.warning("[DEMO-PAIR] status check failed for %s: %s", pairing_sid, exc)
+        await self._send_demo(phone, _demo_text(_DEMO_PAIR_NOT_LINKED, lang))
+
+    async def _demo_poll_pairing(self, phone: str, pairing_sid: str, attempt_id: str) -> None:
+        """Background: poll every 3 s (≤60 s) for a code link; auto-finalize on
+        connect. Self-cancels when a newer attempt/mode supersedes this one."""
+        poll_interval, timeout_s, elapsed = 3.0, 60.0, 0.0
+        while elapsed < timeout_s:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+            session = db.get_demo_session(phone)
+            if not session:
+                return
+            if session.get("demoPairingMode") != "code" or session.get("demoPairingAttemptId") != attempt_id:
+                return
+            try:
+                status = await self.wa.get_session_status(pairing_sid)
+                if status.get("paired") or status.get("status") == "connected":
+                    await self._demo_finalize_pairing(phone, session, session.get("language", "pt"))
+                    return
+            except Exception as exc:
+                logger.warning("[DEMO-PAIR-POLL] status check failed for %s: %s", pairing_sid, exc)
+        session = db.get_demo_session(phone)
+        if session and session.get("demoPairingMode") == "code" and session.get("demoPairingAttemptId") == attempt_id:
+            await self._send_demo(phone, _demo_text(_DEMO_CODE_EXPIRED, session.get("language", "pt")))
+
+    async def _demo_poll_qr(self, phone: str, pairing_sid: str, attempt_id: str) -> None:
+        """Background: poll every 4 s (≤120 s) for a QR scan; auto-finalize on
+        connect. Self-cancels when a newer QR attempt/mode supersedes this one."""
+        poll_interval, timeout_s, elapsed = 4.0, 120.0, 0.0
+        while elapsed < timeout_s:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+            session = db.get_demo_session(phone)
+            if not session:
+                return
+            if session.get("demoPairingMode") != "qr" or session.get("demoQrAttemptId") != attempt_id:
+                return
+            try:
+                status = await self.wa.get_session_status(pairing_sid)
+                if status.get("paired") or status.get("status") == "connected":
+                    await self._demo_finalize_pairing(phone, session, session.get("language", "pt"))
+                    return
+            except Exception as exc:
+                logger.warning("[DEMO-QR-POLL] status check failed for %s: %s", pairing_sid, exc)
+        session = db.get_demo_session(phone)
+        if session and session.get("demoPairingMode") == "qr" and session.get("demoQrAttemptId") == attempt_id:
+            await self._send_demo(phone, _demo_text(_DEMO_QR_FOLLOWUP, session.get("language", "pt")))
+
+    async def _demo_finalize_pairing(self, phone: str, session: dict | None, lang: str) -> None:
+        """Complete the in-demo pairing: activate the business (waSessionId + 7-day
+        trial) via the shared helper, mark the demo + onboarding sessions done, and
+        confirm success in the demo chat. Idempotent."""
+        if session is None:
+            session = db.get_demo_session(phone) or {}
+        if session.get("demoPairingMode") == "paired":
+            return
+
+        pairing_sid = f"biz-{phone}"
+        onb: dict = {}
+        try:
+            onb = db.get_onboarding_session(phone) or {}
+        except Exception:
+            pass
+        business_id = onb.get("businessId")
+
+        await self._apply_wa_pairing(business_id, phone, pairing_sid, onb)
+
+        try:
+            db.upsert_demo_session(phone, {
+                "demoPairingMode": "paired",
+                "lastActivityAt": datetime.utcnow().isoformat(),
+            })
+        except Exception:
+            pass
+        session["demoPairingMode"] = "paired"
+
+        # Reflect the link on the onboarding session so the global side is in sync
+        # (they finished the key step; remaining optional steps can happen later).
+        if onb:
+            try:
+                db.upsert_onboarding_session(phone, {
+                    "currentStep": "post_onboarding",
+                    "pairingSessionId": pairing_sid,
+                })
+            except Exception:
+                pass
+
+        await self._send_demo(phone, _demo_text(_DEMO_PAIR_SUCCESS, lang))
+        try:
+            posthog_client.capture(
+                business_id=business_id or phone, customer_phone=phone,
+                event="whatsapp_connected", properties={"channel": "demo_number"},
+            )
+        except Exception:
+            pass
+        logger.info("[DEMO-PAIR] finalized pairing for %s (business=%s)", phone, business_id)
+
+    async def _apply_wa_pairing(
+        self, business_id: str | None, phone: str, pairing_sid: str | None, session: dict
+    ) -> None:
+        """Persist a successful WhatsApp link (waSessionId + phone) and activate the
+        7-day PRO trial on first connect. Shared by the onboarding 'done' path
+        (_handle_pairing) and the in-demo pairing flow so both finalize identically.
+        No user-facing sends — callers own their own confirmation message."""
+        if business_id and pairing_sid:
+            try:
+                db.update_business_doc(business_id, {
+                    "waSessionId": pairing_sid,
+                    "waPhoneNumber": phone,
+                })
+            except Exception as exc:
+                logger.error("Failed to update business WA info: %s", exc)
+
+        # Activate 7-day PRO trial on first successful WhatsApp connection.
+        # Guard: only onboarding→trialing; never override a paid plan; trialStartedAt
+        # already set → trial already running, no-op.
+        if business_id:
+            try:
+                _biz_snap = db.get_business_by_id(business_id)
+                _plan_now = str((_biz_snap or {}).get("plan") or "").lower()
+                if _biz_snap and _plan_now in ("", "onboarding") and not _biz_snap.get("trialStartedAt"):
+                    from datetime import timezone as _tz
+                    from app.services.billing.trial_manager import build_trial_fields
+                    _trial_fields = build_trial_fields(datetime.now(_tz.utc))
+                    db.update_business_doc(business_id, _trial_fields)
+                    logger.info(
+                        "[TRIAL] 7-day PRO trial activated for business=%s at WhatsApp Done",
+                        business_id,
+                    )
+                    try:
+                        posthog_client.capture(
+                            business_id=business_id,
+                            customer_phone=phone,
+                            event="business_trial_started",
+                            properties={
+                                "plan": "trialing",
+                                "trial_days": 7,
+                                "business_name": (session or {}).get("businessName") or "",
+                                "business_type": (session or {}).get("businessType") or "",
+                            },
+                        )
+                    except Exception:
+                        pass
+            except Exception as _trial_exc:
+                logger.error("[TRIAL] Failed to activate trial for business=%s: %s", business_id, _trial_exc)
+
+    async def _demo_send_aboutus(self, phone: str, lang: str, session: dict | None = None) -> None:
+        """Send the About-us + human-support message on the demo device (once).
+        Sets awaitingHumanSupportAnswer so a following bare 'yes' loops in a human.
+        Used by the *skip* path and the 10-min idle demo_aboutus sweep."""
+        if session is None:
+            session = db.get_demo_session(phone) or {}
+        if session.get("demoAboutUsSent"):
+            return
+        updates = {
+            "demoAboutUsSent": True,
+            "awaitingHumanSupportAnswer": True,
+            "lastActivityAt": datetime.utcnow().isoformat(),
+        }
+        db.upsert_demo_session(phone, updates)
+        session.update(updates)
+        await self._send_demo(phone, _demo_text(_DEMO_ABOUTUS, lang))
+        logger.info("[DEMO-NUMBER] about-us + human-support offer sent for %s", phone)
 
     # ── Demo interrupt: pause onboarding, run demo, resume after ─────────
 
@@ -6481,50 +6856,11 @@ class OnboardingService:
             business_id = session.get("businessId")
             pairing_sid = session.get("pairingSessionId")
 
-            if business_id and pairing_sid:
-                try:
-                    db.update_business_doc(business_id, {
-                        "waSessionId": pairing_sid,
-                        "waPhoneNumber": phone,
-                    })
-                except Exception as exc:
-                    logger.error("Failed to update business WA info: %s", exc)
-
-            # Activate 7-day PRO trial on first successful WhatsApp connection.
-            # This runs regardless of reconnectMode so an owner who skipped pairing
-            # during initial onboarding still gets the trial when they later connect.
-            # Guard: trialStartedAt already set → trial already running, no-op.
-            if business_id:
-                try:
-                    _biz_snap = db.get_business_by_id(business_id)
-                    _plan_now = str((_biz_snap or {}).get("plan") or "").lower()
-                    # Only transition onboarding -> trialing. Never override paid
-                    # plans on reconnect/re-pair flows.
-                    if _biz_snap and _plan_now in ("", "onboarding") and not _biz_snap.get("trialStartedAt"):
-                        from datetime import timezone as _tz
-                        from app.services.billing.trial_manager import build_trial_fields
-                        _trial_fields = build_trial_fields(datetime.now(_tz.utc))
-                        db.update_business_doc(business_id, _trial_fields)
-                        logger.info(
-                            "[TRIAL] 7-day PRO trial activated for business=%s at WhatsApp Done",
-                            business_id,
-                        )
-                        try:
-                            posthog_client.capture(
-                                business_id=business_id,
-                                customer_phone=phone,
-                                event="business_trial_started",
-                                properties={
-                                    "plan": "trialing",
-                                    "trial_days": 7,
-                                    "business_name": session.get("businessName") or "",
-                                    "business_type": session.get("businessType") or "",
-                                },
-                            )
-                        except Exception:
-                            pass
-                except Exception as _trial_exc:
-                    logger.error("[TRIAL] Failed to activate trial for business=%s: %s", business_id, _trial_exc)
+            # Persist the WhatsApp link + activate the 7-day PRO trial on first
+            # connect. Shared with the in-demo pairing flow (client 2026-07-28) so
+            # both finalize identically. Runs regardless of reconnectMode so an
+            # owner who skipped pairing earlier still gets the trial when they link.
+            await self._apply_wa_pairing(business_id, phone, pairing_sid, session)
 
             # Reconnect flow — calendar & call-forwarding were already done during
             # initial onboarding, so go straight back to post_onboarding.

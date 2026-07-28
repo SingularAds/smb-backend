@@ -29,6 +29,7 @@ from app.services.automation.referral_automation import run_referral_invite_swee
 from app.services.automation.trial_expiry_automation import run_trial_expiry_sweep
 from app.services.automation.day2_checkin import run_day2_checkin_sweep
 from app.services.automation.onboarding_followup import run_onboarding_followup_sweep
+from app.services.automation.demo_followup import run_demo_aboutus_sweep
 from app.services.automation.kb_expiry import run_kb_expiry_sweep
 from app.services.csat_service import sweep_all as run_csat_sweep
 from app.config import settings as _settings
@@ -107,6 +108,13 @@ async def _job_onboarding_followup() -> None:
         await run_onboarding_followup_sweep()
     except Exception as exc:
         logger.exception("[Scheduler] onboarding follow-up sweep crashed: %s", exc)
+
+
+async def _job_demo_aboutus() -> None:
+    try:
+        await run_demo_aboutus_sweep()
+    except Exception as exc:
+        logger.exception("[Scheduler] demo about-us sweep crashed: %s", exc)
 
 
 async def _job_kb_expiry() -> None:
@@ -239,6 +247,20 @@ def start_scheduler() -> None:
         trigger=IntervalTrigger(minutes=15),
         id="onboarding_followup_sweep",
         name="Onboarding drop-off follow-up sweep (1 h + 18 h nudges)",
+        replace_existing=True,
+        misfire_grace_time=120,
+        max_instances=1,
+    )
+
+    # End-of-demo "About us" idle sweep — every 5 minutes. The DEMO_ABOUTUS_IDLE_MIN
+    # (default 10 min) threshold is enforced inside the sweep; running every 5 min
+    # just bounds how soon after that threshold the message goes out. At-most-once
+    # per demo session (see app/services/automation/demo_followup.py).
+    _scheduler.add_job(
+        _job_demo_aboutus,
+        trigger=IntervalTrigger(minutes=5),
+        id="demo_aboutus_sweep",
+        name="End-of-demo About-us idle sweep (10-min after pairing offer)",
         replace_existing=True,
         misfire_grace_time=120,
         max_instances=1,
