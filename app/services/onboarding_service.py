@@ -666,6 +666,15 @@ _DEMO_CODE_FOLLOWUP: dict[str, str] = {
     "es": "⏱ ~60s — te aviso en cuanto conecte 🔄\nResponde *nuevo código* para uno nuevo, o *después* para conectar más tarde.",
 }
 
+# Bridge says this number is already registered/linked — reconnect the existing
+# device rather than issuing a (rejected) fresh code, exactly like the onboarding
+# pairing does. Never claim success without a confirmed connection.
+_DEMO_ALREADY_LINKED: dict[str, str] = {
+    "pt": "Seu WhatsApp já está vinculado a este negócio — estou reconectando agora. Responda *pronto* quando voltar, ou *novo código* pra recomeçar.",
+    "en": "Your WhatsApp is already linked to this business — I'm reconnecting it now. Reply *done* once it's back, or *new code* to start fresh.",
+    "es": "Tu WhatsApp ya está vinculado a este negocio — lo estoy reconectando ahora. Responde *listo* cuando vuelva, o *nuevo código* para empezar de nuevo.",
+}
+
 _DEMO_QR_CAPTION: dict[str, str] = {
     "pt": "Escaneie em WhatsApp → Aparelhos conectados → Conectar aparelho. É a conexão oficial do WhatsApp — seu número continua seu. 🔒",
     "en": "Scan this in WhatsApp → Linked Devices → Link a Device. It's WhatsApp's official linking — your number stays yours. 🔒",
@@ -4925,21 +4934,32 @@ class OnboardingService:
 
     async def _handle_demo_pairing(self, session: dict, phone: str, body: str, lang: str) -> None:
         """Drive one turn of the in-demo pairing flow, based on demoPairingMode
-        ("offer" → choose QR/code, "code"/"qr" → the active pairing)."""
+        ("offer" → choose QR/code, "code"/"qr" → the active pairing).
+
+        Matching mirrors the onboarding pairing: DONE / SKIP are exact-match (so a
+        negated "not done" / "it's not linked" never counts), while NEW-CODE /
+        REFRESH are substring-matched so natural phrasings ("send me a new code",
+        "the code didn't work, another one") reliably regenerate — the missing
+        behavior the client reported (2026-07-29)."""
         normalized = body.strip().lower().rstrip(".!?")
         mode = session.get("demoPairingMode")
 
-        _qr_choice = {"1", "qr", "qr code", "scan", "escanear", "escáner", "escaner", "scannear"}
-        _code_choice = {"2", "code", "codigo", "código", "pairing code", "pareamento", "vinculación", "vinculacion"}
-        _switch_qr = {"qr", "qr code", "scan", "escanear"}
-        _switch_code = {"code", "codigo", "código", "pairing code", "pareamento"}
-        _skip = {"skip", "depois", "later", "mais tarde", "después", "despues", "pular", "saltar", "not now"}
-        _done = {"done", "pronto", "feito", "hecho", "listo", "ready", "linked", "conectado", "connected", "scanned"}
-        _new_code = {"new code", "novo código", "novo codigo", "nuevo código", "nuevo codigo",
-                     "resend", "new", "código novo", "codigo novo", "otra vez", "de novo"}
-        _refresh = {"refresh", "atualizar", "actualizar", "new qr", "novo qr", "nuevo qr", "expired", "expirou"}
+        def _has(words: tuple[str, ...]) -> bool:
+            return any(w in normalized for w in words)
 
-        # Skip anywhere → send the About-us + human-support message now.
+        _skip = {"skip", "pular", "saltar", "later", "depois", "mais tarde",
+                 "después", "despues", "not now", "agora não", "agora nao"}
+        _done = {"done", "pronto", "feito", "hecho", "listo", "ready", "conectado",
+                 "connected", "conectei", "conectou", "consegui", "scanned"}
+        _new_code = ("new code", "novo código", "novo codigo", "nuevo código", "nuevo codigo",
+                     "código novo", "codigo novo", "resend", "outro código", "outro codigo",
+                     "another code", "code again", "send the code", "send code")
+        _refresh = ("refresh", "atualizar", "actualizar", "new qr", "novo qr", "nuevo qr",
+                    "another qr", "qr again", "expired", "expirou", "caduc")
+        _code_words = ("code", "código", "codigo", "pareamento", "vincula")
+        _qr_words = ("qr", "scan", "escanear", "escáner", "escaner", "scannear")
+
+        # SKIP (exact) → send the About-us + human-support message now.
         if normalized in _skip:
             db.upsert_demo_session(phone, {
                 "demoPairingMode": "skipped",
@@ -4950,39 +4970,65 @@ class OnboardingService:
             return
 
         if mode == "offer":
-            if normalized in _qr_choice or normalized.startswith("1"):
+            if normalized == "1" or _has(_qr_words):
                 await self._demo_send_qr(session, phone, lang)
-            elif normalized in _code_choice or normalized.startswith("2"):
+            elif normalized == "2" or _has(_code_words):
                 await self._demo_send_code(session, phone, lang)
             else:
                 await self._send_demo(phone, _demo_text(_DEMO_PAIRING_OFFER, lang))
             return
 
         if mode == "code":
-            if normalized in _new_code:
-                await self._demo_send_code(session, phone, lang)
-            elif normalized in _switch_qr:
-                await self._demo_send_qr(session, phone, lang)
+            if _has(_new_code):
+                await self._demo_send_code(session, phone, lang)          # fresh code
             elif normalized in _done:
                 await self._demo_check_and_finalize(session, phone, lang)
+            elif _has(_qr_words):
+                await self._demo_send_qr(session, phone, lang)            # switch to QR
             else:
                 await self._send_demo(phone, _demo_text(_DEMO_PAIR_NOT_LINKED, lang))
             return
 
         if mode == "qr":
-            if normalized in _refresh or normalized in _new_code:
-                await self._demo_send_qr(session, phone, lang)
-            elif normalized in _switch_code:
-                await self._demo_send_code(session, phone, lang)
+            if _has(_refresh):
+                await self._demo_send_qr(session, phone, lang)            # fresh QR
             elif normalized in _done:
                 await self._demo_check_and_finalize(session, phone, lang)
+            elif _has(_new_code) or _has(_code_words):
+                await self._demo_send_code(session, phone, lang)          # switch to code
             else:
                 await self._send_demo(phone, _demo_text(_DEMO_QR_FOLLOWUP, lang))
             return
 
     async def _demo_send_code(self, session: dict, phone: str, lang: str) -> None:
-        """Generate a pairing CODE for biz-<phone> and send it on the demo device."""
+        """Generate a pairing CODE for biz-<phone> and send it on the demo device.
+
+        Mirrors the onboarding _send_pairing_code: a status pre-check self-heals an
+        already-linked / stale session, and a bridge conflict reconnects the
+        existing device rather than falsely declaring success. A fresh 'new code'
+        request always yields a genuinely new code."""
         pairing_sid = f"biz-{phone}"
+
+        # Pre-check (like onboarding): already linked & connected to THIS phone →
+        # finish; linked to a DIFFERENT phone → force-logout so a fresh code links
+        # THIS one; otherwise fall through to generate a code.
+        try:
+            state = await self.wa.get_session_status(pairing_sid)
+        except Exception:
+            state = {}
+        if state.get("paired"):
+            paired_phone = "".join(c for c in str(state.get("phone") or "") if c.isdigit())
+            user_phone = "".join(c for c in str(phone) if c.isdigit())
+            same = bool(paired_phone) and len(user_phone) >= 8 and paired_phone[-8:] == user_phone[-8:]
+            if same and state.get("status") == "connected":
+                await self._demo_finalize_pairing(phone, session, lang)
+                return
+            if paired_phone and not same:
+                try:
+                    await self.wa.logout_session(pairing_sid)
+                except Exception as _lo_exc:
+                    logger.warning("[DEMO-PAIR] logout of stale session failed for %s: %s", phone, _lo_exc)
+
         code = None
         for attempt in range(3):
             try:
@@ -4990,11 +5036,25 @@ class OnboardingService:
                 code = result.get("code")
                 break
             except PairingStateConflict:
+                # Bridge already has this session registered → reconnect the
+                # existing device (do NOT claim success unless it's truly online).
                 try:
                     await self.wa.reconnect_session(pairing_sid)
                 except Exception:
                     pass
-                await self._demo_finalize_pairing(phone, session, lang)
+                try:
+                    st = await self.wa.get_session_status(pairing_sid)
+                    if st.get("paired") and st.get("status") == "connected":
+                        await self._demo_finalize_pairing(phone, session, lang)
+                        return
+                except Exception:
+                    pass
+                db.upsert_demo_session(phone, {
+                    "demoPairingMode": "code",
+                    "lastActivityAt": datetime.utcnow().isoformat(),
+                })
+                session["demoPairingMode"] = "code"
+                await self._send_demo(phone, _demo_text(_DEMO_ALREADY_LINKED, lang))
                 return
             except Exception as exc:
                 logger.warning("[DEMO-PAIR] code gen attempt %d failed for %s: %s", attempt + 1, phone, exc)
@@ -5038,11 +5098,25 @@ class OnboardingService:
                 result = await self.wa.get_qr_payload(pairing_sid, timeout_seconds=45)
             payload = (result or {}).get("qr_payload")
         except PairingStateConflict:
+            # Already registered → reconnect the existing device; only declare
+            # success if the bridge actually shows it connected (no false finalize).
             try:
                 await self.wa.reconnect_session(pairing_sid)
             except Exception:
                 pass
-            await self._demo_finalize_pairing(phone, session, lang)
+            try:
+                st = await self.wa.get_session_status(pairing_sid)
+                if st.get("paired") and st.get("status") == "connected":
+                    await self._demo_finalize_pairing(phone, session, lang)
+                    return
+            except Exception:
+                pass
+            db.upsert_demo_session(phone, {
+                "demoPairingMode": "code",
+                "lastActivityAt": datetime.utcnow().isoformat(),
+            })
+            session["demoPairingMode"] = "code"
+            await self._send_demo(phone, _demo_text(_DEMO_ALREADY_LINKED, lang))
             return
         except Exception as exc:
             logger.warning("[DEMO-PAIR] QR fetch failed for %s: %s", phone, exc)
@@ -7158,8 +7232,10 @@ class OnboardingService:
             session["trustInterstitialShown"] = True
 
         msg = (
-            f"🎉 {biz_name} is officially LIVE! Big moment 🥳 "
-            "Now let’s connect your business WhatsApp so I can start catching every customer for you 📱\n\n"
+            f"🎉 {biz_name} is all set up — just ONE last step to go live! 🙌\n\n"
+            "Now let’s connect your business WhatsApp so I can actually start answering your "
+            "customers and taking bookings for you 📱 Until we link it, I can’t receive your "
+            "customers’ messages yet — so let’s finish this together now 💪\n\n"
             "1️⃣ Scan QR (recommended) — if you’ve got a tablet, computer, or second phone nearby\n"
             "2️⃣ Pairing code — if it’s just you and this phone 😊\n\n"
             "Reply 1 or 2."
