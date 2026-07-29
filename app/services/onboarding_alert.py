@@ -144,6 +144,7 @@ async def maybe_alert_human(
     *,
     force: bool = False,
     session_kind: str = "onboarding",
+    category: str = "",
 ) -> bool:
     """Alert the human-support number about a conversation that needs a human.
 
@@ -151,6 +152,7 @@ async def maybe_alert_human(
     ``ALERT_NUMBER`` is unset, or when the per-session cooldown / ceiling has
     been hit (unless ``force`` is set, which still respects the hard ceiling).
     ``session_kind`` selects onboarding vs demo persistence + context.
+    ``category`` classifies the alert for the Firestore audit log.
     """
     alert_number = (settings.ALERT_NUMBER or "").strip()
     if not alert_number or not phone:
@@ -194,6 +196,20 @@ async def maybe_alert_human(
     _persist(phone, session_kind, updates)
     session.update(updates)
 
+    # Audit log: store the EXACT message sent to ALERT_NUMBER in Firestore so the
+    # team can review what was shared (independent of the WhatsApp inbox). The db
+    # helper is best-effort and never raises.
+    db.log_alert(
+        phone,
+        session_kind=session_kind,
+        category=category,
+        reason=reason,
+        text=text,
+        device=device,
+        business_name=session.get("businessName") or "",
+        step=(session.get("currentStep") or "") if session_kind != "demo" else "demo",
+    )
+
     # Record it on the transcript so the dashboard shows an escalation happened
     # (onboarding only — the demo is isolated and has its own store).
     if session_kind != "demo":
@@ -229,8 +245,45 @@ async def note_stuck(
     _persist(phone, session_kind, {"stuckCount": count})
 
     if count >= _STUCK_THRESHOLD:
-        return await maybe_alert_human(phone, session, reason, session_kind=session_kind)
+        return await maybe_alert_human(
+            phone, session, reason, session_kind=session_kind, category="stuck",
+        )
     return False
+
+
+# How many times an owner asks for a pairing code / QR (incl. QR↔code switches and
+# refreshes) before we treat them as stuck on pairing and page a human. Their
+# FIRST choice counts as 1, so 3 means "asked a third time and still not linked".
+_PAIRING_ATTEMPT_ALERT_AT = 3
+
+
+async def note_pairing_attempt(
+    phone: str, session: dict, *, session_kind: str = "onboarding",
+) -> bool:
+    """Count one WhatsApp pairing code/QR request. WhatsApp linking is the most
+    important — and most drop-off-prone — onboarding step, so when the owner has
+    asked for a code/QR ``_PAIRING_ATTEMPT_ALERT_AT`` times without linking they
+    are clearly stuck: page a human ONCE (a ``pairingStuckAlerted`` latch prevents
+    re-paging on every further attempt). No-op unless ``ALERT_NUMBER`` is set.
+    """
+    if not (settings.ALERT_NUMBER or "").strip():
+        return False
+
+    count = int(session.get("pairingAttemptCount") or 0) + 1
+    session["pairingAttemptCount"] = count
+    _persist(phone, session_kind, {"pairingAttemptCount": count})
+
+    if count < _PAIRING_ATTEMPT_ALERT_AT or session.get("pairingStuckAlerted"):
+        return False
+
+    session["pairingStuckAlerted"] = True
+    _persist(phone, session_kind, {"pairingStuckAlerted": True})
+    return await maybe_alert_human(
+        phone, session,
+        f"Owner is stuck on WhatsApp pairing — asked for a code/QR {count} times "
+        f"without linking their WhatsApp.",
+        force=True, session_kind=session_kind, category="pairing_stuck",
+    )
 
 
 async def note_progress(
@@ -316,6 +369,48 @@ def classify_support_need(text: str) -> tuple[str | None, str]:
     return None, ""
 
 
+# ── Stuck / confused / frustrated signal ──────────────────────────────────────
+# Phrases where the owner is telling us, in their own words, that they can't get
+# something to work / don't understand / don't know how. Unlike an explicit human
+# request this does NOT page immediately — the assistant guides first, and only if
+# the owner keeps signaling (note_stuck threshold) do we escalate (client
+# 2026-07-29). EN / PT / ES. Word-ish boundaries keep false-positives low.
+_STUCK_PHRASE_RE = re.compile(
+    r"("
+    # ── English ──
+    r"not working|does\s?n'?t work|is\s?n'?t work|are\s?n'?t work|did\s?n'?t work"
+    r"|do\s?n'?t work|wo\s?n'?t work|stopped working|not letting me"
+    r"|ca\s?n'?t connect|can\s?not connect|wo\s?n'?t connect|not connecting"
+    r"|ca\s?n'?t link|can\s?not link|not linking"
+    r"|do\s?n'?t understand|do not understand|not understand|no\s?t clear to me"
+    r"|do\s?n'?t know how|do not know how|not sure how|no idea how|how do i even"
+    r"|i'?m stuck|i am stuck|i'?m lost|so confusing|too confusing|too complicated"
+    r"|too hard|too difficult|ca\s?n'?t do (?:it|this)|can\s?not do (?:it|this)"
+    r"|not able to|unable to|i give up|nothing happens|not happening"
+    # ── Portuguese ──
+    r"|não funciona|nao funciona|não está funcion|nao esta funcion|não deu certo|nao deu certo"
+    r"|não consigo|nao consigo|não entendi|nao entendi|não entendo|nao entendo"
+    r"|não sei como|nao sei como|não sei fazer|nao sei fazer|muito difícil|muito dificil"
+    r"|complicado demais|travou|não abre|nao abre|não conecta|nao conecta|desisto"
+    # ── Spanish ──
+    r"|no funciona|no está funcion|no esta funcion|no sirve|no me deja"
+    r"|no entiendo|no sé cómo|no se como|no logro|no puedo hacer|muy difícil|muy dificil"
+    r"|no conecta|no se conecta|me rindo"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def classify_stuck_signal(text: str) -> str:
+    """Return a short reason if the message expresses being stuck / confused /
+    unable to proceed, else "". Used for the guide-first-then-escalate path."""
+    if not text:
+        return ""
+    if _STUCK_PHRASE_RE.search(text.lower()):
+        return f"Owner signaled they're stuck / can't proceed: {text.strip()[:160]!r}"
+    return ""
+
+
 async def alert_if_support_needed(
     phone: str,
     session: dict,
@@ -330,18 +425,36 @@ async def alert_if_support_needed(
     An explicit human request bypasses the cooldown (force=True) since the person
     asked directly; off-context/inappropriate uses the normal cooldown so a
     string of such messages doesn't spam the agent.
+
+    A softer "stuck / confused / can't proceed" signal does NOT page on the first
+    hit — the assistant guides first; only if the owner KEEPS signaling does
+    note_stuck escalate (client 2026-07-29). Returns "stuck" in that case.
     """
     if not (settings.ALERT_NUMBER or "").strip():
         return None
+
+    # 1) Explicit human request / inappropriate → alert in parallel right away.
     category, reason = classify_support_need(text)
-    if not category:
-        return None
-    try:
-        await maybe_alert_human(
-            phone, session, reason,
-            force=(category == "human_request"),
-            session_kind=session_kind,
-        )
-    except Exception:
-        logger.exception("[ALERT] alert_if_support_needed failed for %s", phone)
-    return category
+    if category:
+        try:
+            await maybe_alert_human(
+                phone, session, reason,
+                force=(category == "human_request"),
+                session_kind=session_kind,
+                category=category,
+            )
+        except Exception:
+            logger.exception("[ALERT] alert_if_support_needed failed for %s", phone)
+        return category
+
+    # 2) "It's not working" / "I don't understand" / "I don't know how" → guide
+    #    first (assistant replies as usual), escalate only if they stay stuck.
+    stuck_reason = classify_stuck_signal(text)
+    if stuck_reason:
+        try:
+            await note_stuck(phone, session, stuck_reason, session_kind=session_kind)
+        except Exception:
+            logger.exception("[ALERT] stuck-signal note failed for %s", phone)
+        return "stuck"
+
+    return None

@@ -3032,6 +3032,7 @@ class OnboardingService:
                         phone, session,
                         "Owner is stuck at the location step and could not proceed "
                         "even after being helped — released to open conversation.",
+                        category="stuck",
                     )
                     await self._handle_conversation(session, phone, body, push_name, message_id)
                     return
@@ -4777,7 +4778,7 @@ class OnboardingService:
                     await onboarding_alert.maybe_alert_human(
                         phone, session,
                         "Demo user accepted the offer to have a human help finish onboarding.",
-                        force=True, session_kind="demo",
+                        force=True, session_kind="demo", category="human_request",
                     )
                 except Exception:
                     logger.exception("[ALERT] demo human-support opt-in failed for %s", phone)
@@ -4795,7 +4796,7 @@ class OnboardingService:
                 await onboarding_alert.maybe_alert_human(
                     phone, session,
                     f"Demo user asked to talk to a human: {body.strip()[:160]!r}",
-                    force=True, session_kind="demo",
+                    force=True, session_kind="demo", category="human_request",
                 )
             except Exception:
                 logger.exception("[ALERT] demo human-request alert failed for %s", phone)
@@ -4809,7 +4810,7 @@ class OnboardingService:
                 await onboarding_alert.maybe_alert_human(
                     phone, session,
                     f"Demo user went off-context / inappropriate: {body.strip()[:160]!r}",
-                    session_kind="demo",
+                    session_kind="demo", category="inappropriate",
                 )
             except Exception:
                 logger.exception("[ALERT] demo inappropriate alert failed for %s", phone)
@@ -4858,7 +4859,7 @@ class OnboardingService:
                 await onboarding_alert.maybe_alert_human(
                     phone, session,
                     f"Demo: unsure about a business/pricing/config question. Client asked: {body.strip()[:160]!r}",
-                    session_kind="demo",
+                    session_kind="demo", category="needs_human",
                 )
             except Exception:
                 logger.exception("[ALERT] demo needs-human alert failed for %s", phone)
@@ -5020,6 +5021,10 @@ class OnboardingService:
         await asyncio.sleep(0.5)
         await self._send_demo(phone, _demo_text(_DEMO_CODE_FOLLOWUP, lang))
         asyncio.ensure_future(self._demo_poll_pairing(phone, pairing_sid, attempt_id))
+        try:
+            await onboarding_alert.note_pairing_attempt(phone, session, session_kind="demo")
+        except Exception:
+            logger.exception("[ALERT] demo pairing-attempt note failed for %s", phone)
         logger.info("[DEMO-PAIR] pairing code sent for %s", phone)
 
     async def _demo_send_qr(self, session: dict, phone: str, lang: str) -> None:
@@ -5070,6 +5075,10 @@ class OnboardingService:
         await asyncio.sleep(1)
         await self._send_demo(phone, _demo_text(_DEMO_QR_FOLLOWUP, lang))
         asyncio.ensure_future(self._demo_poll_qr(phone, pairing_sid, attempt_id))
+        try:
+            await onboarding_alert.note_pairing_attempt(phone, session, session_kind="demo")
+        except Exception:
+            logger.exception("[ALERT] demo pairing-attempt note failed for %s", phone)
         logger.info("[DEMO-PAIR] QR sent for %s", phone)
 
     async def _demo_check_and_finalize(self, session: dict, phone: str, lang: str) -> None:
@@ -7107,6 +7116,11 @@ class OnboardingService:
                 phone, "assistant", f"[QR code image]\n{qr_caption}",
                 step=session.get("currentStep"), kind="image",
             )
+            # Count this QR request toward the pairing-stuck escalation.
+            try:
+                await onboarding_alert.note_pairing_attempt(phone, session)
+            except Exception:
+                logger.exception("[ALERT] pairing-attempt note failed for %s", phone)
             return True
         except Exception as exc:
             print(f"[QR] send_image FAILED to {phone}: {exc}")
@@ -7331,6 +7345,11 @@ class OnboardingService:
                 asyncio.ensure_future(
                     self._poll_qr_pairing_status(phone, pairing_sid, _qr_attempt_id_new)
                 )
+                # A QR refresh is another pairing request — count it too.
+                try:
+                    await onboarding_alert.note_pairing_attempt(phone, session)
+                except Exception:
+                    logger.exception("[ALERT] pairing-attempt note failed for %s", phone)
             except Exception as exc:
                 logger.error("[QR] Failed to send refreshed QR image to %s: %s", phone, exc)
                 await self._send(
@@ -7559,6 +7578,12 @@ class OnboardingService:
                 asyncio.ensure_future(
                     self._poll_pairing_status(phone, pairing_sid, session, attempt_id)
                 )
+                # Count this code request; page a human once the owner has asked
+                # for a code/QR too many times without linking (client 2026-07-29).
+                try:
+                    await onboarding_alert.note_pairing_attempt(phone, session)
+                except Exception:
+                    logger.exception("[ALERT] pairing-attempt note failed for %s", phone)
                 return
             except PairingStateConflict as exc:
                 logger.info(

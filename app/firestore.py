@@ -1539,6 +1539,45 @@ def set_global_kb(content: str) -> None:
     })
 
 
+# ── Human-support alert audit log ─────────────────────────────────────────────
+# Every alert actually delivered to settings.ALERT_NUMBER is appended here so the
+# team can review, in Firestore, exactly what was sent (independent of the
+# WhatsApp inbox). Append-only; auto-ID docs. Best-effort — a logging failure must
+# NEVER break the alert path, so this swallows all exceptions.
+
+def log_alert(
+    phone: str,
+    *,
+    session_kind: str = "onboarding",
+    category: str = "",
+    reason: str = "",
+    text: str = "",
+    device: str | None = None,
+    business_name: str = "",
+    step: str = "",
+) -> None:
+    """Append a record of a delivered human-support alert to ``alert_logs``.
+
+    ``text`` is the exact message sent to ALERT_NUMBER; ``category`` classifies
+    it (human_request / inappropriate / stuck / pairing_stuck / …); ``reason`` is
+    the short one-liner. Never raises into the caller.
+    """
+    try:
+        _db().collection("alert_logs").add({
+            "phone": _clean_phone(phone),
+            "sessionKind": session_kind or "onboarding",
+            "category": category or "",
+            "reason": (reason or "")[:500],
+            "text": (text or "")[:4000],
+            "device": device or "",
+            "businessName": business_name or "",
+            "step": step or "",
+            "createdAt": _now_iso(),
+        })
+    except Exception:
+        logger.warning("[ALERT-LOG] failed to store alert for %s", phone, exc_info=True)
+
+
 # ── Website AI Assistant (Chatwoot) ──────────────────────────────────────────
 # Pure CRUD layer for the website chat pipeline. All higher-level logic lives
 # in app.web_assistant.*. Stored at:
