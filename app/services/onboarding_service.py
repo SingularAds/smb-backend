@@ -3184,6 +3184,15 @@ class OnboardingService:
                 normalized = body.strip().lower()
                 _done = {"done", "pronto", "feito", "hecho", "ready", "listo", "linked", "conectado"}
                 _skip = {"skip", "pular", "saltar", "later", "depois"}
+                # Owner on the CODE flow asking to switch to QR. This MUST be
+                # handled here — before skip / the intent classifier — or a "QR
+                # code" reply gets misread as "skip" and the whole linking step is
+                # silently abandoned (prod bug 2026-07-31; linking is critical).
+                _switch_qr = {
+                    "qr", "qr code", "qrcode", "scan", "scan qr", "use qr",
+                    "switch to qr", "qr instead", "qr please", "código qr",
+                    "codigo qr", "escanear", "escáner", "escaner", "leitor",
+                }
                 _new = {
                     "new code", "novo código", "nuevo código", "novo codigo",
                     "new", "código novo", "resend", "re-send", "send again",
@@ -3194,6 +3203,10 @@ class OnboardingService:
                 # Fast substring detection for common natural phrases (no API call)
                 if any(tok in normalized for tok in _done):
                     await self._handle_pairing(session, phone, "done")
+                    return
+                # Switch to QR (checked before skip so "QR code" is never a skip).
+                if "qr" in normalized or any(tok in normalized for tok in _switch_qr):
+                    await self._switch_to_qr(session, phone)
                     return
                 if any(tok in normalized for tok in _skip):
                     await self._handle_pairing(session, phone, "skip")
@@ -3208,6 +3221,9 @@ class OnboardingService:
                 pairing_intent = await self._classify_pairing_intent(body)
                 if pairing_intent == "done":
                     await self._handle_pairing(session, phone, "done")
+                    return
+                if pairing_intent == "switch_qr":
+                    await self._switch_to_qr(session, phone)
                     return
                 if pairing_intent == "resend":
                     await self._send_pairing_code(session, phone)
@@ -7651,6 +7667,50 @@ class OnboardingService:
         except Exception:
             pass
 
+    async def _switch_to_qr(self, session: dict, phone: str) -> None:
+        """Send the QR image and move to the QR-active step (arming the scan poll).
+
+        Shared by BOTH the QR/code choice AND the code step — so an owner who
+        started with a pairing code and then asks for the QR is switched over,
+        not skipped (client 2026-07-31: WhatsApp linking is the crucial step and
+        must never be silently skipped). ``_send_qr_image`` already records the
+        pairing attempt for the stuck-alert, so we don't double-count here.
+        """
+        db.upsert_onboarding_session(phone, {
+            "currentStep": "pairing_qr_active",
+            "pairingChoicePromptCount": 0,
+        })
+        session["currentStep"] = "pairing_qr_active"
+        ok = await self._send_qr_image(session, phone)
+        if ok:
+            await asyncio.sleep(1)
+            await self._send(
+                phone,
+                "⏱ QR codes refresh every ~20 seconds.\n\n"
+                "Reply *done* once linked, *refresh* for a new QR code, or "
+                "*code* to switch to a pairing code instead.",
+            )
+            # Launch background poll — auto-complete when bridge detects the scan
+            _qr_sid = session.get("pairingSessionId", f"biz-{phone}")
+            _qr_attempt_id = datetime.utcnow().isoformat()
+            db.upsert_onboarding_session(phone, {"qrAttemptId": _qr_attempt_id})
+            asyncio.ensure_future(
+                self._poll_qr_pairing_status(phone, _qr_sid, _qr_attempt_id)
+            )
+        else:
+            # QR unavailable after all retries — fall back to the choice with a
+            # clear, actionable alternative (never a dead end).
+            db.upsert_onboarding_session(phone, {"currentStep": "pairing_mode_choice"})
+            session["currentStep"] = "pairing_mode_choice"
+            await self._send(
+                phone,
+                "⚠️ *Couldn't generate the QR code right now.*\n\n"
+                "You can:\n"
+                "• Reply *QR* to try again\n"
+                "• Reply *code* to link via a pairing code instead 📱\n\n"
+                "_The pairing code works great if you only have this phone with you._",
+            )
+
     async def _handle_pairing_mode_choice(
         self, session: dict, phone: str, body: str
     ) -> None:
@@ -7692,39 +7752,8 @@ class OnboardingService:
         }
 
         if any(normalized == w or normalized.startswith(w) for w in _qr_words):
-            # User wants QR code. Clear the stuck/assist counters — they chose.
-            db.upsert_onboarding_session(phone, {
-                "currentStep": "pairing_qr_active",
-                "pairingChoicePromptCount": 0,
-            })
-            ok = await self._send_qr_image(session, phone)
-            if ok:
-                await asyncio.sleep(1)
-                await self._send(
-                    phone,
-                    "⏱ QR codes refresh every ~20 seconds.\n\n"
-                    "Reply *done* once linked, *refresh* for a new QR code, or "
-                    "*code* to switch to a pairing code instead.",
-                )
-                # Launch background poll — auto-complete when bridge detects the scan
-                _qr_sid = session.get("pairingSessionId", f"biz-{phone}")
-                _qr_attempt_id = datetime.utcnow().isoformat()
-                db.upsert_onboarding_session(phone, {"qrAttemptId": _qr_attempt_id})
-                asyncio.ensure_future(
-                    self._poll_qr_pairing_status(phone, _qr_sid, _qr_attempt_id)
-                )
-            else:
-                # QR unavailable after all retries — reset step and offer a clear
-                # actionable alternative rather than a vague "bridge starting up" message.
-                db.upsert_onboarding_session(phone, {"currentStep": "pairing_mode_choice"})
-                await self._send(
-                    phone,
-                    "⚠️ *Couldn't generate the QR code right now.*\n\n"
-                    "You can:\n"
-                    "• Reply *QR* to try again\n"
-                    "• Reply *2* or *code* to link via pairing code instead 📱\n\n"
-                    "_The pairing code works great if you only have this phone with you._",
-                )
+            # User wants QR code.
+            await self._switch_to_qr(session, phone)
             return
 
         if any(normalized == w or normalized.startswith(w) for w in _code_words):
@@ -7903,7 +7932,9 @@ class OnboardingService:
                 )
             return
 
-        if any(w in normalized for w in _switch_to_code_words):
+        # Switch to the pairing-code flow — but only when they did NOT say "qr"
+        # (so "qr code" while already on QR isn't misread as "switch to code").
+        if "qr" not in normalized and any(w in normalized for w in _switch_to_code_words):
             # Owner wants to switch to the pairing-code flow.
             if session.get("reconnectMode"):
                 db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
@@ -8111,7 +8142,8 @@ class OnboardingService:
                 await asyncio.sleep(0.5)
                 followup_template = (
                     "⏱ 60 seconds — I’ll know the second it connects 🔄\n\n"
-                    "Reply *new code* for a fresh one, or *skip* for later."
+                    "Reply *new code* for a fresh one, *QR* to switch to a QR code, "
+                    "or *skip* for later."
                 )
                 followup_localized = await self._localize_static(followup_template, "", session.get("language", "en"))
                 await self._send(phone, followup_localized)
@@ -8860,7 +8892,7 @@ class OnboardingService:
     async def _classify_pairing_intent(self, message: str) -> str:
         """Use Claude to classify what a user means while in the pairing step.
 
-        Returns one of: 'done' | 'resend' | 'skip' | 'change_info'
+        Returns one of: 'done' | 'switch_qr' | 'resend' | 'skip' | 'change_info'
         Handles typos, natural phrasing, and all languages.
         """
         try:
@@ -8869,17 +8901,19 @@ class OnboardingService:
                 max_tokens=10,
                 system=(
                     "The user is pairing their WhatsApp device to a business platform.\n"
+                    "They are currently on the PAIRING CODE method.\n"
                     "Classify their message into exactly one category:\n"
                     "  done        – they have linked/connected successfully and are confirming it\n"
+                    "  switch_qr   – they want to use the QR code method instead of the pairing code\n"
                     "  resend      – they want the pairing code sent again (resend, send again, new code, didn't get it, etc.)\n"
-                    "  skip        – they want to skip pairing for now\n"
+                    "  skip        – they want to skip pairing for now / do it later\n"
                     "  change_info – they want to change their business details (unrelated to pairing)\n"
                     "Reply with ONLY the category name, nothing else."
                 ),
                 messages=[{"role": "user", "content": message}],
             )
             intent = resp.content[0].text.strip().lower()
-            if intent in {"done", "resend", "skip", "change_info"}:
+            if intent in {"done", "switch_qr", "resend", "skip", "change_info"}:
                 return intent
         except Exception as exc:
             logger.warning("Pairing intent classification failed: %s", exc)
