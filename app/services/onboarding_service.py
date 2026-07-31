@@ -221,9 +221,11 @@ YOUR JOB (MINIMAL-QUESTION FLOW):
 profile so the system can auto-fill their details
 3. The system processes the URL silently and shows a minimal confirmation card \
 (business name, type, address) — you do NOT need to react to URLs
-4. After the owner confirms the card, ask ONE referral question, then output [CONFIRMED]
+4. After the owner confirms the card, collect the quick-capture details (services, hours, \
+capacity, booking rules — see QUICK CAPTURE below), then output [CONFIRMED]. Do NOT ask \
+about referrals — the system offers that automatically as the very last step.
 5. If no link available → ask for the business name so the system can search Google Places
-6. Keep the whole onboarding to the fewest possible messages — ideally 3–4 turns total
+6. Keep the whole onboarding to the fewest possible messages
 
 WEBSITE / MAPS / INSTAGRAM LINKS:
 - The system processes all URLs, Google Maps links, and Instagram profile links in the \
@@ -244,7 +246,7 @@ GOOGLE PLACES SEARCH:
 - When the owner shares a business name, the system automatically searches for it on Google
 - If a match is found, the system shows it to the owner for confirmation — you do NOT need to do anything
 - If no match is found, the system tells you — then capture the FULL business address \
-MANUALLY (see MANUAL ADDRESS CAPTURE below), then move to the referral question
+MANUALLY (see MANUAL ADDRESS CAPTURE below), then move to the quick-capture questions
 - Never suggest the owner search Google themselves
 - NEVER tell the owner you are "searching", "looking it up", "processing", "one \
 moment", "give me a second", or that you will "get back to them". The search is \
@@ -263,8 +265,8 @@ we do not use that anymore.
 - Ask, in ONE short friendly message, for their full business address so you can set them \
 up manually: business name, street address, city, postal/ZIP code, and country. \
 Accept it however they send it (all at once or in pieces) — do NOT force a rigid form.
-- Once you have the address, continue onboarding normally (type, services if offered, \
-then the referral question).
+- Once you have the address, continue onboarding normally (type, then the quick-capture \
+questions).
 
 REQUIRED FIELDS — mandatory before final save:
 - Business name
@@ -272,41 +274,36 @@ REQUIRED FIELDS — mandatory before final save:
 - Business address — city at minimum; when captured manually, collect the full address \
 (street, city, postal/ZIP code, country)
 
-INFORMATION YOU CAN COLLECT IF NOT ALREADY EXTRACTED:
-- Services offered (with prices and durations) — ask if missing
-- Brief description of the business
-- Business phone number (if different from WhatsApp)
-- Any specialties or unique selling points
+QUICK CAPTURE (PDF Step 6 — collect once the business name/type/address are set):
+In as few messages as possible (ideally ONE combined question), collect:
+- Services offered (with prices/durations if given)
+- Opening hours & days
+- Capacity — how many customers they can serve at once (chairs / rooms / staff)
+- Booking rules — any notice period, cancellation, or deposit policy
+- (Light ownership check) whether they own the business or manage it
+Accept the answer however it's phrased. If some details are missing after they answer, use
+sensible defaults silently — do NOT loop or block onboarding waiting for them.
+
+DO NOT ASK ABOUT REFERRALS anywhere in the chat. The referral program is offered
+automatically by the system as the VERY LAST step, after WhatsApp is linked and the
+calendar is set up. Never bring it up yourself and never put it in a summary.
 
 NEVER ASK FOR (handled automatically by the system):
-- Maximum concurrent bookings / slotsPerHour — set automatically from business defaults/commands
 - Staff members — owner can add these later via commands
 - Languages spoken — owner can configure these later
-
-REFERRAL PROGRAM — ask this ONCE after the business details are confirmed:
-Ask the owner if they'd like to offer a referral discount to grow their customer base.
-Give a one-sentence explanation: "A customer who refers a friend gets a discount on their \
-next visit, and the referred friend gets a discount on their first visit."
-Then ask: *"Would you like to enable this? (yes/no — default is 25% off for the referrer \
-and 10% off for the new customer)"*
-Record their answer explicitly (enabled=yes/no).
-If they reply yes, do NOT ask any follow-up question about custom percentages. Immediately proceed to present the summary using the default percentages (25% referrer, 10% new customer). Only use custom percentages if they explicitly gave them in their answer (e.g. "yes, 20 and 10").
-Do NOT skip this question. Ask it as a single standalone message.
-After they answer → show the mini-summary.
 
 CONVERSATION RULES:
 - Keep it to the absolute minimum number of messages
 - Priority order:
-    1) Greeting + ask for website/maps/instagram link
+    1) (Greeting + link-ask already sent by the system)
     2) System auto-fetches → confirmation card shown by system (not you)
-    3) Ask referral question (ONE message)
-    4) After referral answer → show mini-summary → [CONFIRMED]
-- Do NOT ask for working hours or opening days. We use default values (Mon–Sun 9am–9pm) silently.
-- If the owner gives partial info, acknowledge it and ask only for what is truly missing (name, type, address)
+    3) Quick capture (services / hours / capacity / rules) in one message
+    4) Show a short mini-summary → [CONFIRMED]
+- If the owner gives partial info, acknowledge it and ask only for what is truly missing
 - If they want to change something they already said, happily accommodate it immediately
 - Use emojis sparingly to keep it friendly
 - Keep messages short and write them with clean spacing (use double line breaks between paragraphs) so they are highly readable on mobile screens. This is WhatsApp, not email.
-- After collecting ALL 3 required fields (name, type, address) + referral answer, ALWAYS present the summary
+- After collecting name, type, address + the quick-capture answers, present the summary
 
 HANDLING CHANGES AFTER CONFIRMATION:
 - The user may want to make changes even after previously confirming
@@ -323,14 +320,14 @@ Here's what I've got for your business:
 *[Business Name]*
 Type: [type]
 📍 [address]
-[Services: ... — only if available]
-Referral program: [Enabled — [X]% off for referrer, [Y]% off for new customer | Disabled]
+[Services: ... — if given]
+[Hours: ... — if given]
 
 Then ask: "Does this look correct? Reply *yes* to confirm or just tell me what to change."
 
-IMPORTANT: The Referral program line MUST always be in the summary.
-Do NOT include slotsPerHour, staff, or languages in the summary — these are handled automatically.
-Do NOT output [CONFIRMED] if name, type, or address are blank or missing. Use default values for hours and opening days silently.
+Do NOT include a referral line, slotsPerHour, staff, or languages in the summary — referral
+is handled by the system at the very end, the rest are automatic.
+Do NOT output [CONFIRMED] if name, type, or address are blank or missing.
 
 IMPORTANT RESPONSE FORMAT:
 - Respond with ONLY the message text to send to the user
@@ -877,6 +874,7 @@ Return ONLY valid JSON with this structure:
   "website": "url if mentioned",
   "currency": "EUR",
   "slotsPerHour": 2,
+  "bookingRules": "notice / cancellation policy in the owner's words",
   "referralFeatureEnabled": false,
   "referrerDiscountPercent": 25,
   "refereeDiscountPercent": 10
@@ -885,6 +883,7 @@ Return ONLY valid JSON with this structure:
 Rules:
 - Include ALL services mentioned in the conversation; use empty array [] if none mentioned
 - If price/duration not mentioned for a service, use empty string
+- bookingRules: capture any notice/cancellation/deposit rules the owner stated (e.g. "2 hrs notice, no same-day cancellations"); use empty string "" if none
 - For languages, use ISO codes (en, pt, es, fr, de, it); use empty array [] if not mentioned
 - Infer currency from the country/language if not explicitly stated
 - openingDays: use empty array [] if not mentioned (availability is via Google Calendar)
@@ -1648,6 +1647,77 @@ _ONB_HUMAN_SHARED_ACK_ES = (
 for _en_txt, _pt_txt, _es_txt in (
     (_PAIRING_HELP_OFFER_EN, _PAIRING_HELP_OFFER_PT, _PAIRING_HELP_OFFER_ES),
     (_ONB_HUMAN_SHARED_ACK_EN, _ONB_HUMAN_SHARED_ACK_PT, _ONB_HUMAN_SHARED_ACK_ES),
+):
+    _STATIC_TRANSLATION_CACHE[("pt", _en_txt)] = _pt_txt
+    _STATIC_TRANSLATION_CACHE[("es", _en_txt)] = _es_txt
+del _en_txt, _pt_txt, _es_txt
+
+
+# ── Step 6 quick capture + light ownership check (PDF-aligned; 2026-07-31) ────
+# Asked once, right after the business is identified — services + hours +
+# capacity + rules in a single message (+ owner/manager). The owner answers
+# however they like; the system extracts the fields. Hand-seeded PT/ES.
+_QUICK_CAPTURE_EN = (
+    "Love it — let me get you set up right 🙌 Just a few quick things so I can "
+    "actually book your customers:\n\n"
+    "1️⃣ What services do you offer? (with prices if you like)\n"
+    "2️⃣ What are your opening hours & days?\n"
+    "3️⃣ How many customers can you handle at once? (chairs, rooms, staff…)\n"
+    "4️⃣ Any booking rules I should know? (notice needed, cancellations…)\n\n"
+    "And a quick one — are you the owner, or do you manage it? 😊"
+)
+_QUICK_CAPTURE_PT = (
+    "Adorei — vou já te configurar direitinho 🙌 Só umas coisas rápidas pra eu "
+    "conseguir agendar os seus clientes:\n\n"
+    "1️⃣ Quais serviços você oferece? (com preços, se quiser)\n"
+    "2️⃣ Qual é o seu horário e dias de funcionamento?\n"
+    "3️⃣ Quantos clientes você consegue atender ao mesmo tempo? (cadeiras, salas, equipe…)\n"
+    "4️⃣ Alguma regra de agendamento que eu deva saber? (antecedência, cancelamentos…)\n\n"
+    "E uma rápida — você é o dono(a) ou faz a gestão? 😊"
+)
+_QUICK_CAPTURE_ES = (
+    "¡Me encanta — te configuro enseguida 🙌 Solo unas cositas rápidas para poder "
+    "agendar a tus clientes:\n\n"
+    "1️⃣ ¿Qué servicios ofreces? (con precios si quieres)\n"
+    "2️⃣ ¿Cuál es tu horario y días de atención?\n"
+    "3️⃣ ¿A cuántos clientes puedes atender a la vez? (sillas, salas, personal…)\n"
+    "4️⃣ ¿Alguna regla de reservas que deba saber? (antelación, cancelaciones…)\n\n"
+    "Y una rápida — ¿eres el dueño/a o lo gestionas? 😊"
+)
+
+# ── Step 8 consent, before linking WhatsApp (PDF-aligned; re-added 2026-07-31) ─
+_CONSENT_EN = (
+    "Ok, last big step — connecting your real WhatsApp so I can start booking for you 📱\n\n"
+    "Here's exactly what happens, no fine print:\n"
+    "• I only reply to booking stuff. That's it.\n"
+    "• I'll never message your customers on my own, or post as you.\n"
+    "• Change your mind? Say 'disconnect' and I'm gone. Instantly.\n"
+    "• Your customers' info stays private — never sold, never shared.\n\n"
+    "All good? Reply *yes* and I'll get you linked 🙌"
+)
+_CONSENT_PT = (
+    "Ok, último passo importante — conectar o seu WhatsApp de verdade pra eu começar "
+    "a agendar pra você 📱\n\n"
+    "Olha exatamente o que acontece, sem letras miúdas:\n"
+    "• Eu só respondo sobre agendamentos. Só isso.\n"
+    "• Nunca vou mandar mensagem pros seus clientes por conta própria, nem postar como você.\n"
+    "• Mudou de ideia? Diga 'desconectar' e eu saio na hora.\n"
+    "• Os dados dos seus clientes ficam privados — nunca vendidos, nunca compartilhados.\n\n"
+    "Tudo certo? Responda *sim* e eu já te conecto 🙌"
+)
+_CONSENT_ES = (
+    "Ok, último gran paso — conectar tu WhatsApp real para empezar a agendar por ti 📱\n\n"
+    "Esto es exactamente lo que pasa, sin letra pequeña:\n"
+    "• Solo respondo cosas de reservas. Nada más.\n"
+    "• Nunca escribiré a tus clientes por mi cuenta, ni publicaré como tú.\n"
+    "• ¿Cambias de idea? Di 'desconectar' y desaparezco al instante.\n"
+    "• Los datos de tus clientes quedan privados — nunca vendidos, nunca compartidos.\n\n"
+    "¿Todo bien? Responde *sí* y te conecto 🙌"
+)
+
+for _en_txt, _pt_txt, _es_txt in (
+    (_QUICK_CAPTURE_EN, _QUICK_CAPTURE_PT, _QUICK_CAPTURE_ES),
+    (_CONSENT_EN, _CONSENT_PT, _CONSENT_ES),
 ):
     _STATIC_TRANSLATION_CACHE[("pt", _en_txt)] = _pt_txt
     _STATIC_TRANSLATION_CACHE[("es", _en_txt)] = _es_txt
@@ -2947,7 +3017,8 @@ class OnboardingService:
         #               (b) a business already exists for this owner (EC10).
         _terminal_steps = {
             "pairing", "pairing_mode_choice", "pairing_qr_active",
-            "pairing_scam_warning", "calendar_setup", "call_forwarding",
+            "pairing_scam_warning", "quick_capture", "consent",
+            "calendar_setup", "call_forwarding",
             "complete", "post_onboarding",
         }
         _current_step = (session or {}).get("currentStep", "")
@@ -2970,7 +3041,8 @@ class OnboardingService:
         if session and has_plan_pricing_intent(body):
             _setup_steps = {
                 "pairing", "pairing_mode_choice", "pairing_qr_active",
-                "pairing_scam_warning", "calendar_setup", "call_forwarding",
+                "pairing_scam_warning", "consent",
+                "calendar_setup", "call_forwarding",
             }
             if session.get("currentStep", "") in _setup_steps:
                 await self._handle_pricing_question(session, phone, body)
@@ -3074,6 +3146,16 @@ class OnboardingService:
                 await self._handle_new_biz_confirm(
                     session, biz, phone, body, push_name, message_id
                 )
+                return
+
+            # Step 6: quick capture (services / hours / capacity / rules + owner).
+            if step == "quick_capture":
+                await self._handle_quick_capture(session, phone, body, push_name, message_id)
+                return
+
+            # Step 8: consent, before linking WhatsApp.
+            if step == "consent":
+                await self._handle_consent(session, phone, body)
                 return
 
             # ── New pairing sub-steps (device-choice → QR or code) ────────
@@ -3698,7 +3780,202 @@ class OnboardingService:
         history.append({"role": "user", "content": body})
         db.upsert_onboarding_session(phone, {"conversationHistory": history})
         business_json = _lead_to_business_json(lead)
-        await self._start_referral_step(session, phone, push, business_json)
+        await self._start_quick_capture(session, phone, push, business_json)
+
+    # ── Step 6: quick capture (services / hours / capacity / rules + owner) ──
+
+    async def _start_quick_capture(
+        self,
+        session: dict,
+        phone: str,
+        push_name: str,
+        pre_extracted: dict,
+    ) -> None:
+        """PDF Step 6: right after the business is identified, ask services +
+        hours + capacity + rules (+ a light owner/manager check) in ONE message,
+        then finalize. Referral is NO LONGER asked here — it is the very last
+        step, after calendar (client 2026-07-31)."""
+        pre_extracted = dict(pre_extracted or {})
+        history = session.get("conversationHistory", [])
+        db.upsert_onboarding_session(phone, {
+            "currentStep": "quick_capture",
+            "websiteExtractedData": pre_extracted,
+        })
+        session["currentStep"] = "quick_capture"
+        session["websiteExtractedData"] = pre_extracted
+        msg = await self._localize_static(
+            _QUICK_CAPTURE_EN, _last_user_message(history), session.get("language", "en"),
+        )
+        history.append({"role": "assistant", "content": msg})
+        db.upsert_onboarding_session(phone, {"conversationHistory": history})
+        await self._send(phone, msg)
+
+    async def _handle_quick_capture(
+        self, session: dict, phone: str, body: str, push_name: str, message_id: str,
+    ) -> None:
+        """Owner's answer to the Step-6 questions → merge details, then finalize
+        (which runs consent → pairing). Never loops: whatever they send, we
+        extract what we can and move on (missing fields fall back to defaults)."""
+        history = session.get("conversationHistory", [])
+        history.append({"role": "user", "content": body})
+        base = dict(session.get("websiteExtractedData") or {})
+        try:
+            qc = await self._extract_business_data(history) or {}
+        except Exception:
+            qc = {}
+        # Overlay only non-empty quick-capture fields; name/type/address stay
+        # from the earlier confirmation.
+        for _k in ("services", "hours", "openingDays", "slotsPerHour",
+                   "bookingRules", "phone", "description", "specialties",
+                   "currency", "businessType"):
+            _v = qc.get(_k)
+            if _v not in (None, "", [], 0):
+                base[_k] = _v
+        db.upsert_onboarding_session(phone, {
+            "currentStep": "conversing",   # transient; _finalize_business sets pairing/consent
+            "websiteExtractedData": base,
+            "conversationHistory": history,
+            "lastMessageId": message_id,
+        })
+        session["currentStep"] = "conversing"
+        session["websiteExtractedData"] = base
+        await self._finalize_business(session, phone, history, pre_extracted=base)
+
+    # ── Step 8: consent, before we link the owner's WhatsApp ─────────────────
+
+    async def _start_consent(self, session: dict, phone: str, biz_name: str) -> None:
+        """PDF Step 8: the plain-language consent moment BEFORE linking WhatsApp.
+        The demo-before-commitment offer (Step 7) is shown here once, so the
+        pairing step won't repeat it. On 'yes' → the QR/code choice."""
+        db.upsert_onboarding_session(phone, {"currentStep": "consent"})
+        session["currentStep"] = "consent"
+        lang = session.get("language", "en")
+
+        # Demo-before-commitment offer (PDF Step 7), once. Marking
+        # trustInterstitialShown here stops _start_pairing_mode_choice repeating it.
+        if not session.get("reconnectMode") and not session.get("trustInterstitialShown"):
+            demo_number = settings.DEMO_WA_NUMBER
+            if demo_number:
+                prefill = _demo_prefill_text(lang)
+                demo_link = f"https://wa.me/{demo_number}?text={quote(prefill)}"
+                demo_offer = await self._localize_static(_TRUST_DEMO_OFFER_EN, "", lang)
+                await self._send(phone, demo_offer.replace("{demo_link}", demo_link))
+                await asyncio.sleep(1)
+            db.upsert_onboarding_session(phone, {"trustInterstitialShown": True})
+            session["trustInterstitialShown"] = True
+
+        msg = await self._localize_static(_CONSENT_EN, "", lang)
+        await self._send(phone, msg)
+
+    async def _handle_consent(self, session: dict, phone: str, body: str) -> None:
+        """Owner's reply to the pre-linking consent. Yes → QR/code choice; a
+        question/concern → answer honestly (trust) and re-ask; repeated hesitation
+        → offer a human. Never repeats the same canned line."""
+        biz_name = (
+            session.get("businessName")
+            or (session.get("websiteExtractedData") or {}).get("name")
+            or "your business"
+        )
+
+        # Human-support opt-in (one-turn window), same pattern as pairing.
+        if session.get("awaitingHumanSupportAnswer"):
+            db.upsert_onboarding_session(phone, {"awaitingHumanSupportAnswer": False})
+            session["awaitingHumanSupportAnswer"] = False
+            if _is_affirmative(body):
+                try:
+                    await onboarding_alert.maybe_alert_human(
+                        phone, session,
+                        "Owner asked for a human at the WhatsApp consent step.",
+                        force=True, category="stuck",
+                    )
+                except Exception:
+                    logger.exception("[ALERT] consent human opt-in failed for %s", phone)
+                ack = await self._localize_static(
+                    _ONB_HUMAN_SHARED_ACK_EN, body, session.get("language", "en"),
+                )
+                await self._send(phone, ack)
+                return
+
+        if _is_affirmative(body):
+            db.upsert_onboarding_session(phone, {"consentPromptCount": 0})
+            session["consentPromptCount"] = 0
+            await self._start_pairing_mode_choice(session, phone, biz_name)
+            return
+
+        # Not a clear yes → dynamic assist (answer the concern honestly), track stuck.
+        _cp = int(session.get("consentPromptCount") or 0) + 1
+        db.upsert_onboarding_session(phone, {"consentPromptCount": _cp})
+        session["consentPromptCount"] = _cp
+        try:
+            await onboarding_alert.note_stuck(
+                phone, session,
+                f"Owner hesitating at the WhatsApp consent step (reply: {body.strip()[:120]!r}).",
+            )
+        except Exception:
+            logger.exception("[ALERT] consent stuck note failed for %s", phone)
+
+        if _cp >= 2:
+            db.upsert_onboarding_session(phone, {"awaitingHumanSupportAnswer": True})
+            session["awaitingHumanSupportAnswer"] = True
+            offer = await self._localize_static(
+                _PAIRING_HELP_OFFER_EN, body, session.get("language", "en"),
+            )
+            await self._send(phone, offer)
+            return
+
+        _ctx = (
+            "CONTEXT: You just asked the owner to consent to connecting their real WhatsApp "
+            "(the final linking step). Their reply is not a clear yes — they may have a privacy/"
+            "security concern or a question. Answer it honestly and warmly using the trust facts "
+            "(official WhatsApp Linked Devices, they still see every message, they can disconnect "
+            "anytime in 2 taps, GDPR/LGPD compliant, we never sell or share their data), reassure "
+            "them, then gently ask again if they're happy to connect. 2-4 short lines. Never ask "
+            "for their location."
+        )
+        history = session.get("conversationHistory", [])
+        history.append({"role": "user", "content": body})
+        push = session.get("pushName", "")
+        lang = session.get("language", "en")
+        ai_reply = await self._get_ai_response(history, push, lang, extra_context=_ctx)
+        _, clean = self._check_confirmed(ai_reply)
+        history.append({"role": "assistant", "content": clean})
+        db.upsert_onboarding_session(phone, {"conversationHistory": history})
+        await self._send(phone, clean)
+
+    # ── Step 11: referral — the VERY LAST step, after calendar + call fwd ─────
+
+    async def _transition_to_referral(self, session: dict, phone: str) -> None:
+        """PDF Step 11: offer the referral program as the final bonus, after
+        WhatsApp is linked and calendar/call-forwarding are done. The business
+        already exists, so the answer UPDATES it (handled in _handle_referral_offer)
+        then onboarding completes. Reconnect flows skip straight to complete."""
+        if session.get("reconnectMode"):
+            await self._complete_onboarding(session, phone)
+            return
+        history = session.get("conversationHistory", [])
+        db.upsert_onboarding_session(phone, {
+            "currentStep": "referral_offer",
+            "referralFeatureEnabled": None,
+            "referrerDiscountPercent": 25,
+            "refereeDiscountPercent": 10,
+        })
+        session["currentStep"] = "referral_offer"
+        msg = (
+            "One last thing — totally optional 🤑\n\n"
+            "Turn happy customers into new ones: a customer refers a friend → both get a "
+            "little discount → your client list keeps growing 📈 It runs itself.\n\n"
+            "*Switch it on?* Reply *yes* or *no*\n\n"
+            "Default discounts:\n"
+            "• 25% off for the referrer\n"
+            "• 10% off for the newcomer\n"
+            "(You can change these anytime in your dashboard 👍)"
+        )
+        msg = await self._localize_static(
+            msg, _last_user_message(history), session.get("language", "en"),
+        )
+        history.append({"role": "assistant", "content": msg})
+        db.upsert_onboarding_session(phone, {"conversationHistory": history})
+        await self._send(phone, msg)
 
     # ── referral step ─────────────────────────────────────────────────────
 
@@ -3800,28 +4077,23 @@ class OnboardingService:
         push_name: str,
         message_id: str,
     ) -> None:
-        """Handle owner response to referral enable question."""
+        """Handle the owner's yes/no to the FINAL referral offer (PDF Step 11).
+
+        The business is already registered and live at this point, so the answer
+        UPDATES the business doc, then onboarding completes. Non-looping: anything
+        that isn't a clear yes leaves referrals off (a bonus they can enable later
+        from the dashboard) and finishes — the owner is never trapped at the end.
+        """
         import re as _re
 
         normalized = body.strip().lower()
         yes_words = {
             "yes", "sim", "sí", "si", "ok", "enable", "enabled", "y", "yeah",
-            "yep", "sure", "correct", "right", "✅",
-        }
-        no_words = {
-            "no", "não", "nao", "disable", "disabled", "n", "nope", "nah",
+            "yep", "sure", "correct", "right", "✅", "claro", "quero",
         }
         is_yes = any(w in normalized for w in yes_words)
-        is_no = any(w in normalized for w in no_words)
 
-        if not is_yes and not is_no:
-            await self._send(
-                phone,
-                "Please reply *yes* to enable referral discounts or *no* to keep them disabled."
-            )
-            return
-
-        referral_enabled = bool(is_yes and not is_no)
+        referral_enabled = bool(is_yes)
         referrer_pct = 25
         referee_pct = 10
 
@@ -3833,30 +4105,46 @@ class OnboardingService:
                 referrer_pct = min(max(nums[0], 1), 90)
                 referee_pct = min(max(nums[1], 1), 90)
 
-        extracted = dict(session.get("websiteExtractedData") or {})
-        extracted["referralFeatureEnabled"] = referral_enabled
-        extracted["referrerDiscountPercent"] = referrer_pct
-        extracted["refereeDiscountPercent"] = referee_pct
-
         history = session.get("conversationHistory", [])
         history.append({"role": "user", "content": body})
 
+        # Persist onto the LIVE business doc (already created at finalize).
+        biz_id = session.get("businessId")
+        if biz_id:
+            try:
+                db.update_business_doc(biz_id, {
+                    "referralFeatureEnabled": referral_enabled,
+                    "referrerDiscountPercent": referrer_pct,
+                    "refereeDiscountPercent": referee_pct,
+                })
+            except Exception:
+                logger.exception("[REFERRAL] business update failed for %s", phone)
+
         db.upsert_onboarding_session(phone, {
-            "currentStep": "pairing",
-            "websiteExtractedData": extracted,
             "referralFeatureEnabled": referral_enabled,
             "referrerDiscountPercent": referrer_pct,
             "refereeDiscountPercent": referee_pct,
             "conversationHistory": history,
             "lastMessageId": message_id,
         })
-        session["currentStep"] = "pairing"
-        session["websiteExtractedData"] = extracted
         session["referralFeatureEnabled"] = referral_enabled
         session["referrerDiscountPercent"] = referrer_pct
         session["refereeDiscountPercent"] = referee_pct
 
-        await self._finalize_business(session, phone, history, pre_extracted=extracted)
+        if referral_enabled:
+            ack = (
+                f"Done ✅ Referrals are ON — {referrer_pct}% off for the referrer and "
+                f"{referee_pct}% off for the newcomer. You can tweak this anytime in your dashboard 🙌"
+            )
+        else:
+            ack = (
+                "No worries — I've left referrals off for now. You can switch them on "
+                "anytime from your dashboard 👍"
+            )
+        ack = await self._localize_static(ack, body, session.get("language", "en"))
+        await self._send(phone, ack)
+        await asyncio.sleep(1)
+        await self._complete_onboarding(session, phone)
 
     async def _handle_referral_confirm(
         self,
@@ -4128,7 +4416,7 @@ class OnboardingService:
             if has_hours and has_days:
                 db.upsert_onboarding_session(phone, {"mandatoryFieldsRequired": False})
                 session["mandatoryFieldsRequired"] = False
-                await self._start_referral_step(session, phone, push_name, _merged)
+                await self._start_quick_capture(session, phone, push_name, _merged)
                 return
 
             # Still missing one or both — send a targeted follow-up
@@ -6552,7 +6840,7 @@ class OnboardingService:
             # Owner confirmed the minimal card — continue to deterministic
             # referral-offer/referral-confirm steps before finalizing.
             push = push_name or session.get("pushName", "")
-            await self._start_referral_step(session, phone, push, extracted)
+            await self._start_quick_capture(session, phone, push, extracted)
             return
 
         if is_no:
@@ -6777,6 +7065,8 @@ class OnboardingService:
             "addressCity": business_json.get("city", ""),
             "addressPostalCode": business_json.get("postalCode", ""),
             "addressCountry": business_json.get("country", ""),
+            # Booking notice/cancellation policy from the Step-6 quick capture.
+            "bookingRules": business_json.get("bookingRules", ""),
             "businessPhone": business_json.get("phone", ""),
             "staff": business_json.get("staff", []),
             "specialties": business_json.get("specialties", []),
@@ -6990,7 +7280,8 @@ class OnboardingService:
                 # Let _send_pairing_code handle reconnecting the existing device
                 await self._send_pairing_code(refreshed, phone)
         else:
-            await self._start_pairing_mode_choice(refreshed, phone, biz_name)
+            # Fresh link → PDF Step 8 consent BEFORE the QR/code choice.
+            await self._start_consent(refreshed, phone, biz_name)
 
     async def _extract_business_data(self, history: list[dict]) -> dict:
         """Use Claude to extract structured business data from the conversation."""
@@ -8403,7 +8694,7 @@ class OnboardingService:
                 "Call forwarding is not yet available in your region. "
                 "Your AI receptionist is already active on WhatsApp — you're all set! 🎉",
             )
-            await self._complete_onboarding(session, phone)
+            await self._transition_to_referral(session, phone)
             return
 
         # USSD code: **61* = forward on no-answer, *11 = voice calls, *15 = 15-second ring time
@@ -8441,7 +8732,7 @@ class OnboardingService:
                 "✅ All set! You won't miss a customer again 💪\n\n"
                 "Your AI receptionist is now fully active on WhatsApp and calls.",
             )
-            await self._complete_onboarding(session, phone)
+            await self._transition_to_referral(session, phone)
             return
 
         if normalized in skip_words:
@@ -8450,7 +8741,7 @@ class OnboardingService:
                 "No problem 👍 You can enable call forwarding anytime later.\n\n"
                 "You're all set! Your AI receptionist is now active on WhatsApp.",
             )
-            await self._complete_onboarding(session, phone)
+            await self._transition_to_referral(session, phone)
             return
 
         if normalized in help_words:
