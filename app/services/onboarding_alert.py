@@ -346,6 +346,9 @@ _HUMAN_WORDS_EXACT: frozenset[str] = frozenset({
     "human", "humans", "humano", "humanos", "humain",
     "person", "pessoa", "persona",
     "atendente", "agente", "representante", "representative",
+    # The intro copy invites the owner to say "team" (EN) / "equipe" (PT) /
+    # "equipo" (ES) to reach a person — recognise those so the promise is real.
+    "team", "teams", "equipe", "equipa", "equipo",
 })
 
 
