@@ -2219,6 +2219,49 @@ def _is_affirmative(text: str) -> bool:
     return bool(_AFFIRMATIVE_RE.match(normalized))
 
 
+# ── Centralized "owner wants QR" detection (client 2026-07-31 bug fix) ────────
+# WhatsApp pairing is the single most critical onboarding step — the QR/code
+# switch was previously matched by FOUR separate, slightly-different word lists
+# scattered across the pairing handlers (the "pairing" code step, the mode
+# choice, the QR-active reminder, and the legacy scam-warning step), which is
+# exactly the kind of duplication that lets a real phrasing slip through in one
+# spot but not another. This single word-boundary regex is now the ONE source
+# of truth, checked FIRST (before skip/resend/AI-classification) everywhere a
+# QR-code request can plausibly arrive, so a switch NEVER depends on an LLM
+# call or a step-specific keyword list going stale.
+_WANTS_QR_RE = re.compile(
+    r"\bqr\b|c[oó]digo\s*qr|qr\s*code|scan\s*(the\s*|a\s*)?qr|escanear|escane[oó]|"
+    r"le[ií]tor\s*(de\s*)?qr|outro\s*dispositivo|other\s*device",
+    re.IGNORECASE,
+)
+
+
+def _wants_qr(text: str) -> bool:
+    return bool(_WANTS_QR_RE.search((text or "").strip()))
+
+
+# Sent when QR generation fails even after retries — instead of re-prompting
+# the owner to try the SAME broken option again (the exact loop reported
+# 2026-07-31: a client typed "QR" repeatedly and kept hitting the same
+# failure), we say so briefly and IMMEDIATELY send a pairing code instead —
+# the method we already know works, since linking WhatsApp must never strand
+# an owner. Hand-seeded PT/ES.
+_QR_FAILED_FALLBACK_EN = (
+    "Hmm, the QR code isn't generating right now 😅 No worries — let's use a "
+    "pairing code instead, it works just as well:"
+)
+_QR_FAILED_FALLBACK_PT = (
+    "Hmm, o código QR não está gerando agora 😅 Sem problemas — vamos usar um "
+    "código de emparelhamento, que funciona igualmente bem:"
+)
+_QR_FAILED_FALLBACK_ES = (
+    "Uy, el código QR no se está generando ahora 😅 No te preocupes — vamos a "
+    "usar un código de vinculación, que funciona igual de bien:"
+)
+_STATIC_TRANSLATION_CACHE[("pt", _QR_FAILED_FALLBACK_EN)] = _QR_FAILED_FALLBACK_PT
+_STATIC_TRANSLATION_CACHE[("es", _QR_FAILED_FALLBACK_EN)] = _QR_FAILED_FALLBACK_ES
+
+
 _CONVERSATIONAL_NOISE_RE = re.compile(
     r"("
     r"came?\s+(?:through|from|via)\s+(?:an?\s+)?ads?"
@@ -2768,6 +2811,13 @@ class OnboardingService:
         self.ai = AIService()
         self.client = AsyncOpenAIAnthropicWrapper(api_key=settings.OPENAI_API_KEY)
         self.model = "gpt-4o-mini"
+        # Best-effort same-process guard against duplicate/concurrent QR
+        # generation requests for the same phone (e.g. a redelivered webhook
+        # arriving while the first request is still inside the bridge retry
+        # loop). See _switch_to_qr. `_onboarding` is a module-level singleton
+        # (app/api/v1/whatsapp.py), so this survives across requests on one
+        # instance — cross-instance races are out of scope here.
+        self._qr_inflight: set[str] = set()
 
     async def _detect_language_llm(self, text: str) -> tuple[str, float]:
         cleaned = (text or "").strip()
@@ -3184,15 +3234,6 @@ class OnboardingService:
                 normalized = body.strip().lower()
                 _done = {"done", "pronto", "feito", "hecho", "ready", "listo", "linked", "conectado"}
                 _skip = {"skip", "pular", "saltar", "later", "depois"}
-                # Owner on the CODE flow asking to switch to QR. This MUST be
-                # handled here — before skip / the intent classifier — or a "QR
-                # code" reply gets misread as "skip" and the whole linking step is
-                # silently abandoned (prod bug 2026-07-31; linking is critical).
-                _switch_qr = {
-                    "qr", "qr code", "qrcode", "scan", "scan qr", "use qr",
-                    "switch to qr", "qr instead", "qr please", "código qr",
-                    "codigo qr", "escanear", "escáner", "escaner", "leitor",
-                }
                 _new = {
                     "new code", "novo código", "nuevo código", "novo codigo",
                     "new", "código novo", "resend", "re-send", "send again",
@@ -3204,8 +3245,13 @@ class OnboardingService:
                 if any(tok in normalized for tok in _done):
                     await self._handle_pairing(session, phone, "done")
                     return
-                # Switch to QR (checked before skip so "QR code" is never a skip).
-                if "qr" in normalized or any(tok in normalized for tok in _switch_qr):
+                # Owner on the CODE flow asking to switch to QR. This MUST be
+                # checked here — before skip / the intent classifier — or a "QR
+                # code" reply gets misread as "skip" and the whole linking step is
+                # silently abandoned (prod bug 2026-07-31; linking is critical).
+                # Uses the ONE shared detector — see _wants_qr — so this never
+                # drifts out of sync with the other pairing handlers again.
+                if _wants_qr(body):
                     await self._switch_to_qr(session, phone)
                     return
                 if any(tok in normalized for tok in _skip):
@@ -7539,9 +7585,9 @@ class OnboardingService:
                 if attempt < 3:
                     logger.warning(
                         "[QR] Attempt %d/3: bridge returned empty payload for session %s — retrying in %ds",
-                        attempt, pairing_sid, attempt * 3,
+                        attempt, pairing_sid, attempt * 2,
                     )
-                    await asyncio.sleep(attempt * 3)
+                    await asyncio.sleep(attempt * 2)
             except PairingStateConflict:
                 logger.info("[QR] Session %s is already paired; skipping QR send", pairing_sid)
                 return False
@@ -7549,10 +7595,10 @@ class OnboardingService:
                 last_exc = exc
                 logger.warning(
                     "[QR] Attempt %d/3 failed for session %s: %s — retrying in %ds",
-                    attempt, pairing_sid, exc, attempt * 3,
+                    attempt, pairing_sid, exc, attempt * 2,
                 )
                 if attempt < 3:
-                    await asyncio.sleep(attempt * 3)
+                    await asyncio.sleep(attempt * 2)
 
         if not result or not result.get("qr_payload"):
             logger.error(
@@ -7670,18 +7716,39 @@ class OnboardingService:
     async def _switch_to_qr(self, session: dict, phone: str) -> None:
         """Send the QR image and move to the QR-active step (arming the scan poll).
 
-        Shared by BOTH the QR/code choice AND the code step — so an owner who
-        started with a pairing code and then asks for the QR is switched over,
-        not skipped (client 2026-07-31: WhatsApp linking is the crucial step and
-        must never be silently skipped). ``_send_qr_image`` already records the
-        pairing attempt for the stuck-alert, so we don't double-count here.
+        Shared by EVERY pairing-related handler (the code step, the mode choice,
+        and the legacy scam-warning step) — so an owner who started with a
+        pairing code and then asks for the QR is switched over, not skipped or
+        misrouted to a free-form AI reply (client 2026-07-31: WhatsApp linking is
+        the single most crucial onboarding step and must never lose the owner).
+
+        On failure — even after the bridge retries inside ``_send_qr_image`` —
+        we do NOT re-prompt for the same broken QR again. A client got stuck
+        exactly that way: "QR" kept returning the same "couldn't generate"
+        message on repeat. Instead we IMMEDIATELY fall back to the pairing
+        CODE, a method we already know works, so the owner is never stranded.
         """
         db.upsert_onboarding_session(phone, {
             "currentStep": "pairing_qr_active",
             "pairingChoicePromptCount": 0,
         })
         session["currentStep"] = "pairing_qr_active"
-        ok = await self._send_qr_image(session, phone)
+
+        # Same-process guard: a duplicate/concurrent request for this phone
+        # (e.g. a redelivered webhook arriving while the bridge call below is
+        # still retrying) is a no-op rather than racing the bridge twice.
+        if phone in self._qr_inflight:
+            logger.info(
+                "[QR] Duplicate QR switch request for %s while one is already "
+                "in flight — ignoring", phone,
+            )
+            return
+        self._qr_inflight.add(phone)
+        try:
+            ok = await self._send_qr_image(session, phone)
+        finally:
+            self._qr_inflight.discard(phone)
+
         if ok:
             await asyncio.sleep(1)
             await self._send(
@@ -7698,18 +7765,15 @@ class OnboardingService:
                 self._poll_qr_pairing_status(phone, _qr_sid, _qr_attempt_id)
             )
         else:
-            # QR unavailable after all retries — fall back to the choice with a
-            # clear, actionable alternative (never a dead end).
-            db.upsert_onboarding_session(phone, {"currentStep": "pairing_mode_choice"})
-            session["currentStep"] = "pairing_mode_choice"
-            await self._send(
-                phone,
-                "⚠️ *Couldn't generate the QR code right now.*\n\n"
-                "You can:\n"
-                "• Reply *QR* to try again\n"
-                "• Reply *code* to link via a pairing code instead 📱\n\n"
-                "_The pairing code works great if you only have this phone with you._",
+            # QR unavailable after retries — auto-fallback to the pairing code
+            # (never re-offer the same broken QR option).
+            db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
+            session["currentStep"] = "pairing"
+            note = await self._localize_static(
+                _QR_FAILED_FALLBACK_EN, "", session.get("language", "en"),
             )
+            await self._send(phone, note)
+            await self._send_pairing_code(session, phone)
 
     async def _handle_pairing_mode_choice(
         self, session: dict, phone: str, body: str
@@ -7740,18 +7804,20 @@ class OnboardingService:
                 await self._send(phone, ack)
                 return
 
-        # Keywords for each option — handle common language variations.
-        _qr_words = {
-            "1", "qr", "scan", "qr code", "scan qr", "other device", "tablet",
-            "computer", "laptop", "another device", "another phone",
-            "escaner", "qr code scan", "scaner", "scannear",
+        # Keywords for each option — handle common language variations. QR uses
+        # the ONE shared detector (_wants_qr) plus a couple of device-hint words
+        # / the legacy "1" numbered choice; "code" stays local since it also
+        # covers plain "phone"/"pair" phrasing that would be too broad to share.
+        _qr_hint_words = {
+            "1", "scan", "other device", "tablet", "computer", "laptop",
+            "another device", "another phone", "scaner", "scannear",
         }
         _code_words = {
             "2", "code", "pairing code", "same phone", "this phone", "phone",
             "código", "codigo", "pair", "sms", "only phone",
         }
 
-        if any(normalized == w or normalized.startswith(w) for w in _qr_words):
+        if _wants_qr(body) or any(normalized == w or normalized.startswith(w) for w in _qr_hint_words):
             # User wants QR code.
             await self._switch_to_qr(session, phone)
             return
@@ -7932,9 +7998,10 @@ class OnboardingService:
                 )
             return
 
-        # Switch to the pairing-code flow — but only when they did NOT say "qr"
-        # (so "qr code" while already on QR isn't misread as "switch to code").
-        if "qr" not in normalized and any(w in normalized for w in _switch_to_code_words):
+        # Switch to the pairing-code flow — but only when they did NOT ALSO ask
+        # for QR (so "qr code" / "escanear" while already on QR isn't misread as
+        # "switch to code"; uses the same shared detector as everywhere else).
+        if not _wants_qr(body) and any(w in normalized for w in _switch_to_code_words):
             # Owner wants to switch to the pairing-code flow.
             if session.get("reconnectMode"):
                 db.upsert_onboarding_session(phone, {"currentStep": "pairing"})
@@ -8016,28 +8083,10 @@ class OnboardingService:
             await self._send_pairing_code(session, phone)
             return
 
-        _qr_words = {"qr", "scan", "qr code", "other device", "use qr", "switch to qr"}
-        if any(w in normalized for w in _qr_words):
-            # Owner wants to switch back to the QR flow.
-            db.upsert_onboarding_session(phone, {"currentStep": "pairing_qr_active"})
-            ok = await self._send_qr_image(session, phone)
-            if ok:
-                await asyncio.sleep(1)
-                await self._send(
-                    phone,
-                    "⏱ QR codes refresh every ~20 seconds.\n\n"
-                    "Reply *done* once linked\n"
-                    "Reply *refresh* for a new QR code\n"
-                    "Reply *code* to switch back to a pairing code",
-                )
-            else:
-                # QR unavailable — re-send the warning so they can confirm YES.
-                db.upsert_onboarding_session(phone, {"currentStep": "pairing_scam_warning"})
-                await self._send(
-                    phone,
-                    "⚠️ I couldn't load the QR code right now.\n\n"
-                    "Reply *YES* to get a pairing code instead.",
-                )
+        if _wants_qr(body):
+            # Owner wants to switch back to the QR flow — shared helper handles
+            # send + failure auto-fallback consistently with every other step.
+            await self._switch_to_qr(session, phone)
             return
 
         # Not a clear YES — gently remind them.
